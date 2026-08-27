@@ -10,7 +10,7 @@ from typing import cast
 
 from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.constants import ADAPTER_VERSION, NORMALIZATION_VERSION, REDACTION_VERSION
-from worktrace.db.authority import authoritative_run_sql
+from worktrace.db.authority import authoritative_current_observations
 from worktrace.domain.models import (
     ActorObservation,
     AvailabilityObservation,
@@ -581,36 +581,7 @@ class EvidenceRepository:
         return self._append_availability_event(run_id, object_id, "unavailable", unavailable.reason)
 
     def current_observations(self, app_id: str) -> list[sqlite3.Row]:
-        return list(
-            self.connection.execute(
-                f"""
-                WITH current_runs AS (
-                    SELECT id FROM (
-                        SELECT id, source,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY app_id, source, source_instance
-                                ORDER BY completed_at DESC, id DESC
-                            ) AS position
-                        FROM sync_runs sr
-                        WHERE app_id=? AND {authoritative_run_sql("sr")}
-                    ) WHERE position=1 OR source='manual'
-                ), latest AS (
-                    SELECT o.*,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY o.source_object_id ORDER BY o.fetched_at DESC, o.id DESC
-                        ) AS position
-                    FROM observations o JOIN current_runs r ON r.id=o.sync_run_id
-                )
-                SELECT latest.*, so.app_id, so.source, so.source_instance, so.kind,
-                    so.external_id, so.canonical_url, so.availability,
-                    so.availability_reason, so.availability_observed_at
-                FROM latest JOIN source_objects so ON so.id=latest.source_object_id
-                WHERE latest.position=1
-                ORDER BY so.source, so.kind, so.external_id
-                """,
-                (app_id,),
-            )
-        )
+        return authoritative_current_observations(self.connection, app_id)
 
     def object_row(self, object_id: str) -> sqlite3.Row:
         row = self.connection.execute(

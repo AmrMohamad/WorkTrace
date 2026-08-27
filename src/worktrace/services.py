@@ -141,8 +141,9 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
             SELECT * FROM "references" WHERE app_id=?
               AND from_object_id IN ({placeholders(object_ids)})
               AND to_object_id IN ({placeholders(object_ids)})
+              AND supporting_observation_id IN ({placeholders(observation_ids)})
             """,
-            [app_id, *object_ids, *object_ids],
+            [app_id, *object_ids, *object_ids, *observation_ids],
         )
     ]
     payload["candidate_groups"] = [

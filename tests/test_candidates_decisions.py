@@ -157,15 +157,20 @@ def test_candidate_overflow_does_not_consume_discarded_tail_seeds(
             for row in connection.execute("SELECT id FROM source_objects ORDER BY external_id")
         ]
         seed = objects[0]
+        supporting_observation_id = next(
+            str(row["id"])
+            for row in repository.current_observations("sample_store")
+            if str(row["source_object_id"]) == seed
+        )
         for index, target in enumerate(objects[1:], start=1):
             connection.execute(
                 """
                 INSERT INTO "references"(
                     id, app_id, from_object_id, to_object_id, relationship_type,
-                    extraction_method, derived
-                ) VALUES (?, 'sample_store', ?, ?, 'mr_contains_commit', 'fixture', 1)
+                    extraction_method, supporting_observation_id, derived
+                ) VALUES (?, 'sample_store', ?, ?, 'mr_contains_commit', 'fixture', ?, 1)
                 """,
-                (f"ref:overflow:{index}", seed, target),
+                (f"ref:overflow:{index}", seed, target, supporting_observation_id),
             )
         connection.commit()
         monkeypatch.setattr("worktrace.candidates.builder.MAX_MEMBERS", 2)

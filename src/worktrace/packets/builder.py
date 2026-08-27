@@ -11,11 +11,13 @@ from worktrace.candidates.projector import CandidateView, project_candidate
 from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.constants import DEFAULT_EXCERPT_CHARS, STALE_AFTER_DAYS
 from worktrace.db.authority import (
+    authoritative_current_observation_ids,
     authoritative_run_sql,
     authority_limitation,
     parse_scope,
     run_is_authoritative,
     selection_policy_version,
+    supporting_observation_is_authoritative,
 )
 from worktrace.domain.enums import ClaimStatus, ObservationType
 from worktrace.errors import NotFound, ScopeViolation
@@ -469,6 +471,9 @@ class PacketBuilder:
         member_ids = sorted(contribution.member_ids | contribution.context_ids)
         contradictions: list[dict[str, object]] = []
         if member_ids:
+            current_observation_ids = authoritative_current_observation_ids(
+                self.connection, contribution.app_id
+            )
             placeholders = ",".join("?" for _ in member_ids)
             rows = self.connection.execute(
                 f"""
@@ -481,6 +486,10 @@ class PacketBuilder:
                 [*member_ids, *member_ids],
             )
             for row in rows:
+                if not supporting_observation_is_authoritative(
+                    row["supporting_observation_id"], current_observation_ids
+                ):
+                    continue
                 evidence = [str(row["id"])]
                 if row["supporting_observation_id"]:
                     evidence.append(str(row["supporting_observation_id"]))
@@ -1518,6 +1527,11 @@ class PacketBuilder:
         if reference is not None:
             app_id = str(reference["app_id"])
             self._app(app_id)
+            current_observation_ids = authoritative_current_observation_ids(self.connection, app_id)
+            if not supporting_observation_is_authoritative(
+                reference["supporting_observation_id"], current_observation_ids
+            ):
+                raise NotFound(f"evidence not found: {evidence_id}")
             return {
                 "evidence_id": evidence_id,
                 "app_id": app_id,
@@ -1527,6 +1541,7 @@ class PacketBuilder:
                 "to_object_id": str(reference["to_object_id"]),
                 "extraction_method": str(reference["extraction_method"]),
                 "supporting_observation_id": reference["supporting_observation_id"],
+                "authoritative_current": True,
                 "source_status": self.source_status(app_id),
             }
         raise NotFound(f"evidence not found: {evidence_id}")

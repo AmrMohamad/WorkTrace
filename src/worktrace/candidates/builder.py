@@ -5,6 +5,7 @@ import sqlite3
 from collections import deque
 from datetime import UTC, datetime
 
+from worktrace.db.authority import supporting_observation_is_authoritative
 from worktrace.db.repository import EvidenceRepository, stable_id
 from worktrace.participation import (
     ParticipationCategory,
@@ -38,10 +39,14 @@ CONTEXT_ONLY.update({"jira_links_to_issue", "jira_hierarchy_context"})
 SEED_PRIORITY = {"jira_issue": 0, "gitlab_mr": 1, "git_commit": 2, "manual_evidence": 3}
 
 
-def _self_roles(connection: sqlite3.Connection, app_id: str) -> dict[str, set[str]]:
+def _self_roles(
+    connection: sqlite3.Connection,
+    app_id: str,
+    current_observation_ids: frozenset[str],
+) -> dict[str, set[str]]:
     rows = connection.execute(
         """
-        SELECT p.source_object_id, p.role, so.source, so.kind
+        SELECT p.source_object_id, p.observation_id, p.role, so.source, so.kind
         FROM participations p
         JOIN actors a ON a.id=p.actor_id
         JOIN source_objects so ON so.id=p.source_object_id
@@ -51,6 +56,10 @@ def _self_roles(connection: sqlite3.Connection, app_id: str) -> dict[str, set[st
     )
     result: dict[str, set[str]] = {}
     for row in rows:
+        if not supporting_observation_is_authoritative(
+            row["observation_id"], current_observation_ids
+        ):
+            continue
         result.setdefault(str(row["source_object_id"]), set()).add(
             canonical_role(str(row["source"]), str(row["kind"]), str(row["role"]))
         )
@@ -92,14 +101,21 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
     connection = repository.connection
     current = repository.current_observations(app_id)
     objects = {str(row["source_object_id"]): row for row in current}
+    current_observation_ids = frozenset(str(row["id"]) for row in current)
+    references = [
+        row
+        for row in connection.execute(
+            'SELECT * FROM "references" WHERE app_id=? ORDER BY id',
+            (app_id,),
+        )
+        if supporting_observation_is_authoritative(
+            row["supporting_observation_id"], current_observation_ids
+        )
+    ]
     mr_with_changed_paths: set[str] = set()
-    for relation in connection.execute(
-        """
-        SELECT from_object_id, to_object_id FROM "references"
-        WHERE app_id=? AND relationship_type='gitlab_mr_changed_paths'
-        """,
-        (app_id,),
-    ):
+    for relation in references:
+        if str(relation["relationship_type"]) != "gitlab_mr_changed_paths":
+            continue
         left = str(relation["from_object_id"])
         right = str(relation["to_object_id"])
         left_kind = str(objects[left]["kind"]) if left in objects else ""
@@ -116,16 +132,11 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
             and _has_complete_changed_paths(objects[left])
         ):
             mr_with_changed_paths.add(right)
-    roles = _self_roles(connection, app_id)
+    roles = _self_roles(connection, app_id, current_observation_ids)
     linked_ids = {
-        str(row[0])
-        for row in connection.execute(
-            """
-            SELECT from_object_id FROM "references" WHERE app_id=?
-            UNION SELECT to_object_id FROM "references" WHERE app_id=?
-            """,
-            (app_id, app_id),
-        )
+        object_id
+        for row in references
+        for object_id in (str(row["from_object_id"]), str(row["to_object_id"]))
     }
     seeds = []
     for object_id, row in objects.items():
@@ -168,14 +179,10 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
     )
 
     edges: dict[str, list[tuple[str, str, bool]]] = {}
-    for row in connection.execute(
-        """
-        SELECT from_object_id, to_object_id, relationship_type
-        FROM "references" WHERE app_id=? ORDER BY id
-        """,
-        (app_id,),
-    ):
-        left, right, relationship = str(row[0]), str(row[1]), str(row[2])
+    for row in references:
+        left = str(row["from_object_id"])
+        right = str(row["to_object_id"])
+        relationship = str(row["relationship_type"])
         edges.setdefault(left, []).append((right, relationship, True))
         edges.setdefault(right, []).append((left, relationship, False))
 

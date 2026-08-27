@@ -3,6 +3,10 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 
+from worktrace.db.authority import (
+    authoritative_current_observation_ids,
+    supporting_observation_is_authoritative,
+)
 from worktrace.packets.authority import find_attestation
 from worktrace.packets.models import EvidenceRecord, HumanAttestation
 from worktrace.participation import (
@@ -50,16 +54,25 @@ def build_participation_summary(
     data_by_object = {record.object_id: record.data for record in records}
     mr_path_support: dict[str, set[str]] = {}
     object_ids = sorted(record_by_object)
+    current_observation_ids = frozenset(
+        observation_id
+        for app_id in {record.app_id for record in records}
+        for observation_id in authoritative_current_observation_ids(connection, app_id)
+    )
     if object_ids:
         for relation in connection.execute(
             f"""
-            SELECT from_object_id, to_object_id FROM "references"
+            SELECT from_object_id, to_object_id, supporting_observation_id FROM "references"
             WHERE relationship_type='gitlab_mr_changed_paths'
               AND from_object_id IN ({_placeholders(object_ids)})
               AND to_object_id IN ({_placeholders(object_ids)})
             """,
             [*object_ids, *object_ids],
         ):
+            if not supporting_observation_is_authoritative(
+                relation["supporting_observation_id"], current_observation_ids
+            ):
+                continue
             left = record_by_object[str(relation["from_object_id"])]
             right = record_by_object[str(relation["to_object_id"])]
             mr, paths = (right, left) if "changed_path" in left.kind else (left, right)
