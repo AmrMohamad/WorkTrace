@@ -96,12 +96,16 @@ def test_only_complete_run_projects_unavailable_and_reappearance(tmp_path: Path)
             "INSERT INTO apps(id, name, market, business_type) VALUES ('sample','Sample','','')"
         )
         repository = EvidenceRepository(connection)
-        first = repository.start_sync_run("sample", "jira", "jira-main", {})
+        first = repository.start_sync_run(
+            "sample", "jira", "jira-main", {"selection_policy_version": 2}
+        )
         repository.store_page(first, [_object()])
         repository.finish_sync_run(first, "complete", "complete_for_scope")
         object_id = str(connection.execute("SELECT id FROM source_objects").fetchone()[0])
 
-        failed = repository.start_sync_run("sample", "jira", "jira-main", {})
+        failed = repository.start_sync_run(
+            "sample", "jira", "jira-main", {"selection_policy_version": 2}
+        )
         repository.record_object_unavailable(
             failed,
             source="jira",
@@ -117,7 +121,9 @@ def test_only_complete_run_projects_unavailable_and_reappearance(tmp_path: Path)
             == "visible"
         )
 
-        unavailable = repository.start_sync_run("sample", "jira", "jira-main", {})
+        unavailable = repository.start_sync_run(
+            "sample", "jira", "jira-main", {"selection_policy_version": 2}
+        )
         repository.record_object_unavailable(
             unavailable,
             source="jira",
@@ -132,7 +138,9 @@ def test_only_complete_run_projects_unavailable_and_reappearance(tmp_path: Path)
         ).fetchone()
         assert tuple(state) == ("unavailable", "not_found")
 
-        reappeared = repository.start_sync_run("sample", "jira", "jira-main", {})
+        reappeared = repository.start_sync_run(
+            "sample", "jira", "jira-main", {"selection_policy_version": 2}
+        )
         repository.store_page(reappeared, [_object()])
         repository.finish_sync_run(reappeared, "complete", "complete_for_scope")
         state = connection.execute(

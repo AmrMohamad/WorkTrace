@@ -170,22 +170,28 @@ def _relevant_git_commit_shas(
 ) -> _CommitSeedSelection:
     """Return bounded current self-authored/coauthored local commit identities."""
 
+    current = repository.current_observations(app_id)
+    current_observation_ids = [str(row["id"]) for row in current]
+    if not current_observation_ids:
+        return _CommitSeedSelection((), 0, limit)
+    placeholders = ",".join("?" for _ in current_observation_ids)
     allowed_objects = {
         str(row["source_object_id"])
         for row in repository.connection.execute(
-            """
+            f"""
             SELECT DISTINCT p.source_object_id
             FROM participations p
             JOIN actors a ON a.id=p.actor_id
             JOIN source_objects so ON so.id=p.source_object_id
             WHERE so.app_id=? AND so.source='git' AND so.kind='git_commit'
               AND a.is_self=1 AND p.role IN ('git_author', 'git_coauthor')
+              AND p.observation_id IN ({placeholders})
             """,
-            (app_id,),
+            [app_id, *current_observation_ids],
         )
     }
     candidates: dict[str, str] = {}
-    for row in repository.current_observations(app_id):
+    for row in current:
         if (
             str(row["source_object_id"]) not in allowed_objects
             or str(row["source"]) != "git"

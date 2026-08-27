@@ -11,10 +11,12 @@ from worktrace.candidates.projector import CandidateView, project_candidate
 from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.constants import DEFAULT_EXCERPT_CHARS, STALE_AFTER_DAYS
 from worktrace.db.authority import (
+    authoritative_current_observation_ctes,
     authoritative_current_observation_ids,
-    authoritative_run_sql,
-    authority_limitation,
+    authoritative_current_run_ctes,
+    completeness_is_full_scope,
     parse_scope,
+    run_authority_limitation,
     run_is_authoritative,
     selection_policy_version,
     supporting_observation_is_authoritative,
@@ -285,44 +287,22 @@ class PacketBuilder:
     def _record_for_object(self, object_id: str, context_only: bool) -> EvidenceRecord | None:
         row = self.connection.execute(
             f"""
-            WITH ranked_runs AS (
-                SELECT id, source, ROW_NUMBER() OVER (
-                    PARTITION BY app_id, source, source_instance
-                    ORDER BY completed_at DESC, id DESC
-                ) AS position
-                FROM sync_runs sr WHERE {authoritative_run_sql("sr")}
-            ), eligible_runs AS (
-                SELECT id, position FROM ranked_runs
-            ), ranked_current AS (
-                SELECT o.*, ROW_NUMBER() OVER (
-                    PARTITION BY o.source_object_id ORDER BY o.fetched_at DESC, o.id DESC
-                ) AS position
-                FROM observations o JOIN eligible_runs r ON r.id=o.sync_run_id
-                WHERE o.source_object_id=?
-            )
-            SELECT rc.*, so.app_id, so.source, so.source_instance, so.kind, so.external_id,
+            WITH {authoritative_current_observation_ctes()}
+            SELECT current.*, so.app_id, so.source, so.source_instance, so.kind, so.external_id,
                 so.availability, so.availability_reason, so.availability_observed_at,
                 (
-                    SELECT event.id FROM source_object_availability_events event
+                    SELECT event.id
+                    FROM source_object_availability_events event
+                    JOIN ranked_authoritative_runs eligible_run
+                      ON eligible_run.id=event.sync_run_id
                     WHERE event.source_object_id=so.id
                       AND event.state=so.availability
                       AND event.observed_at=so.availability_observed_at
                     ORDER BY event.observed_at DESC, event.id DESC LIMIT 1
-                ) AS availability_evidence_id,
-                EXISTS(
-                    SELECT 1 FROM ranked_runs current_run
-                    WHERE current_run.id=rc.sync_run_id
-                      AND (current_run.source='manual' OR current_run.position=1)
-                ) AS is_current
-            FROM ranked_current rc JOIN source_objects so ON so.id=rc.source_object_id
-            WHERE rc.position=1 AND (
-                so.availability='unavailable'
-                OR EXISTS(
-                    SELECT 1 FROM ranked_runs current_run
-                    WHERE current_run.id=rc.sync_run_id
-                      AND (current_run.source='manual' OR current_run.position=1)
-                )
-            )
+                ) AS availability_evidence_id
+            FROM authoritative_current_observations current
+            JOIN source_objects so ON so.id=current.source_object_id
+            WHERE current.source_object_id=?
             """,
             (object_id,),
         ).fetchone()
@@ -358,7 +338,7 @@ class PacketBuilder:
                 if row["availability_observed_at"] is not None
                 else None
             ),
-            is_current=bool(row["is_current"]),
+            is_current=True,
             context_only=context_only,
         )
 
@@ -415,13 +395,14 @@ class PacketBuilder:
             for row in source_rows:
                 completed = _parse_timestamp(row["completed_at"])
                 stale = completed is None or now - completed > timedelta(days=STALE_AFTER_DAYS)
-                complete = str(row["status"]) == "complete" and str(row["completeness"]) in {
-                    "complete",
-                    "complete_for_scope",
-                }
                 scope = parse_scope(row["scope_json"])
                 selection_version = selection_policy_version(scope)
-                authoritative = run_is_authoritative(source, str(row["status"]), scope)
+                authoritative = run_is_authoritative(
+                    source,
+                    str(row["status"]),
+                    str(row["completeness"]),
+                    scope,
+                )
                 progress = _parse_json_object(row["progress_json"])
                 progress_limitations = progress.get("limitations", [])
                 limitations = (
@@ -429,7 +410,12 @@ class PacketBuilder:
                     if isinstance(progress_limitations, list)
                     else []
                 )
-                limitation = authority_limitation(source, scope)
+                limitation = run_authority_limitation(
+                    source,
+                    str(row["status"]),
+                    str(row["completeness"]),
+                    scope,
+                )
                 if limitation and limitation not in limitations:
                     limitations.append(limitation)
                 raw_selection_events = progress.get("selection_events", [])
@@ -438,7 +424,7 @@ class PacketBuilder:
                     if isinstance(raw_selection_events, list)
                     else []
                 )
-                complete = complete and authoritative
+                complete = authoritative and completeness_is_full_scope(str(row["completeness"]))
                 instances.append(
                     {
                         "source_instance": str(row["source_instance"]),
@@ -524,6 +510,49 @@ class PacketBuilder:
                         ),
                         "evidence_ids": [record.availability_evidence_id or record.evidence_id],
                         "observed_at": record.availability_observed_at,
+                    }
+                )
+        recorded_object_ids = {record.object_id for record in records}
+        unavailable_member_ids = [
+            object_id for object_id in member_ids if object_id not in recorded_object_ids
+        ]
+        if unavailable_member_ids:
+            placeholders = ",".join("?" for _ in unavailable_member_ids)
+            unavailable_rows = self.connection.execute(
+                f"""
+                WITH {authoritative_current_run_ctes()},
+                ranked_availability AS (
+                    SELECT event.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY event.source_object_id
+                            ORDER BY eligible_run.completed_at DESC,
+                                     event.observed_at DESC, event.id DESC
+                        ) AS position
+                    FROM source_object_availability_events event
+                    JOIN ranked_authoritative_runs eligible_run
+                      ON eligible_run.id=event.sync_run_id
+                    WHERE event.source_object_id IN ({placeholders})
+                )
+                SELECT event.id, event.source_object_id, event.reason, event.observed_at
+                FROM ranked_availability event
+                JOIN source_objects object ON object.id=event.source_object_id
+                WHERE event.position=1 AND event.state='unavailable'
+                  AND object.availability='unavailable'
+                  AND object.availability_observed_at=event.observed_at
+                ORDER BY event.source_object_id
+                """,
+                unavailable_member_ids,
+            )
+            for row in unavailable_rows:
+                contradictions.append(
+                    {
+                        "kind": "source_unavailable",
+                        "statement": (
+                            "A previously observed source object is no longer visible: "
+                            f"{str(row['reason']) or 'reason unknown'}."
+                        ),
+                        "evidence_ids": [str(row["id"])],
+                        "observed_at": row["observed_at"],
                     }
                 )
         return contradictions
@@ -1227,6 +1256,8 @@ class PacketBuilder:
             if candidate is None or projected.status == "ignored":
                 continue
             records = self._records(candidate)
+            if not records:
+                continue
             period_from, period_to = self._date_range(records)
             period_from_date = _calendar_date(period_from)
             period_to_date = _calendar_date(period_to)
@@ -1275,17 +1306,17 @@ class PacketBuilder:
                 }
             )
         items = visible_items[offset : offset + limit]
-        as_of = max(
-            (
-                str(row["completed_at"])
-                for row in self.connection.execute(
-                    "SELECT completed_at FROM sync_runs WHERE app_id=? "
-                    "AND status='complete' AND completed_at IS NOT NULL",
-                    (app_id,),
-                )
-            ),
-            default=None,
-        )
+        as_of_row = self.connection.execute(
+            f"""
+            WITH {authoritative_current_observation_ctes()}
+            SELECT MAX(current.fetched_at)
+            FROM authoritative_current_observations current
+            JOIN source_objects object ON object.id=current.source_object_id
+            WHERE object.app_id=?
+            """,
+            (app_id,),
+        ).fetchone()
+        as_of = str(as_of_row[0]) if as_of_row is not None and as_of_row[0] else None
         return {
             "app_id": app_id,
             "as_of": as_of,
@@ -1340,27 +1371,15 @@ class PacketBuilder:
         rows = list(
             self.connection.execute(
                 f"""
-                WITH ranked_runs AS (
-                    SELECT id, source, ROW_NUMBER() OVER (
-                        PARTITION BY app_id, source, source_instance
-                        ORDER BY completed_at DESC, id DESC
-                    ) AS position
-                    FROM sync_runs sr WHERE app_id=? AND {authoritative_run_sql("sr")}
-                ), current_runs AS (
-                    SELECT id FROM ranked_runs WHERE source='manual' OR position=1
-                ), latest AS (
-                    SELECT o.*, ROW_NUMBER() OVER (
-                        PARTITION BY o.source_object_id ORDER BY o.fetched_at DESC, o.id DESC
-                    ) AS position
-                    FROM observations o JOIN current_runs r ON r.id=o.sync_run_id
-                )
+                WITH {authoritative_current_observation_ctes()}
                 SELECT latest.*, so.source, so.source_instance, so.kind, so.external_id
-                FROM latest JOIN source_objects so ON so.id=latest.source_object_id
+                FROM authoritative_current_observations latest
+                JOIN source_objects so ON so.id=latest.source_object_id
                 WHERE {" AND ".join(clauses)}
                 ORDER BY COALESCE(latest.source_updated_at, latest.fetched_at) DESC, latest.id
                 LIMIT ? OFFSET ?
                 """,
-                [app_id, *parameters],
+                parameters,
             )
         )
         results = []
@@ -1393,20 +1412,12 @@ class PacketBuilder:
     def evidence_excerpt(self, evidence_id: str, max_chars: int) -> dict[str, object]:
         row = self.connection.execute(
             f"""
-            WITH ranked_runs AS (
-                SELECT sr.id, sr.source, ROW_NUMBER() OVER (
-                    PARTITION BY sr.app_id, sr.source, sr.source_instance
-                    ORDER BY sr.completed_at DESC, sr.id DESC
-                ) AS position
-                FROM sync_runs sr WHERE {authoritative_run_sql("sr")}
-            ), current_runs AS (
-                SELECT id FROM ranked_runs WHERE source='manual' OR position=1
-            )
+            WITH {authoritative_current_observation_ctes()}
             SELECT o.*, so.app_id, so.source, so.source_instance, so.kind, so.external_id,
                    sr.status AS run_status, sr.completeness AS run_completeness
-            FROM observations o JOIN source_objects so ON so.id=o.source_object_id
+            FROM authoritative_current_observations o
+            JOIN source_objects so ON so.id=o.source_object_id
             JOIN sync_runs sr ON sr.id=o.sync_run_id
-            JOIN current_runs current_run ON current_run.id=sr.id
             WHERE o.id=? OR so.id=?
             ORDER BY CASE WHEN o.id=? THEN 0 ELSE 1 END, o.fetched_at DESC, o.id DESC
             LIMIT 1
@@ -1440,23 +1451,14 @@ class PacketBuilder:
             }
         participation = self.connection.execute(
             f"""
-            WITH ranked_runs AS (
-                SELECT sr.id, sr.source, ROW_NUMBER() OVER (
-                    PARTITION BY sr.app_id, sr.source, sr.source_instance
-                    ORDER BY sr.completed_at DESC, sr.id DESC
-                ) AS position
-                FROM sync_runs sr WHERE {authoritative_run_sql("sr")}
-            ), current_runs AS (
-                SELECT id FROM ranked_runs WHERE source='manual' OR position=1
-            )
+            WITH {authoritative_current_observation_ctes()}
             SELECT p.*, a.display_name, a.is_self, so.app_id, so.source, so.kind,
                    so.external_id, sr.status AS run_status,
                    sr.completeness AS run_completeness
             FROM participations p JOIN actors a ON a.id=p.actor_id
             JOIN source_objects so ON so.id=p.source_object_id
-            JOIN observations o ON o.id=p.observation_id
+            JOIN authoritative_current_observations o ON o.id=p.observation_id
             JOIN sync_runs sr ON sr.id=o.sync_run_id
-            JOIN current_runs current_run ON current_run.id=sr.id
             WHERE p.id=?
             """,
             (evidence_id,),

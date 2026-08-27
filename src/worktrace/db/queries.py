@@ -6,9 +6,10 @@ from datetime import UTC, datetime, timedelta
 
 from worktrace.constants import MAX_RECORDS, STALE_AFTER_DAYS
 from worktrace.db.authority import (
-    authoritative_run_sql,
-    authority_limitation,
+    authoritative_current_observation_ctes,
+    completeness_is_full_scope,
     parse_scope,
+    run_authority_limitation,
     run_is_authoritative,
     selection_policy_version,
 )
@@ -39,7 +40,12 @@ def source_status(connection: sqlite3.Connection, app_id: str) -> list[dict[str,
             stale = True
         scope = parse_scope(row["scope_json"])
         selection_version = selection_policy_version(scope)
-        authoritative = run_is_authoritative(str(row["source"]), str(row["status"]), scope)
+        authoritative = run_is_authoritative(
+            str(row["source"]),
+            str(row["status"]),
+            str(row["completeness"]),
+            scope,
+        )
         try:
             raw_progress = json.loads(str(row["progress_json"]))
         except (TypeError, json.JSONDecodeError):
@@ -51,10 +57,15 @@ def source_status(connection: sqlite3.Connection, app_id: str) -> list[dict[str,
             if isinstance(raw_limitations, list)
             else []
         )
-        limitation = authority_limitation(str(row["source"]), scope)
+        limitation = run_authority_limitation(
+            str(row["source"]),
+            str(row["status"]),
+            str(row["completeness"]),
+            scope,
+        )
         if limitation and limitation not in limitations:
             limitations.append(limitation)
-        complete = authoritative and str(row["completeness"]) in {"complete", "complete_for_scope"}
+        complete = authoritative and completeness_is_full_scope(str(row["completeness"]))
         result.append(
             {
                 "source": str(row["source"]),
@@ -94,24 +105,12 @@ def search_evidence(
     parameters.append(limit)
     rows = connection.execute(
         f"""
-        WITH complete_runs AS (
-          SELECT id FROM (
-            SELECT id, source, ROW_NUMBER() OVER (
-              PARTITION BY app_id, source, source_instance
-              ORDER BY completed_at DESC, id DESC
-            ) AS position
-            FROM sync_runs sr WHERE app_id=? AND {authoritative_run_sql("sr")}
-          ) WHERE position=1 OR source='manual'
-        ), latest AS (
-          SELECT o.*, ROW_NUMBER() OVER (
-            PARTITION BY o.source_object_id ORDER BY o.fetched_at DESC, o.id DESC
-          ) AS position
-          FROM observations o JOIN complete_runs r ON r.id=o.sync_run_id
-        )
+        WITH {authoritative_current_observation_ctes()}
         SELECT o.id AS evidence_id, so.id AS object_id, so.kind, so.source,
                so.external_id, o.title, o.body_text, o.completeness, o.fetched_at
-        FROM latest o JOIN source_objects so ON so.id=o.source_object_id
-        WHERE o.position=1 AND (COALESCE(o.title, '') LIKE ? ESCAPE '\\'
+        FROM authoritative_current_observations o
+        JOIN source_objects so ON so.id=o.source_object_id
+        WHERE so.app_id=? AND (COALESCE(o.title, '') LIKE ? ESCAPE '\\'
               OR COALESCE(o.body_text, '') LIKE ? ESCAPE '\\')
               {kind_filter}
         ORDER BY o.fetched_at DESC, o.id LIMIT ?
@@ -129,21 +128,13 @@ def evidence_excerpt(
 ) -> dict[str, object]:
     row = connection.execute(
         f"""
-        WITH ranked_runs AS (
-          SELECT sr.id, sr.source, ROW_NUMBER() OVER (
-            PARTITION BY sr.app_id, sr.source, sr.source_instance
-            ORDER BY sr.completed_at DESC, sr.id DESC
-          ) AS position
-          FROM sync_runs sr WHERE {authoritative_run_sql("sr")}
-        ), current_runs AS (
-          SELECT id FROM ranked_runs WHERE source='manual' OR position=1
-        )
+        WITH {authoritative_current_observation_ctes()}
         SELECT o.id AS evidence_id, so.app_id, so.source, so.kind, so.external_id,
                o.title, o.body_text, o.data_json, o.completeness, o.fetched_at,
                sr.status AS run_status, sr.completeness AS run_completeness
-        FROM observations o JOIN source_objects so ON so.id=o.source_object_id
+        FROM authoritative_current_observations o
+        JOIN source_objects so ON so.id=o.source_object_id
         JOIN sync_runs sr ON sr.id=o.sync_run_id
-        JOIN current_runs cr ON cr.id=sr.id
         WHERE o.id=?
         """,
         (evidence_id,),

@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from worktrace.candidates.decisions import active_decisions
+from worktrace.db.authority import authoritative_current_object_ids
 from worktrace.errors import NotFound
 
 
@@ -39,16 +40,23 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
     title = str(row["suggested_title"])
     contribution_type = str(row["suggested_type"])
     status = str(row["status"])
+    human_title = False
     decisions = active_decisions(connection, candidate_id)
     for decision in decisions:
         payload = decision.payload
         if decision.action in {"confirm", "confirm_candidate"}:
             status = "confirmed"
+            if isinstance(payload.get("title"), str) and payload["title"]:
+                title = str(payload["title"])
+                human_title = True
+            if isinstance(payload.get("type"), str) and payload["type"]:
+                contribution_type = str(payload["type"])
         elif decision.action in {"ignore", "ignore_candidate"}:
             status = "ignored"
         elif decision.action in {"rename", "rename_contribution"}:
             title = str(payload.get("title", title))
             contribution_type = str(payload.get("type", contribution_type))
+            human_title = isinstance(payload.get("title"), str) and bool(payload.get("title"))
         elif decision.action == "add_member":
             object_id = str(payload.get("source_object_id", ""))
             source = connection.execute(
@@ -95,6 +103,15 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
             if isinstance(keep, list):
                 allowed = {str(value) for value in keep}
                 members = {key: value for key, value in members.items() if key in allowed}
+    current_object_ids = authoritative_current_object_ids(connection, str(row["app_id"]))
+    has_authoritative_support = str(row["seed_object_id"]) in current_object_ids or any(
+        object_id in current_object_ids for object_id in members
+    )
+    if not has_authoritative_support and status != "confirmed":
+        raise NotFound(f"candidate has no authoritative current evidence: {candidate_id}")
+    if not has_authoritative_support and not human_title:
+        title = "Confirmed contribution history (current evidence unavailable)"
+        contribution_type = "unknown"
     return CandidateView(
         id=candidate_id,
         app_id=str(row["app_id"]),
@@ -121,4 +138,10 @@ def list_candidates(
         "SELECT id FROM candidate_groups WHERE app_id=? ORDER BY generated_at DESC, id LIMIT ?",
         (app_id, limit),
     )
-    return [project_candidate(connection, str(row[0])) for row in rows]
+    result: list[CandidateView] = []
+    for row in rows:
+        try:
+            result.append(project_candidate(connection, str(row[0])))
+        except NotFound:
+            continue
+    return result

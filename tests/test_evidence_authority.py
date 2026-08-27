@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from worktrace.candidates.builder import rebuild_candidates
+from worktrace.candidates.decisions import append_decision
 from worktrace.config import AppConfig, IdentityConfig, WorkTraceConfig
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
@@ -16,7 +17,7 @@ from worktrace.db.repository import EvidenceRepository
 from worktrace.errors import NotFound
 from worktrace.mcp_server.tools import WorkTraceTools
 from worktrace.packets.builder import PacketBuilder
-from worktrace.services import export_app
+from worktrace.services import add_manual_evidence, export_app
 
 
 def _config(tmp_path: Path) -> WorkTraceConfig:
@@ -195,27 +196,312 @@ def test_unversioned_remote_run_is_quarantined_across_all_consumer_surfaces(
         )
         connection.commit()
 
-        summary = PacketBuilder(connection, config).contribution_summary("candidate:legacy")
-        assert summary["members"] == []
-        assert summary["unsupported_member_ids"] == ["obj:legacy"]
+        with pytest.raises(NotFound):
+            PacketBuilder(connection, config).contribution_summary("candidate:legacy")
 
         tools = WorkTraceTools(config=config, database_path=database_path)
         assert tools.search_evidence(query="Legacy", app_id="sample_store")["results"] == []
+        assert tools.list_contribution_candidates(app_id="sample_store")["candidates"] == []
         with pytest.raises(NotFound):
             tools.get_evidence_excerpt(evidence_id="obs:legacy")
 
         export_path = tmp_path / "export.json"
         assert export_app(connection, "sample_store", export_path) == 0
+        exported = json.loads(export_path.read_text(encoding="utf-8"))
         assert "Legacy whole-project evidence" not in export_path.read_text(encoding="utf-8")
+        assert exported["candidate_groups"] == []
+        assert exported["candidate_members"] == []
+
+        append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:legacy",
+            {
+                "contribution_id": "contribution:legacy-history",
+                "app_id": "sample_store",
+                "title": "Human-confirmed historical contribution",
+                "members": ["obj:legacy"],
+            },
+        )
+        confirmed = tools.get_contribution_summary(contribution_id="contribution:legacy-history")
+        assert confirmed["members"] == []
+        assert confirmed["unsupported_member_ids"] == ["obj:legacy"]
+        assert any(
+            "no authoritative current observation" in item for item in confirmed["limitations"]
+        )
 
         status = source_status(connection, "sample_store")[0]
         assert status["selection_policy_version"] is None
         assert status["authoritative_current"] is False
         assert status["limitations"]
-        packet_status = summary["source_status"]["jira"]["instances"][0]
+        packet_status = PacketBuilder(connection, config).source_status("sample_store")["jira"][
+            "instances"
+        ][0]
         assert packet_status["complete"] is False
         assert packet_status["authoritative_current"] is False
         assert packet_status["limitations"]
+    finally:
+        connection.close()
+
+
+def test_complete_but_partial_v2_run_is_quarantined_across_surfaces(
+    tmp_path: Path,
+) -> None:
+    connection, database_path = _ledger(tmp_path)
+    config = _config(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:v2-control",
+            object_id="obj:v2-control",
+            observation_id="obs:v2-control",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-26T10:00:00+00:00",
+            title="Eligible v2 evidence",
+        )
+        _insert_remote_observation(
+            connection,
+            run_id="run:v2-partial",
+            object_id="obj:v2-partial",
+            observation_id="obs:v2-partial",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T10:00:00+00:00",
+            title="Partial v2 evidence",
+            completeness="partial",
+        )
+        _insert_self_participation(connection, "obj:v2-partial")
+        connection.commit()
+
+        manual_observation_id = add_manual_evidence(
+            EvidenceRepository(connection),
+            config.app("sample_store"),
+            title="Eligible manual evidence",
+            body="Human-supplied control",
+            evidence_type="fixture_control",
+        )
+        repository = EvidenceRepository(connection)
+        current_ids = {str(row["id"]) for row in repository.current_observations("sample_store")}
+        assert current_ids == {"obs:v2-control", manual_observation_id}
+        assert search_evidence(connection, "sample_store", "Partial v2") == []
+        assert [
+            item["evidence_id"] for item in search_evidence(connection, "sample_store", "Eligible")
+        ] == [manual_observation_id, "obs:v2-control"]
+        with pytest.raises(NotFound):
+            evidence_excerpt(connection, "obs:v2-partial", chars=1_200)
+        assert (
+            evidence_excerpt(connection, "obs:v2-control", chars=1_200)["authoritative_current"]
+            is True
+        )
+
+        assert rebuild_candidates("sample_store", repository) == 1
+        assert (
+            connection.execute(
+                "SELECT 1 FROM candidate_groups WHERE seed_object_id='obj:v2-partial'"
+            ).fetchone()
+            is None
+        )
+
+        tools = WorkTraceTools(config=config, database_path=database_path)
+        with pytest.raises(NotFound):
+            tools.get_evidence_excerpt(evidence_id="obs:v2-partial")
+        assert (
+            tools.get_evidence_excerpt(evidence_id=manual_observation_id)["authoritative_current"]
+            is True
+        )
+
+        export_path = tmp_path / "partial-export.json"
+        export_app(connection, "sample_store", export_path)
+        exported = json.loads(export_path.read_text(encoding="utf-8"))
+        assert {row["id"] for row in exported["observations"]} == {
+            "obs:v2-control",
+            manual_observation_id,
+        }
+        assert exported["participations"] == []
+
+        latest = source_status(connection, "sample_store")[0]
+        assert latest["completeness"] == "partial"
+        assert latest["authoritative_current"] is False
+        assert latest["complete"] is False
+        assert latest["limitations"]
+    finally:
+        connection.close()
+
+
+def test_ineligible_availability_event_cannot_poison_projection_or_packet(
+    tmp_path: Path,
+) -> None:
+    connection, _ = _ledger(tmp_path)
+    config = _config(tmp_path)
+    repository = EvidenceRepository(connection)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:availability-v2",
+            object_id="obj:availability",
+            observation_id="obs:availability-v2",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-26T10:00:00+00:00",
+            title="Available v2 evidence",
+        )
+        connection.execute(
+            """
+            INSERT INTO source_object_availability_events(
+                id, source_object_id, sync_run_id, state, reason, observed_at
+            ) VALUES ('availability:v2', 'obj:availability', 'run:availability-v2',
+                      'visible', 'observed', '2026-08-26T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            """
+            UPDATE source_objects SET availability='visible', availability_reason='observed',
+                availability_observed_at='2026-08-26T10:00:00+00:00'
+            WHERE id='obj:availability'
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:availability', 'sample_store', 'obj:availability',
+                      'fixture', 'Availability candidate', 'feature',
+                      '2026-08-26T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_members(
+                candidate_id, source_object_id, membership_reason, context_only
+            ) VALUES ('candidate:availability', 'obj:availability', 'seed', 0)
+            """
+        )
+        connection.commit()
+
+        legacy_run = repository.start_sync_run("sample_store", "jira", "jira-main", {})
+        repository.record_object_unavailable(
+            legacy_run,
+            source="jira",
+            source_instance="jira-main",
+            kind="jira_issue",
+            external_id="obj:availability",
+        )
+        repository.finish_sync_run(legacy_run, "complete", "complete_for_scope")
+
+        projected = connection.execute(
+            "SELECT availability, availability_reason FROM source_objects "
+            "WHERE id='obj:availability'"
+        ).fetchone()
+        assert tuple(projected) == ("visible", "observed")
+        summary = PacketBuilder(connection, config).contribution_summary("candidate:availability")
+        assert summary["contradictions"] == []
+        assert [member["evidence_id"] for member in summary["members"]] == ["obs:availability-v2"]
+
+        eligible_run = repository.start_sync_run(
+            "sample_store",
+            "jira",
+            "jira-main",
+            {"selection_policy_version": 2},
+        )
+        repository.record_object_unavailable(
+            eligible_run,
+            source="jira",
+            source_instance="jira-main",
+            kind="jira_issue",
+            external_id="obj:availability",
+        )
+        repository.finish_sync_run(eligible_run, "complete", "complete_for_scope")
+        projected = connection.execute(
+            "SELECT availability, availability_reason FROM source_objects "
+            "WHERE id='obj:availability'"
+        ).fetchone()
+        assert tuple(projected) == ("unavailable", "not_found")
+    finally:
+        connection.close()
+
+
+def test_superseded_same_run_observation_and_participation_are_not_citable(
+    tmp_path: Path,
+) -> None:
+    connection, database_path = _ledger(tmp_path)
+    config = _config(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:same-run",
+            object_id="obj:same-run",
+            observation_id="obs:same-run-old",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T10:00:00+00:00",
+            title="Superseded same-run evidence",
+        )
+        connection.execute(
+            """
+            INSERT INTO observations(
+                id, source_object_id, sync_run_id, fetched_at, payload_hash, title,
+                body_text, data_json, completeness, adapter_version,
+                normalization_version, redaction_version
+            ) VALUES ('obs:same-run-new', 'obj:same-run', 'run:same-run',
+                      '2026-08-27T10:01:00+00:00', 'hash:same-run-new',
+                      'Current same-run evidence', 'Current same-run body', '{}',
+                      'complete_for_scope', 'fixture', '2', '1')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO actors(
+                id, source, source_instance, external_actor_id, display_name, is_self
+            ) VALUES ('actor:same-run', 'jira', 'jira-main', 'fixture-self',
+                      'Fixture Engineer', 1)
+            """
+        )
+        for participation_id, observation_id in (
+            ("part:same-run-old", "obs:same-run-old"),
+            ("part:same-run-new", "obs:same-run-new"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO participations(
+                    id, source_object_id, observation_id, actor_id, role, details_json
+                ) VALUES (?, 'obj:same-run', ?, 'actor:same-run', 'jira_assignee', '{}')
+                """,
+                (participation_id, observation_id),
+            )
+        connection.commit()
+
+        repository = EvidenceRepository(connection)
+        assert [str(row["id"]) for row in repository.current_observations("sample_store")] == [
+            "obs:same-run-new"
+        ]
+        with pytest.raises(NotFound):
+            evidence_excerpt(connection, "obs:same-run-old", chars=1_200)
+        assert (
+            evidence_excerpt(connection, "obs:same-run-new", chars=1_200)["evidence_id"]
+            == "obs:same-run-new"
+        )
+
+        tools = WorkTraceTools(config=config, database_path=database_path)
+        for stale_id in ("obs:same-run-old", "part:same-run-old"):
+            with pytest.raises(NotFound):
+                tools.get_evidence_excerpt(evidence_id=stale_id)
+        assert tools.get_evidence_excerpt(evidence_id="obs:same-run-new")["evidence_id"] == (
+            "obs:same-run-new"
+        )
+        assert tools.get_evidence_excerpt(evidence_id="part:same-run-new")["evidence_id"] == (
+            "part:same-run-new"
+        )
+        assert tools.get_evidence_excerpt(evidence_id="obj:same-run")["evidence_id"] == (
+            "obs:same-run-new"
+        )
+
+        export_path = tmp_path / "same-run-export.json"
+        export_app(connection, "sample_store", export_path)
+        exported = json.loads(export_path.read_text(encoding="utf-8"))
+        assert [row["id"] for row in exported["observations"]] == ["obs:same-run-new"]
+        assert [row["id"] for row in exported["participations"]] == ["part:same-run-new"]
     finally:
         connection.close()
 

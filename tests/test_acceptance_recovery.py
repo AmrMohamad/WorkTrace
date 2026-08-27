@@ -287,16 +287,13 @@ def test_exact_object_unavailable_then_reappearance_is_append_only(
         unavailable_packet = build_phase4_packet(connection, contribution_id, packet_config)
         summary = cast(dict[str, object], unavailable_packet["evidence_summary"])
         members = cast(list[dict[str, object]], summary["members"])
-        assert summary["unsupported_member_ids"] == []
-        assert members[0]["availability"] == "unavailable"
-        assert members[0]["availability_reason"] == "not_found"
-        assert str(members[0]["availability_evidence_id"]).startswith("availability:")
-        assert members[0]["current_complete_evidence"] is False
+        assert summary["unsupported_member_ids"] == [object_id]
+        assert members == []
         contradictions = cast(list[dict[str, object]], summary["contradictions"])
         unavailable_contradiction = next(
             item for item in contradictions if item["kind"] == "source_unavailable"
         )
-        assert unavailable_contradiction["evidence_ids"] == [members[0]["availability_evidence_id"]]
+        assert str(unavailable_contradiction["evidence_ids"][0]).startswith("availability:")
         returned = import_snapshot(
             app_config,
             _Adapter(_page(records=(_record("Visible again"),))),

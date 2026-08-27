@@ -56,13 +56,28 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
     object_ids = sorted({str(row["source_object_id"]) for row in current})
     observation_ids = sorted({str(row["id"]) for row in current})
     sync_run_ids = sorted({str(row["sync_run_id"]) for row in current})
-    candidate_ids = sorted(
-        str(row[0])
-        for row in connection.execute("SELECT id FROM candidate_groups WHERE app_id=?", (app_id,))
-    )
 
     def placeholders(values: list[str]) -> str:
         return ",".join("?" for _ in values) or "NULL"
+
+    candidate_ids = sorted(
+        str(row[0])
+        for row in connection.execute(
+            f"""
+            SELECT candidate.id FROM candidate_groups candidate
+            WHERE candidate.app_id=?
+              AND (
+                  candidate.seed_object_id IN ({placeholders(object_ids)})
+                  OR EXISTS (
+                      SELECT 1 FROM candidate_members member
+                      WHERE member.candidate_id=candidate.id
+                        AND member.source_object_id IN ({placeholders(object_ids)})
+                  )
+              )
+            """,
+            [app_id, *object_ids, *object_ids],
+        )
+    )
 
     payload: dict[str, object] = {
         "schema": "worktrace-export-v2",
@@ -148,7 +163,10 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
     ]
     payload["candidate_groups"] = [
         dict(row)
-        for row in connection.execute("SELECT * FROM candidate_groups WHERE app_id=?", (app_id,))
+        for row in connection.execute(
+            f"SELECT * FROM candidate_groups WHERE id IN ({placeholders(candidate_ids)})",
+            candidate_ids,
+        )
     ]
     payload["candidate_members"] = [
         dict(row)

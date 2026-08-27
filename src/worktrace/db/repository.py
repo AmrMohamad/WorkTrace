@@ -10,7 +10,10 @@ from typing import cast
 
 from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.constants import ADAPTER_VERSION, NORMALIZATION_VERSION, REDACTION_VERSION
-from worktrace.db.authority import authoritative_current_observations
+from worktrace.db.authority import (
+    authoritative_current_observations,
+    authoritative_current_run_ctes,
+)
 from worktrace.domain.models import (
     ActorObservation,
     AvailabilityObservation,
@@ -147,39 +150,58 @@ class EvidenceRepository:
                 """,
                 (status, completeness, iso(utc_now()), error_summary, run_id),
             )
-            if status == "complete":
-                self.connection.execute(
-                    """
-                    UPDATE source_objects
-                    SET availability = (
-                            SELECT event.state
-                            FROM source_object_availability_events event
-                            WHERE event.source_object_id=source_objects.id
-                              AND event.sync_run_id=?
-                            ORDER BY event.observed_at DESC, event.id DESC LIMIT 1
-                        ),
-                        availability_reason = (
-                            SELECT event.reason
-                            FROM source_object_availability_events event
-                            WHERE event.source_object_id=source_objects.id
-                              AND event.sync_run_id=?
-                            ORDER BY event.observed_at DESC, event.id DESC LIMIT 1
-                        ),
-                        availability_observed_at = (
-                            SELECT event.observed_at
-                            FROM source_object_availability_events event
-                            WHERE event.source_object_id=source_objects.id
-                              AND event.sync_run_id=?
-                            ORDER BY event.observed_at DESC, event.id DESC LIMIT 1
-                        )
-                    WHERE EXISTS (
-                        SELECT 1 FROM source_object_availability_events event
-                        WHERE event.source_object_id=source_objects.id
-                          AND event.sync_run_id=?
-                    )
-                    """,
-                    (run_id, run_id, run_id, run_id),
+            self._project_authoritative_availability(run_id)
+
+    def _project_authoritative_availability(self, run_id: str) -> None:
+        """Reconcile affected objects from eligible events only.
+
+        Running this for every finalization also restores the prior eligible projection when
+        a failed, partial, or legacy remote run staged an availability event.
+        """
+
+        self.connection.execute(
+            f"""
+            WITH {authoritative_current_run_ctes()},
+            affected_objects AS (
+                SELECT DISTINCT source_object_id
+                FROM source_object_availability_events
+                WHERE sync_run_id=?
+            ), ranked_events AS (
+                SELECT event.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY event.source_object_id
+                        ORDER BY eligible_run.completed_at DESC,
+                                 event.observed_at DESC, event.id DESC
+                    ) AS position
+                FROM source_object_availability_events event
+                JOIN ranked_authoritative_runs eligible_run
+                  ON eligible_run.id=event.sync_run_id
+                JOIN affected_objects affected
+                  ON affected.source_object_id=event.source_object_id
+            ), current_events AS (
+                SELECT * FROM ranked_events WHERE position=1
+            )
+            UPDATE source_objects
+            SET availability = (
+                    SELECT event.state FROM current_events event
+                    WHERE event.source_object_id=source_objects.id
+                ),
+                availability_reason = (
+                    SELECT event.reason FROM current_events event
+                    WHERE event.source_object_id=source_objects.id
+                ),
+                availability_observed_at = (
+                    SELECT event.observed_at FROM current_events event
+                    WHERE event.source_object_id=source_objects.id
                 )
+            WHERE id IN (SELECT source_object_id FROM affected_objects)
+              AND EXISTS (
+                  SELECT 1 FROM current_events event
+                  WHERE event.source_object_id=source_objects.id
+              )
+            """,
+            (run_id,),
+        )
 
     def mark_stale_runs_failed(self, older_than: timedelta = timedelta(hours=6)) -> int:
         cutoff = iso(utc_now() - older_than)
