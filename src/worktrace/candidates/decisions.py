@@ -363,14 +363,17 @@ def decision_scope_map(
     return result
 
 
-def decision_lineages(connection: sqlite3.Connection) -> tuple[DecisionLineage, ...]:
-    """Build active app-scoped candidate/contribution lineage components."""
+def decision_lineages(
+    connection: sqlite3.Connection,
+    *,
+    active_only: bool = True,
+) -> tuple[DecisionLineage, ...]:
+    """Build app-scoped lineage components for the selected decision projection."""
 
-    active = decision_stream(connection, active_only=True)
+    decisions = decision_stream(connection, active_only=active_only)
     adjacency: dict[tuple[str, str], set[tuple[str, str]]] = {}
     node_kind: dict[tuple[str, str], str] = {}
-    creation_app: dict[str, str] = {}
-    for decision in active:
+    for decision in decisions:
         if decision.action not in CREATION_ACTIONS:
             continue
         app_id = creation_decision_scope_app(
@@ -381,7 +384,6 @@ def decision_lineages(connection: sqlite3.Connection) -> tuple[DecisionLineage, 
         contribution_id = decision.payload.get("contribution_id")
         if app_id is None or not isinstance(contribution_id, str) or not contribution_id:
             continue
-        creation_app[decision.id] = app_id
         candidates = {decision.target_id}
         raw_candidates = decision.payload.get("candidate_ids")
         if isinstance(raw_candidates, list):
@@ -402,7 +404,7 @@ def decision_lineages(connection: sqlite3.Connection) -> tuple[DecisionLineage, 
                 other for other in candidate_nodes if other != candidate_node
             )
 
-    node_apps = decision_node_apps(connection, active_only=True)
+    decision_scopes = decision_scope_map(connection, active_only=active_only)
 
     result: list[DecisionLineage] = []
     visited: set[tuple[str, str]] = set()
@@ -426,17 +428,10 @@ def decision_lineages(connection: sqlite3.Connection) -> tuple[DecisionLineage, 
         component_contribution_ids = frozenset(component_ids - set(component_candidate_ids))
         scoped: list[Decision] = []
         creations: list[Decision] = []
-        for decision in active:
+        for decision in decisions:
             if decision.target_id not in component_ids:
                 continue
-            decision_app = creation_app.get(decision.id)
-            if decision_app is None:
-                decision_app = scoped_decision_app(
-                    connection,
-                    decision,
-                    node_apps=node_apps,
-                )
-            if decision_app != app_id:
+            if decision_scopes.get(decision.id) != app_id:
                 continue
             scoped.append(decision)
             if decision.action in CREATION_ACTIONS:

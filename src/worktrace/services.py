@@ -99,21 +99,24 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         and isinstance(decision_payloads[str(decision["id"])].get("contribution_id"), str)
         and decision_payloads[str(decision["id"])]["contribution_id"]
     ]
-    history_candidate_ids = {str(decision["target_id"]) for decision in valid_creation_decisions}
-    contribution_ids = {
-        str(decision_payloads[str(decision["id"])]["contribution_id"])
-        for decision in valid_creation_decisions
-    }
-    active_lineages = tuple(
-        lineage for lineage in decision_lineages(connection) if lineage.app_id == app_id
+    historical_lineages = tuple(
+        lineage
+        for lineage in decision_lineages(connection, active_only=False)
+        if lineage.app_id == app_id
     )
-    active_lineage_candidate_ids = {
-        candidate_id for lineage in active_lineages for candidate_id in lineage.candidate_ids
+    history_candidate_ids = {
+        candidate_id for lineage in historical_lineages for candidate_id in lineage.candidate_ids
     }
-    active_lineage_contribution_ids = {
+    contribution_ids = {
         contribution_id
-        for lineage in active_lineages
+        for lineage in historical_lineages
         for contribution_id in lineage.contribution_ids
+    }
+    historical_lineage_decisions = {
+        decision.id: frozenset(item.id for item in lineage.decisions)
+        for lineage in historical_lineages
+        for decision in lineage.decisions
+        if decision.action in CREATION_ACTIONS
     }
     scoped_source_object_ids = {
         str(row[0])
@@ -200,8 +203,7 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         *candidate_ids,
         *(projected.id for _, projected in unsupported_candidates),
         *history_candidate_ids,
-        *active_lineage_candidate_ids,
-        *active_lineage_contribution_ids,
+        *contribution_ids,
         *object_ids,
     }
     included_decision_ids: set[str] = set()
@@ -382,11 +384,16 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         creation_id = str(creation["id"])
         creation_payload = decision_payloads[creation_id]
         contribution_id = str(creation_payload["contribution_id"])
+        lineage_decision_ids = historical_lineage_decisions.get(creation_id)
         history_decision_ids = [
             str(decision["id"])
             for decision in all_decisions
             if str(decision["id"]) in included_decision_ids
-            and str(decision["target_id"]) in {candidate_id, contribution_id}
+            and (
+                str(decision["id"]) in lineage_decision_ids
+                if lineage_decision_ids is not None
+                else str(decision["target_id"]) in {candidate_id, contribution_id}
+            )
         ]
         unsupported_projected = projected_by_id.get(candidate_id)
         unsupported_member_ids = sorted(

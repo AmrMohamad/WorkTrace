@@ -2068,6 +2068,251 @@ def test_export_preserves_rowless_secondary_alias_decision_lineage(
         connection.close()
 
 
+@pytest.mark.parametrize("creation_action", ["merge_contributions", "split_contribution"])
+def test_export_preserves_inactive_rowless_secondary_alias_history(
+    tmp_path: Path,
+    creation_action: str,
+) -> None:
+    connection, database_path = _ledger(tmp_path)
+    try:
+        for suffix, scope, hour in (
+            ("a", {"selection_policy_version": 2}, 8),
+            ("b", {}, 9),
+            ("c", {"selection_policy_version": 2}, 10),
+        ):
+            _insert_remote_observation(
+                connection,
+                run_id=f"run:inactive-alias-{suffix}",
+                object_id=f"obj:inactive-alias-{suffix}",
+                observation_id=f"obs:inactive-alias-{suffix}",
+                status="complete",
+                scope=scope,
+                completed_at=f"2026-08-27T{hour:02d}:00:00+00:00",
+                title=f"Inactive alias {suffix.upper()}",
+                source_instance=f"jira-inactive-alias-{suffix}",
+            )
+            _insert_candidate_fixture(
+                connection,
+                f"candidate:inactive-alias-{suffix}",
+                f"obj:inactive-alias-{suffix}",
+                f"Inactive alias {suffix.upper()}",
+            )
+        connection.commit()
+
+        contribution_id = f"contribution:inactive-alias-{creation_action}"
+        creation_id = append_decision(
+            connection,
+            creation_action,
+            "candidate:inactive-alias-a",
+            {
+                "contribution_id": contribution_id,
+                "candidate_ids": ["candidate:inactive-alias-b"],
+                "app_id": "sample_store",
+                "title": "Inactive alias creation",
+                "members": ["obj:inactive-alias-a"],
+                "keep_source_object_ids": ["obj:inactive-alias-a"],
+            },
+        )
+        rename_id = append_decision(
+            connection,
+            "rename_contribution",
+            "candidate:inactive-alias-b",
+            {"title": "Secondary alias title"},
+        )
+        add_id = append_decision(
+            connection,
+            "add_member",
+            "candidate:inactive-alias-b",
+            {"source_object_id": "obj:inactive-alias-c"},
+        )
+        remove_id = append_decision(
+            connection,
+            "remove_member",
+            "candidate:inactive-alias-b",
+            {"source_object_id": "obj:inactive-alias-c"},
+        )
+        remove_undo_id = undo_decision(connection, remove_id)
+        attest_id = append_decision(
+            connection,
+            "attest_claim",
+            "candidate:inactive-alias-b",
+            {
+                "claim": "currently_enabled",
+                "statement": "Secondary alias attestation",
+            },
+        )
+
+        # The alias row is rebuildable and its source observation is quarantined. Active
+        # packet/MCP reads may follow the immutable active lineage, but export must not
+        # resurrect either the deleted candidate row or its legacy provider evidence.
+        connection.execute("DELETE FROM candidate_groups WHERE id='candidate:inactive-alias-b'")
+        connection.commit()
+
+        builder = PacketBuilder(connection, _config(tmp_path))
+        active_packet = builder.build_packet(contribution_id)
+        active_result = next(
+            item
+            for item in active_packet["sections"]["result"]
+            if item["question_id"] == "result.current_use"
+        )
+        assert active_packet["contribution"]["title"] == "Secondary alias title"
+        assert active_result["answer_draft"] == "Secondary alias attestation"
+        assert _summary_member_ids(builder.contribution_summary(contribution_id)) == {
+            "obj:inactive-alias-a",
+            "obj:inactive-alias-c",
+        }
+        mcp_packet = WorkTraceTools(
+            config=_config(tmp_path), database_path=database_path
+        ).build_phase4_packet(contribution_id=contribution_id)
+        assert mcp_packet["contribution"]["title"] == "Secondary alias title"
+
+        active_export_path = tmp_path / f"{creation_action}-active-alias-history.json"
+        export_app(connection, "sample_store", active_export_path)
+        active_export = json.loads(active_export_path.read_text(encoding="utf-8"))
+        assert {row["id"] for row in active_export["human_decisions"]} == {
+            creation_id,
+            rename_id,
+            add_id,
+            remove_id,
+            remove_undo_id,
+            attest_id,
+        }
+
+        # If a later rebuild also removes the primary candidate row, the same immutable
+        # lineage belongs in the bounded unsupported-history projection.
+        connection.execute("DELETE FROM candidate_groups WHERE id='candidate:inactive-alias-a'")
+        connection.commit()
+        creation_undo_id = undo_decision(connection, creation_id)
+        with pytest.raises(NotFound):
+            builder.contribution_summary(contribution_id)
+        with pytest.raises(NotFound):
+            WorkTraceTools(
+                config=_config(tmp_path), database_path=database_path
+            ).get_contribution_summary(contribution_id=contribution_id)
+
+        inactive_export_path = tmp_path / f"{creation_action}-inactive-alias-history.json"
+        export_app(connection, "sample_store", inactive_export_path)
+        exported_text = inactive_export_path.read_text(encoding="utf-8")
+        exported = json.loads(exported_text)
+        assert {row["id"] for row in exported["human_decisions"]} == {
+            creation_id,
+            rename_id,
+            add_id,
+            remove_id,
+            remove_undo_id,
+            attest_id,
+            creation_undo_id,
+        }
+        assert "candidate:inactive-alias-b" not in {
+            row["id"] for row in exported["candidate_groups"]
+        }
+        assert "candidate:inactive-alias-b" not in {
+            row["candidate_id"] for row in exported["candidate_members"]
+        }
+        assert "obs:inactive-alias-b" not in {row["id"] for row in exported["observations"]}
+        assert "run:inactive-alias-b" not in exported_text
+        unsupported = next(
+            row
+            for row in exported["unsupported_contribution_history"]
+            if row["candidate_id"] == "candidate:inactive-alias-a"
+        )
+        assert unsupported["status"] == "confirmed_history_undone"
+        assert set(unsupported["decision_ids"]) == {
+            creation_id,
+            rename_id,
+            add_id,
+            remove_id,
+            remove_undo_id,
+            attest_id,
+            creation_undo_id,
+        }
+    finally:
+        connection.close()
+
+
+def test_export_preserves_inactive_multi_hop_alias_history(tmp_path: Path) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        for suffix, hour in (("a", 8), ("b", 9), ("c", 10)):
+            _insert_remote_observation(
+                connection,
+                run_id=f"run:inactive-multi-hop-{suffix}",
+                object_id=f"obj:inactive-multi-hop-{suffix}",
+                observation_id=f"obs:inactive-multi-hop-{suffix}",
+                status="complete",
+                scope={"selection_policy_version": 2},
+                completed_at=f"2026-08-27T{hour:02d}:00:00+00:00",
+                title=f"Inactive multi-hop {suffix.upper()}",
+                source_instance=f"jira-inactive-multi-hop-{suffix}",
+            )
+            _insert_candidate_fixture(
+                connection,
+                f"candidate:inactive-multi-hop-{suffix}",
+                f"obj:inactive-multi-hop-{suffix}",
+                f"Inactive multi-hop {suffix.upper()}",
+            )
+        connection.commit()
+
+        first_creation = append_decision(
+            connection,
+            "merge_contributions",
+            "candidate:inactive-multi-hop-a",
+            {
+                "contribution_id": "contribution:inactive-multi-hop-ab",
+                "candidate_ids": ["candidate:inactive-multi-hop-b"],
+                "app_id": "sample_store",
+                "title": "First historical hop",
+                "members": ["obj:inactive-multi-hop-a", "obj:inactive-multi-hop-b"],
+            },
+        )
+        second_creation = append_decision(
+            connection,
+            "split_contribution",
+            "candidate:inactive-multi-hop-b",
+            {
+                "contribution_id": "contribution:inactive-multi-hop-bc",
+                "candidate_ids": ["candidate:inactive-multi-hop-c"],
+                "app_id": "sample_store",
+                "title": "Second historical hop",
+                "members": ["obj:inactive-multi-hop-b", "obj:inactive-multi-hop-c"],
+                "keep_source_object_ids": [
+                    "obj:inactive-multi-hop-b",
+                    "obj:inactive-multi-hop-c",
+                ],
+            },
+        )
+        tail_followup = append_decision(
+            connection,
+            "rename_contribution",
+            "candidate:inactive-multi-hop-c",
+            {"title": "Historical tail alias"},
+        )
+        connection.execute(
+            "DELETE FROM candidate_groups "
+            "WHERE id IN ('candidate:inactive-multi-hop-b', "
+            "             'candidate:inactive-multi-hop-c')"
+        )
+        connection.commit()
+        second_undo = undo_decision(connection, second_creation)
+        first_undo = undo_decision(connection, first_creation)
+
+        export_path = tmp_path / "inactive-multi-hop-history.json"
+        export_app(connection, "sample_store", export_path)
+        exported = json.loads(export_path.read_text(encoding="utf-8"))
+        assert {row["id"] for row in exported["human_decisions"]} == {
+            first_creation,
+            second_creation,
+            tail_followup,
+            second_undo,
+            first_undo,
+        }
+        assert {row["id"] for row in exported["candidate_groups"]} == {
+            "candidate:inactive-multi-hop-a"
+        }
+    finally:
+        connection.close()
+
+
 def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_closed(
     tmp_path: Path,
 ) -> None:
@@ -2185,6 +2430,25 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
         assert "PRIVATE APP B" not in exported_text
         assert "APP B ONLY" not in exported_text
         assert "AMBIGUOUS ALIAS PAYLOAD" not in exported_text
+
+        undo_a = undo_decision(connection, creation_a)
+        undo_b = undo_decision(connection, creation_b)
+        inactive_export_path = tmp_path / "secondary-alias-collision-inactive.json"
+        export_app(connection, "sample_store", inactive_export_path)
+        inactive_export_text = inactive_export_path.read_text(encoding="utf-8")
+        inactive_export = json.loads(inactive_export_text)
+        assert {row["id"] for row in inactive_export["human_decisions"]} == {
+            creation_a,
+            rename_a,
+            undo_a,
+        }
+        assert creation_b not in inactive_export_text
+        assert undo_b not in inactive_export_text
+        assert ambiguous not in inactive_export_text
+        assert rename_b not in inactive_export_text
+        assert "PRIVATE APP B" not in inactive_export_text
+        assert "APP B ONLY" not in inactive_export_text
+        assert "AMBIGUOUS ALIAS PAYLOAD" not in inactive_export_text
     finally:
         connection.close()
 
