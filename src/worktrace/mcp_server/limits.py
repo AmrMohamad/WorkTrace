@@ -63,6 +63,72 @@ _SENSITIVE_OUTPUT_KEYS = {
     "x_api_key",
 }
 
+# These keys are emitted by WorkTrace itself and carry opaque ledger identifiers,
+# not provider prose.  Preserve only values that satisfy the public stable-ID
+# grammar; provider-controlled fields such as ``external_id`` and ``source_instance``
+# deliberately remain subject to output redaction.
+_STABLE_IDENTIFIER_KEYS = frozenset(
+    {
+        "actor_id",
+        "availability_evidence_id",
+        "candidate_id",
+        "confirmed_contribution_id",
+        "contribution_id",
+        "decision_id",
+        "evidence_id",
+        "from_object_id",
+        "import_session_id",
+        "metadata_source_object_id",
+        "object_id",
+        "observation_evidence_id",
+        "participation_evidence_id",
+        "reference_id",
+        "replaces_decision_id",
+        "run_id",
+        "seed_object_id",
+        "source_object_id",
+        "supporting_observation_id",
+        "sync_run_id",
+        "target_id",
+        "to_object_id",
+        "undo_target_id",
+        "unsupported_seed_object_id",
+    }
+)
+_STABLE_IDENTIFIER_LIST_KEYS = frozenset(
+    {
+        "candidate_ids",
+        "claim_supporting_evidence_ids",
+        "compensated_by_decision_ids",
+        "contradicting_evidence_ids",
+        "contribution_ids",
+        "decision_ids",
+        "evidence_ids",
+        "module_evidence_ids",
+        "supporting_evidence_ids",
+        "title_supporting_evidence_ids",
+        "unsupported_member_ids",
+    }
+)
+_STABLE_IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,127}(?::[A-Za-z0-9._-]{1,128})*$")
+_INTERNAL_ID_PREFIXES = frozenset(
+    {
+        "actor",
+        "availability",
+        "candidate",
+        "contribution",
+        "decision",
+        "obj",
+        "obs",
+        "part",
+        "participation",
+        "ref",
+        "run",
+        "session",
+        "source",
+    }
+)
+
 
 def _redact_string(value: str) -> str:
     result = value
@@ -71,22 +137,35 @@ def _redact_string(value: str) -> str:
     return result
 
 
-def redact_output(value: object) -> JsonValue:
+def _is_structured_identifier(value: str, field_name: str | None) -> bool:
+    if field_name is None or _STABLE_IDENTIFIER.fullmatch(value) is None:
+        return False
+    key = field_name.casefold()
+    if key in _STABLE_IDENTIFIER_KEYS or key in _STABLE_IDENTIFIER_LIST_KEYS:
+        return True
+    if key == "id":
+        return value.partition(":")[0].casefold() in _INTERNAL_ID_PREFIXES
+    return False
+
+
+def redact_output(value: object, *, field_name: str | None = None) -> JsonValue:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
+        if _is_structured_identifier(value, field_name):
+            return value
         return _redact_string(value)
     if isinstance(value, dict):
         return {
             str(key): (
                 "[REDACTED]"
                 if str(key).casefold() in _SENSITIVE_OUTPUT_KEYS
-                else redact_output(item)
+                else redact_output(item, field_name=str(key))
             )
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple, set)):
-        return [redact_output(item) for item in value]
+        return [redact_output(item, field_name=field_name) for item in value]
     return _redact_string(str(value))
 
 
@@ -97,22 +176,26 @@ def _serialized_size(value: JsonValue) -> int:
 def _longest_string(value: JsonValue) -> tuple[object, object, str] | None:
     best: tuple[object, object, str] | None = None
 
-    def visit(current: JsonValue) -> None:
+    def visit(current: JsonValue, field_name: str | None = None) -> None:
         nonlocal best
         if isinstance(current, dict):
             for key, item in current.items():
                 if isinstance(item, str):
-                    if best is None or len(item) > len(best[2]):
+                    if not _is_structured_identifier(item, key) and (
+                        best is None or len(item) > len(best[2])
+                    ):
                         best = (current, key, item)
                 else:
-                    visit(item)
+                    visit(item, key)
         elif isinstance(current, list):
             for index, item in enumerate(current):
                 if isinstance(item, str):
-                    if best is None or len(item) > len(best[2]):
+                    if not _is_structured_identifier(item, field_name) and (
+                        best is None or len(item) > len(best[2])
+                    ):
                         best = (current, index, item)
                 else:
-                    visit(item)
+                    visit(item, field_name)
 
     visit(value)
     return best

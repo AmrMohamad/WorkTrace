@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import uuid
 from datetime import date
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from worktrace.errors import NotFound, ScopeViolation
 from worktrace.mcp_server.limits import enforce_total_limit
 from worktrace.mcp_server.server import SERVER_INSTRUCTIONS, build_mcp_server
 from worktrace.mcp_server.tools import WorkTraceTools
+from worktrace.normalize.redaction import Redactor
+from worktrace.services import export_app
 
 
 def _config(tmp_path: Path) -> WorkTraceConfig:
@@ -274,6 +277,106 @@ def test_mcp_redacts_legacy_secret_forms_at_the_output_boundary(tmp_path: Path) 
     )
     serialized = json.dumps({"excerpt": excerpt, "keyed": keyed})
     assert all(secret not in serialized for secret in secrets)
+
+
+def test_phone_like_stable_decision_ids_remain_exact_across_all_read_surfaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path, _, tools = _mcp_state(tmp_path)
+    phone_like_uuid = uuid.UUID("12345678-1234-1234-8234-123456789012")
+    monkeypatch.setattr(
+        "worktrace.candidates.decisions.uuid.uuid4",
+        lambda: phone_like_uuid,
+    )
+    decision_id = f"decision:{phone_like_uuid}"
+    contribution_id = "contribution:manual_1"
+    secret = "fixture-stable-id-secret"
+
+    connection = connect(database_path)
+    try:
+        assert (
+            append_decision(
+                connection,
+                "confirm_candidate",
+                "candidate:manual_1",
+                {
+                    "app_id": "sample_store",
+                    "contribution_id": contribution_id,
+                    "members": ["obj:manual_1"],
+                    "title": f"Reviewed token={secret}",
+                },
+                redactor=Redactor(b"fixture-output-redaction-key"),
+            )
+            == decision_id
+        )
+        destination = tmp_path / "stable-id-export.json"
+        export_app(connection, "sample_store", destination)
+    finally:
+        connection.close()
+
+    candidates = tools.list_contribution_candidates(app_id="sample_store")
+    candidate = next(
+        item for item in candidates["candidates"] if item["candidate_id"] == "candidate:manual_1"
+    )
+    summary = tools.get_contribution_summary(contribution_id=contribution_id)
+    packet = tools.build_phase4_packet(contribution_id=contribution_id)
+    excerpt = tools.get_evidence_excerpt(evidence_id=decision_id)
+
+    assert candidate["title_supporting_evidence_ids"] == [decision_id]
+    assert summary["contribution"]["title_supporting_evidence_ids"] == [decision_id]
+    assert packet["contribution"]["title_supporting_evidence_ids"] == [decision_id]
+    assert excerpt["evidence_id"] == decision_id
+    assert excerpt["decision_context"]["target_id"] == "candidate:manual_1"
+    for response in (candidates, summary, packet, excerpt):
+        serialized = json.dumps(
+            response,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        assert decision_id in serialized
+        assert secret not in serialized
+        assert "[REDACTED_SECRET]" in serialized
+        assert len(serialized) <= MAX_RESPONSE_CHARS
+
+    exported = json.loads(destination.read_text(encoding="utf-8"))
+    exported_decision = next(
+        item for item in exported["human_decisions"] if item["id"] == decision_id
+    )
+    assert exported_decision["id"] == decision_id
+    assert decision_id in json.dumps(exported, ensure_ascii=False, sort_keys=True)
+    assert secret not in exported_decision["payload_json"]
+    assert "[REDACTED_SECRET]" in exported_decision["payload_json"]
+
+    boundary = enforce_total_limit(
+        {
+            "evidence_id": decision_id,
+            "supporting_evidence_ids": [decision_id],
+            "external_id": str(phone_like_uuid),
+            "source_instance": f"token={secret}",
+            "provider_payload": {"id": str(phone_like_uuid)},
+        }
+    )
+    assert boundary["evidence_id"] == decision_id
+    assert boundary["supporting_evidence_ids"] == [decision_id]
+    assert boundary["external_id"] == "[REDACTED_PHONE]"
+    assert boundary["source_instance"] == "[REDACTED_SECRET]"
+    assert boundary["provider_payload"] == {"id": "[REDACTED_PHONE]"}
+
+    long_id = f"decision:{'1' * 120}"
+    truncated = enforce_total_limit(
+        {
+            "evidence_id": long_id,
+            "supporting_evidence_ids": [long_id],
+            "text": "x" * (MAX_RESPONSE_CHARS * 2),
+        }
+    )
+    assert truncated["evidence_id"] == long_id
+    assert truncated["supporting_evidence_ids"] == [long_id]
+    assert len(json.dumps(truncated, ensure_ascii=False, separators=(",", ":"))) <= (
+        MAX_RESPONSE_CHARS
+    )
 
 
 def test_record_excerpt_and_total_response_budgets_are_enforced(tmp_path: Path) -> None:

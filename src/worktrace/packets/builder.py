@@ -9,6 +9,7 @@ from typing import cast
 
 from worktrace.candidates.decisions import (
     CREATION_ACTIONS,
+    compensating_decision_ids,
     decision_lineages,
     decision_scope_map,
     decision_stream,
@@ -1573,16 +1574,8 @@ class PacketBuilder:
                     replaces_decision_id = item.id
 
         compensated_by = [
-            str(row["id"])[:_MAX_DECISION_VALUE_CHARS]
-            for row in self.connection.execute(
-                """
-                SELECT id FROM human_decisions
-                WHERE action IN ('undo', 'undo_decision') AND undo_target_id=?
-                ORDER BY created_at, id
-                LIMIT ?
-                """,
-                (decision_id, _MAX_DECISION_LINEAGE_IDS),
-            )
+            value[:_MAX_DECISION_VALUE_CHARS]
+            for value in compensating_decision_ids(self.connection, decision_id)
         ]
         undo_target_id = (
             str(decision["undo_target_id"])[:_MAX_DECISION_VALUE_CHARS]
@@ -1599,7 +1592,8 @@ class PacketBuilder:
             "rationale": _bounded_value(payload.get("reason"), _MAX_DECISION_VALUE_CHARS),
             "created_at": str(decision["created_at"])[:_MAX_DECISION_VALUE_CHARS],
             "actor": str(decision["actor_label"])[:_MAX_DECISION_ACTOR_CHARS],
-            "active": not compensated_by,
+            "active": decision_id
+            in {item.id for item in decision_stream(self.connection, active_only=True)},
             "undo_target_id": undo_target_id,
             "replaces_decision_id": replaces_decision_id,
             "compensated_by_decision_ids": compensated_by,

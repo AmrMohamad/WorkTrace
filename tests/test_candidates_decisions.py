@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from worktrace.candidates.builder import rebuild_candidates
-from worktrace.candidates.decisions import append_decision, undo_decision
+from worktrace.candidates.decisions import append_decision, decision_stream, undo_decision
 from worktrace.candidates.projector import CandidateView, project_candidate
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
@@ -19,6 +20,8 @@ from worktrace.domain.models import (
     ParticipationObservation,
     SourceIdentity,
 )
+from worktrace.errors import ScopeViolation
+from worktrace.services import export_app
 
 
 def _object(external_id: str, title: str) -> NormalizedObject:
@@ -129,6 +132,60 @@ def test_decisions_are_reversible_and_survive_candidate_rebuild(tmp_path: Path) 
         assert _member_ids(rebuilt) == {alpha}
         assert before == after == 9
         assert any(decision["id"] == confirm_id for decision in rebuilt.decisions)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "payload"),
+    (
+        ("rename_contribution", {"title": "Reviewed title"}),
+        ("confirm", {}),
+        ("add_member", {"source_object_id": "__SECOND_OBJECT__"}),
+    ),
+)
+def test_undo_of_undo_is_rejected_without_mutating_the_active_stream(
+    tmp_path: Path,
+    action: str,
+    payload: dict[str, object],
+) -> None:
+    connection, _, candidates, objects = _candidate_state(tmp_path)
+    candidate_id = candidates[0]
+    resolved_payload = {
+        key: (objects[1] if value == "__SECOND_OBJECT__" else value)
+        for key, value in payload.items()
+    }
+    try:
+        original_id = append_decision(connection, action, candidate_id, resolved_payload)
+        undo_id = undo_decision(connection, original_id)
+        before = connection.execute("SELECT COUNT(*) FROM human_decisions").fetchone()[0]
+
+        with pytest.raises(ScopeViolation, match="undo decisions cannot themselves be undone"):
+            undo_decision(connection, undo_id)
+        with pytest.raises(ScopeViolation, match="undo decisions cannot themselves be undone"):
+            append_decision(
+                connection,
+                "undo_decision",
+                candidate_id,
+                {"compensates": undo_id},
+                undo_target_id=undo_id,
+            )
+        with pytest.raises(ScopeViolation, match="decision has already been undone"):
+            undo_decision(connection, original_id)
+
+        after = connection.execute("SELECT COUNT(*) FROM human_decisions").fetchone()[0]
+        active_ids = {decision.id for decision in decision_stream(connection, active_only=True)}
+        assert before == after == 2
+        assert original_id not in active_ids
+        assert undo_id not in active_ids
+
+        export_path = tmp_path / f"{action}-undo-rejection.json"
+        export_app(connection, "sample_store", export_path)
+        exported = json.loads(export_path.read_text(encoding="utf-8"))
+        assert {row["id"] for row in exported["human_decisions"]} == {
+            original_id,
+            undo_id,
+        }
     finally:
         connection.close()
 

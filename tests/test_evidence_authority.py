@@ -1986,6 +1986,9 @@ def test_human_title_claims_cite_active_decisions_and_expose_bounded_context(
         assert compensated_excerpt["decision_context"]["compensated_by_decision_ids"] == [undo_id]
         assert compensated_excerpt["decision_context"]["active"] is False
         assert undo_excerpt["decision_context"]["undo_target_id"] == rename_id
+        assert undo_excerpt["decision_context"]["active"] is False
+        with pytest.raises(ScopeViolation, match="undo decisions cannot themselves be undone"):
+            undo_decision(connection, undo_id)
 
         confirmation_undo_id = undo_decision(connection, confirmation_id)
         downgraded_packet = tools.build_phase4_packet(contribution_id="candidate:title-citation")
@@ -2617,6 +2620,18 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
             builder.contribution_summary("candidate:shared-secondary-alias")
         with pytest.raises(ScopeViolation):
             builder.evidence_excerpt(ambiguous, 1_200)
+        before_ambiguous_undo = connection.execute(
+            "SELECT COUNT(*) FROM human_decisions"
+        ).fetchone()[0]
+        with pytest.raises(
+            ScopeViolation,
+            match="decision has no unambiguous configured application scope",
+        ):
+            undo_decision(connection, ambiguous)
+        assert (
+            connection.execute("SELECT COUNT(*) FROM human_decisions").fetchone()[0]
+            == before_ambiguous_undo
+        )
         excerpt_a = builder.evidence_excerpt(rename_a, 1_200)
         excerpt_b = builder.evidence_excerpt(rename_b, 1_200)
         assert (excerpt_a["app_id"], excerpt_a["text"]) == (

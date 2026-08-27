@@ -54,6 +54,7 @@ VALID_ACTIONS = {
 }
 
 CREATION_ACTIONS = frozenset({"confirm_candidate", "merge_contributions", "split_contribution"})
+UNDO_ACTIONS = frozenset({"undo", "undo_decision"})
 
 
 def snapshot_member_ids(payload: Mapping[str, object]) -> set[str]:
@@ -65,6 +66,42 @@ def snapshot_member_ids(payload: Mapping[str, object]) -> set[str]:
         if isinstance(values, list):
             result.update(str(value) for value in values if isinstance(value, str) and value)
     return result
+
+
+def _valid_compensation_map(rows: list[sqlite3.Row]) -> dict[str, str]:
+    """Map each compensated decision to the first structurally valid undo event."""
+
+    rows_by_id = {str(row["id"]): row for row in rows}
+    result: dict[str, str] = {}
+    for row in rows:
+        if str(row["action"]) not in UNDO_ACTIONS or not row["undo_target_id"]:
+            continue
+        target_decision_id = str(row["undo_target_id"])
+        target = rows_by_id.get(target_decision_id)
+        if target is None or str(target["action"]) in UNDO_ACTIONS:
+            continue
+        if str(row["target_id"]) != str(target["target_id"]):
+            continue
+        try:
+            parsed = json.loads(str(row["payload_json"]))
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        compensates = parsed.get("compensates") if isinstance(parsed, dict) else None
+        if compensates is not None and compensates != target_decision_id:
+            continue
+        result.setdefault(target_decision_id, str(row["id"]))
+    return result
+
+
+def compensating_decision_ids(
+    connection: sqlite3.Connection,
+    decision_id: str,
+) -> tuple[str, ...]:
+    """Return the valid compensation event for one decision, if present."""
+
+    rows = list(connection.execute("SELECT * FROM human_decisions ORDER BY created_at, id"))
+    compensation_id = _valid_compensation_map(rows).get(decision_id)
+    return (compensation_id,) if compensation_id is not None else ()
 
 
 def creation_decision_scope_app(
@@ -131,15 +168,33 @@ def append_decision(
 ) -> str:
     if action not in VALID_ACTIONS:
         raise ValueError(f"unsupported decision action: {action}")
-    if (
-        undo_target_id is not None
-        and connection.execute(
-            "SELECT 1 FROM human_decisions WHERE id=?", (undo_target_id,)
+    is_undo = action in UNDO_ACTIONS
+    if is_undo and undo_target_id is None:
+        raise ScopeViolation("undo decisions require an undo target")
+    if not is_undo and undo_target_id is not None:
+        raise ScopeViolation("only undo decisions may carry an undo target")
+    if undo_target_id is not None:
+        undo_target = connection.execute(
+            "SELECT action, target_id FROM human_decisions WHERE id=?", (undo_target_id,)
         ).fetchone()
-        is None
-    ):
-        raise NotFound(f"decision not found: {undo_target_id}")
+        if undo_target is None:
+            raise NotFound(f"decision not found: {undo_target_id}")
+        if str(undo_target["action"]) in UNDO_ACTIONS:
+            raise ScopeViolation("undo decisions cannot themselves be undone")
+        if str(undo_target["target_id"]) != target_id:
+            raise ScopeViolation("undo decision target does not match the compensated decision")
+        decision_rows = list(
+            connection.execute("SELECT * FROM human_decisions ORDER BY created_at, id")
+        )
+        if undo_target_id in _valid_compensation_map(decision_rows):
+            raise ScopeViolation("decision has already been undone")
+        if decision_scope_map(connection).get(undo_target_id) is None:
+            raise ScopeViolation("decision has no unambiguous configured application scope")
     stored_payload: dict[str, object] = dict(payload or {})
+    if is_undo:
+        compensates = stored_payload.get("compensates")
+        if compensates is not None and compensates != undo_target_id:
+            raise ScopeViolation("undo payload does not match the compensated decision")
     if redactor is not None:
         redacted = redactor.redact_payload(stored_payload)
         if not isinstance(redacted, dict):
@@ -173,10 +228,12 @@ def append_decision(
 
 def undo_decision(connection: sqlite3.Connection, decision_id: str) -> str:
     row = connection.execute(
-        "SELECT target_id FROM human_decisions WHERE id=?", (decision_id,)
+        "SELECT action, target_id FROM human_decisions WHERE id=?", (decision_id,)
     ).fetchone()
     if row is None:
         raise NotFound(f"decision not found: {decision_id}")
+    if str(row["action"]) in UNDO_ACTIONS:
+        raise ScopeViolation("undo decisions cannot themselves be undone")
     return append_decision(
         connection,
         "undo_decision",
@@ -187,28 +244,10 @@ def undo_decision(connection: sqlite3.Connection, decision_id: str) -> str:
 
 
 def active_decisions(connection: sqlite3.Connection, target_id: str) -> list[Decision]:
-    rows = connection.execute(
-        """
-        SELECT d.* FROM human_decisions d
-        WHERE d.target_id=?
-          AND NOT EXISTS (
-            SELECT 1 FROM human_decisions u
-            WHERE u.action IN ('undo', 'undo_decision') AND u.undo_target_id=d.id
-          )
-        ORDER BY d.created_at, d.id
-        """,
-        (target_id,),
-    )
     return [
-        Decision(
-            id=str(row["id"]),
-            action=str(row["action"]),
-            target_id=str(row["target_id"]),
-            payload=json.loads(str(row["payload_json"])),
-            created_at=str(row["created_at"]),
-            undo_target_id=(str(row["undo_target_id"]) if row["undo_target_id"] else None),
-        )
-        for row in rows
+        decision
+        for decision in decision_stream(connection, active_only=True)
+        if decision.target_id == target_id
     ]
 
 
@@ -220,16 +259,12 @@ def decision_stream(
     """Return immutable decisions in projection order, optionally without compensated rows."""
 
     rows = list(connection.execute("SELECT * FROM human_decisions ORDER BY created_at, id"))
-    canceled = {
-        str(row["undo_target_id"])
-        for row in rows
-        if str(row["action"]) in {"undo", "undo_decision"} and row["undo_target_id"]
-    }
+    canceled = set(_valid_compensation_map(rows))
     result: list[Decision] = []
     for row in rows:
         action = str(row["action"])
         decision_id = str(row["id"])
-        if active_only and (decision_id in canceled or action in {"undo", "undo_decision"}):
+        if active_only and (decision_id in canceled or action in UNDO_ACTIONS):
             continue
         try:
             parsed = json.loads(str(row["payload_json"]))
@@ -350,16 +385,18 @@ def decision_scope_map(
     node_apps = decision_node_apps(connection, active_only=active_only)
     result: dict[str, str | None] = {}
     for decision in decisions:
-        if decision.action in {"undo", "undo_decision"}:
-            result[decision.id] = (
-                result.get(decision.undo_target_id) if decision.undo_target_id else None
-            )
+        if decision.action in UNDO_ACTIONS:
             continue
         result[decision.id] = scoped_decision_app(
             connection,
             decision,
             node_apps=node_apps,
         )
+    for decision in decisions:
+        if decision.action in UNDO_ACTIONS:
+            result[decision.id] = (
+                result.get(decision.undo_target_id) if decision.undo_target_id else None
+            )
     return result
 
 
