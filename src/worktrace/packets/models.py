@@ -49,6 +49,8 @@ class ContributionView:
     member_ids: set[str]
     context_ids: set[str] = field(default_factory=set)
     decision_evidence_ids: set[str] = field(default_factory=set)
+    title_evidence_ids: set[str] = field(default_factory=set)
+    title_source_object_id: str | None = None
     attestations: list[HumanAttestation] = field(default_factory=list)
     candidate_id: str | None = None
 

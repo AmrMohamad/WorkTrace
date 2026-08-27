@@ -9,6 +9,7 @@ from typing import cast
 
 from worktrace.candidates.decisions import (
     CREATION_ACTIONS,
+    decision_lineages,
     decision_scope_map,
     decision_stream,
     resolve_decision_lineage,
@@ -86,6 +87,26 @@ PHASE4_QUESTIONS: dict[str, tuple[tuple[str, str], ...]] = {
         ("result.interview_defensible", "Which parts are defensible in an interview?"),
     ),
 }
+
+_TITLE_DECISION_ACTIONS = CREATION_ACTIONS | {
+    "confirm",
+    "rename",
+    "rename_contribution",
+}
+_MAX_DECISION_LINEAGE_IDS = 20
+_MAX_DECISION_ACTOR_CHARS = 120
+_MAX_DECISION_VALUE_CHARS = 4_000
+
+
+def _selected_title(payload: dict[str, object]) -> str | None:
+    value = payload.get("title")
+    return value if isinstance(value, str) and value else None
+
+
+def _bounded_value(value: object, limit: int) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value[:limit]
 
 
 def _parse_json_object(value: object) -> dict[str, object]:
@@ -168,6 +189,7 @@ class PacketBuilder:
             contribution_type=projected.contribution_type,
             member_ids=members,
             context_ids=context,
+            title_source_object_id=projected.metadata_source_object_id,
         )
 
     def _resolve_contribution(self, identifier: str) -> ContributionView:
@@ -181,6 +203,12 @@ class PacketBuilder:
                 if decision.target_id != identifier or scopes.get(decision.id) != candidate.app_id:
                     continue
                 candidate.decision_evidence_ids.add(decision.id)
+                if (
+                    decision.action in _TITLE_DECISION_ACTIONS
+                    and _selected_title(decision.payload) is not None
+                ):
+                    candidate.title_evidence_ids = {decision.id}
+                    candidate.title_source_object_id = None
                 if decision.action not in {"attest", "attest_claim"}:
                     continue
                 claim = decision.payload.get("claim")
@@ -222,18 +250,22 @@ class PacketBuilder:
                     else set()
                 )
                 state.member_ids -= state.context_ids
-                title = payload.get("title")
-                if isinstance(title, str) and title:
+                title = _selected_title(payload)
+                if title is not None:
                     state.title = title
+                    state.title_evidence_ids = {decision.id}
+                    state.title_source_object_id = None
                 contribution_type = payload.get("type")
                 if isinstance(contribution_type, str) and contribution_type:
                     state.contribution_type = contribution_type
             elif action in {"ignore", "ignore_candidate"}:
                 ignored = True
             elif action in {"rename", "rename_contribution"}:
-                title = payload.get("title")
-                if isinstance(title, str) and title:
+                title = _selected_title(payload)
+                if title is not None:
                     state.title = title
+                    state.title_evidence_ids = {decision.id}
+                    state.title_source_object_id = None
                 contribution_type = payload.get("type")
                 if isinstance(contribution_type, str) and contribution_type:
                     state.contribution_type = contribution_type
@@ -656,9 +688,57 @@ class PacketBuilder:
                 evidence.append(record)
         return sorted(modules)[:50], evidence
 
+    @staticmethod
+    def _title_answer(
+        contribution: ContributionView,
+        records: Sequence[EvidenceRecord],
+        question: str,
+    ) -> QuestionAnswer:
+        if contribution.title_evidence_ids:
+            return QuestionAnswer(
+                question_id="identity.what",
+                question=question,
+                answer_draft=(
+                    f"Evidence is grouped under the reviewed title: {contribution.title}."
+                ),
+                status=ClaimStatus.HUMAN_ATTESTED,
+                observation_types=(ObservationType.HUMAN_ATTESTED,),
+                supporting_evidence_ids=tuple(sorted(contribution.title_evidence_ids)),
+                limitations=("The title is a local-user decision, not provider-observed text.",),
+            )
+        provider_records = [
+            record
+            for record in records
+            if not record.context_only and record.object_id == contribution.title_source_object_id
+        ]
+        if provider_records:
+            return supported_answer(
+                "identity.what",
+                question,
+                f"Evidence is grouped under the provider-observed title: {contribution.title}.",
+                provider_records,
+                status=ClaimStatus.PARTIALLY_SUPPORTED,
+                observation_types=(ObservationType.SOURCE_ASSERTED, ObservationType.DERIVED),
+                limitations=(
+                    "The title is a provider-observed candidate suggestion unless confirmed "
+                    "by a decision.",
+                ),
+            )
+        return unknown_answer(
+            "identity.what",
+            question,
+            "Add an authoritative provider title or confirm a reviewed human title.",
+            limitations=("No citable evidence establishes a contribution title.",),
+        )
+
     def contribution_summary(self, identifier: str) -> dict[str, object]:
         contribution = self._resolve_contribution(identifier)
         records = self._records(contribution)
+        title_answer = self._title_answer(
+            contribution,
+            records,
+            "What was the contribution?",
+        )
         participation = build_participation_summary(
             self.connection, records, contribution.attestations
         )
@@ -682,9 +762,28 @@ class PacketBuilder:
                 "id": contribution.id,
                 "candidate_id": contribution.candidate_id,
                 "app_id": contribution.app_id,
-                "title": contribution.title,
-                "source_text_is_untrusted": True,
-                "title_content_type": "untrusted_source_text",
+                "title": contribution.title if title_answer.answer_draft is not None else None,
+                "source_text_is_untrusted": title_answer.answer_draft is not None,
+                "title_content_type": (
+                    "human_decision_text"
+                    if title_answer.status is ClaimStatus.HUMAN_ATTESTED
+                    else (
+                        "untrusted_source_text" if title_answer.answer_draft is not None else None
+                    )
+                ),
+                "title_authority": (
+                    "human_decision"
+                    if title_answer.status is ClaimStatus.HUMAN_ATTESTED
+                    else (
+                        "provider_observed" if title_answer.answer_draft is not None else "unknown"
+                    )
+                ),
+                "title_status": title_answer.status.value,
+                "title_observation_types": [
+                    value.value for value in title_answer.observation_types
+                ],
+                "title_supporting_evidence_ids": list(title_answer.supporting_evidence_ids),
+                "title_limitations": list(title_answer.limitations),
                 "type": contribution.contribution_type,
                 "date_from": date_from,
                 "date_to": date_to,
@@ -812,22 +911,12 @@ class PacketBuilder:
         date_from, date_to = self._date_range(records)
 
         answers: dict[str, QuestionAnswer] = {}
+        answers["identity.what"] = self._title_answer(
+            contribution,
+            records,
+            by_id["identity.what"],
+        )
         if material:
-            answers["identity.what"] = supported_answer(
-                "identity.what",
-                by_id["identity.what"],
-                f"Evidence is grouped under the reviewed title: {contribution.title}.",
-                material,
-                status=(
-                    ClaimStatus.HUMAN_ATTESTED
-                    if contribution.decision_evidence_ids
-                    else ClaimStatus.PARTIALLY_SUPPORTED
-                ),
-                observation_types=(ObservationType.DERIVED,),
-                limitations=(
-                    "The title is a candidate suggestion unless confirmed by a decision.",
-                ),
-            )
             app = self._app(contribution.app_id)
             answers["identity.app_flow"] = supported_answer(
                 "identity.app_flow",
@@ -838,11 +927,6 @@ class PacketBuilder:
                 limitations=("Application scope comes from explicit local configuration.",),
             )
         else:
-            answers["identity.what"] = unknown_answer(
-                "identity.what",
-                by_id["identity.what"],
-                "Import or add evidence for this contribution.",
-            )
             answers["identity.app_flow"] = unknown_answer(
                 "identity.app_flow", by_id["identity.app_flow"], "Add scoped contribution evidence."
             )
@@ -1414,6 +1498,86 @@ class PacketBuilder:
             "next_offset": offset + limit if len(rows) > limit else None,
         }
 
+    def _decision_context(
+        self,
+        decision: sqlite3.Row,
+        payload: dict[str, object],
+        app_id: str,
+    ) -> dict[str, object]:
+        decision_id = str(decision["id"])
+        lineage_match = next(
+            (
+                lineage
+                for lineage in decision_lineages(self.connection, active_only=False)
+                if lineage.app_id == app_id
+                and any(item.id == decision_id for item in lineage.decisions)
+            ),
+            None,
+        )
+        candidate_ids = sorted(lineage_match.candidate_ids) if lineage_match else []
+        contribution_ids = sorted(lineage_match.contribution_ids) if lineage_match else []
+        retained_candidate_ids = candidate_ids[:_MAX_DECISION_LINEAGE_IDS]
+        remaining = _MAX_DECISION_LINEAGE_IDS - len(retained_candidate_ids)
+        retained_contribution_ids = contribution_ids[:remaining]
+        lineage_context = {
+            "app_id": app_id,
+            "candidate_ids": [
+                value[:_MAX_DECISION_VALUE_CHARS] for value in retained_candidate_ids
+            ],
+            "contribution_ids": [
+                value[:_MAX_DECISION_VALUE_CHARS] for value in retained_contribution_ids
+            ],
+            "truncated": (len(candidate_ids) + len(contribution_ids) > _MAX_DECISION_LINEAGE_IDS),
+        }
+
+        replaces_decision_id: str | None = None
+        if (
+            lineage_match is not None
+            and str(decision["action"]) in _TITLE_DECISION_ACTIONS
+            and _selected_title(payload) is not None
+        ):
+            for item in lineage_match.decisions:
+                if item.id == decision_id:
+                    break
+                if (
+                    item.action in _TITLE_DECISION_ACTIONS
+                    and _selected_title(item.payload) is not None
+                ):
+                    replaces_decision_id = item.id
+
+        compensated_by = [
+            str(row["id"])[:_MAX_DECISION_VALUE_CHARS]
+            for row in self.connection.execute(
+                """
+                SELECT id FROM human_decisions
+                WHERE action IN ('undo', 'undo_decision') AND undo_target_id=?
+                ORDER BY created_at, id
+                LIMIT ?
+                """,
+                (decision_id, _MAX_DECISION_LINEAGE_IDS),
+            )
+        ]
+        undo_target_id = (
+            str(decision["undo_target_id"])[:_MAX_DECISION_VALUE_CHARS]
+            if decision["undo_target_id"]
+            else None
+        )
+        return {
+            "decision_type": str(decision["action"])[:_MAX_DECISION_VALUE_CHARS],
+            "target_id": str(decision["target_id"])[:_MAX_DECISION_VALUE_CHARS],
+            "lineage": lineage_context,
+            "selected_title": _bounded_value(payload.get("title"), _MAX_DECISION_VALUE_CHARS),
+            "attestation_subject": _bounded_value(payload.get("claim"), _MAX_DECISION_VALUE_CHARS),
+            "attestation_text": _bounded_value(payload.get("statement"), _MAX_DECISION_VALUE_CHARS),
+            "rationale": _bounded_value(payload.get("reason"), _MAX_DECISION_VALUE_CHARS),
+            "created_at": str(decision["created_at"])[:_MAX_DECISION_VALUE_CHARS],
+            "actor": str(decision["actor_label"])[:_MAX_DECISION_ACTOR_CHARS],
+            "active": not compensated_by,
+            "undo_target_id": undo_target_id,
+            "replaces_decision_id": replaces_decision_id,
+            "compensated_by_decision_ids": compensated_by,
+        }
+
     def evidence_excerpt(self, evidence_id: str, max_chars: int) -> dict[str, object]:
         row = self.connection.execute(
             f"""
@@ -1532,17 +1696,62 @@ class PacketBuilder:
                 raise ScopeViolation("manual evidence has no configured application scope")
             self._app(decision_app_id)
             payload = _parse_json_object(decision["payload_json"])
-            statement = payload.get("statement", payload.get("reason", ""))
-            text = str(statement)[:max_chars]
+            decision_context = self._decision_context(
+                decision,
+                payload,
+                decision_app_id,
+            )
+            selected_text = next(
+                (
+                    value
+                    for value in (
+                        decision_context["selected_title"],
+                        decision_context["attestation_text"],
+                        decision_context["rationale"],
+                    )
+                    if isinstance(value, str) and value
+                ),
+                None,
+            )
+            raw_selected_text = next(
+                (
+                    value
+                    for value in (
+                        payload.get("title"),
+                        payload.get("statement"),
+                        payload.get("reason"),
+                    )
+                    if isinstance(value, str) and value
+                ),
+                None,
+            )
+            if selected_text is None:
+                selected_text = json.dumps(
+                    {
+                        "decision_type": decision_context["decision_type"],
+                        "target_id": decision_context["target_id"],
+                        "undo_target_id": decision_context["undo_target_id"],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            text = selected_text[:max_chars]
             return {
                 "evidence_id": evidence_id,
                 "app_id": decision_app_id,
-                "content_type": "untrusted_source_excerpt",
+                "content_type": "human_decision_evidence",
                 "source_text_is_untrusted": True,
                 "source": "manual",
                 "kind": str(decision["action"]),
                 "text": text,
-                "truncated": len(str(statement)) > max_chars,
+                "truncated": (
+                    len(selected_text) > max_chars
+                    or (
+                        raw_selected_text is not None
+                        and len(raw_selected_text) > len(selected_text)
+                    )
+                ),
+                "decision_context": decision_context,
                 "as_of": str(decision["created_at"]),
                 "completeness": "human_attested",
                 "source_status": self.source_status(decision_app_id),

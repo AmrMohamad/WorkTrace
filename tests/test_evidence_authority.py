@@ -1547,6 +1547,11 @@ def test_cross_app_creation_payload_cannot_override_candidate_or_export_scope(
         projected = project_candidate(connection, "candidate:scoped")
         assert projected.status == "candidate"
         assert projected.title == "Scoped authoritative title"
+        with pytest.raises(ScopeViolation):
+            PacketBuilder(connection, _config(tmp_path)).evidence_excerpt(
+                invalid_decision,
+                1_200,
+            )
 
         export_path = tmp_path / "cross-app-decision.json"
         export_app(connection, "sample_store", export_path)
@@ -1839,6 +1844,167 @@ def _summary_member_ids(summary: dict[str, object]) -> set[str]:
         for member in members
         if isinstance(member, dict) and member.get("object_id")
     }
+
+
+def test_human_title_claims_cite_active_decisions_and_expose_bounded_context(
+    tmp_path: Path,
+) -> None:
+    connection, database_path = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:title-citation",
+            object_id="obj:title-citation",
+            observation_id="obs:title-citation",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T10:00:00+00:00",
+            title="Provider source title",
+        )
+        _insert_candidate_fixture(
+            connection,
+            "candidate:title-citation",
+            "obj:title-citation",
+            "Provider source title",
+        )
+        connection.commit()
+        provider_attestation_id = append_decision(
+            connection,
+            "attest_claim",
+            "candidate:title-citation",
+            {
+                "claim": "result",
+                "statement": "A non-title decision must not attest the provider title.",
+            },
+        )
+
+        builder = PacketBuilder(connection, _config(tmp_path))
+        provider_packet = builder.build_packet("candidate:title-citation")
+        provider_what = next(
+            item
+            for item in provider_packet["sections"]["contribution_identity"]
+            if item["question_id"] == "identity.what"
+        )
+        assert provider_what["status"] == "partially_supported"
+        assert provider_what["supporting_evidence_ids"] == ["obs:title-citation"]
+        assert provider_packet["contribution"]["title_authority"] == "provider_observed"
+        assert provider_packet["contribution"]["title_supporting_evidence_ids"] == [
+            "obs:title-citation"
+        ]
+        assert provider_attestation_id not in provider_what["supporting_evidence_ids"]
+        assert provider_packet["contribution"]["title_limitations"] == provider_what["limitations"]
+
+        confirmation_id = append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:title-citation",
+            {
+                "contribution_id": "contribution:title-citation",
+                "app_id": "sample_store",
+                "title": "Human reviewed title",
+                "members": ["obj:title-citation"],
+            },
+        )
+        rename_id = append_decision(
+            connection,
+            "rename_contribution",
+            "contribution:title-citation",
+            {"title": "Renamed human title"},
+        )
+        attestation_id = append_decision(
+            connection,
+            "attest_claim",
+            "contribution:title-citation",
+            {
+                "claim": "title_context",
+                "statement": "A" * 5_000,
+                "private_payload": "ARBITRARY PRIVATE FIELD MUST NOT BE EXPOSED",
+            },
+        )
+
+        tools = WorkTraceTools(config=_config(tmp_path), database_path=database_path)
+        renamed_packet = tools.build_phase4_packet(contribution_id="contribution:title-citation")
+        renamed_summary = tools.get_contribution_summary(
+            contribution_id="contribution:title-citation"
+        )
+        renamed_what = next(
+            item
+            for item in renamed_packet["sections"]["contribution_identity"]
+            if item["question_id"] == "identity.what"
+        )
+        assert renamed_packet["contribution"]["title"] == "Renamed human title"
+        assert renamed_what["status"] == "human_attested"
+        assert renamed_what["supporting_evidence_ids"] == [rename_id]
+        assert renamed_summary["contribution"]["title_authority"] == "human_decision"
+        assert renamed_summary["contribution"]["title_supporting_evidence_ids"] == [rename_id]
+        assert renamed_summary["contribution"]["title_limitations"] == renamed_what["limitations"]
+
+        confirmation_excerpt = tools.get_evidence_excerpt(evidence_id=confirmation_id)
+        rename_excerpt = tools.get_evidence_excerpt(evidence_id=rename_id)
+        assert confirmation_excerpt["text"] == "Human reviewed title"
+        assert confirmation_excerpt["decision_context"]["selected_title"] == (
+            "Human reviewed title"
+        )
+        assert rename_excerpt["text"] == "Renamed human title"
+        assert rename_excerpt["decision_context"]["decision_type"] == ("rename_contribution")
+        assert rename_excerpt["decision_context"]["target_id"] == ("contribution:title-citation")
+        assert rename_excerpt["decision_context"]["replaces_decision_id"] == (confirmation_id)
+        assert rename_excerpt["decision_context"]["actor"] == "local-user"
+        attestation_excerpt = tools.get_evidence_excerpt(
+            evidence_id=attestation_id,
+            max_chars=100,
+        )
+        assert attestation_excerpt["text"] == "A" * 100
+        assert attestation_excerpt["truncated"] is True
+        assert attestation_excerpt["decision_context"]["attestation_subject"] == ("title_context")
+        assert len(attestation_excerpt["decision_context"]["attestation_text"]) == 4_000
+        assert "ARBITRARY PRIVATE FIELD" not in json.dumps(attestation_excerpt)
+        max_attestation_excerpt = tools.get_evidence_excerpt(
+            evidence_id=attestation_id,
+            max_chars=4_000,
+        )
+        assert len(max_attestation_excerpt["text"]) == 4_000
+        assert max_attestation_excerpt["truncated"] is True
+
+        undo_id = undo_decision(connection, rename_id)
+        reverted_packet = tools.build_phase4_packet(contribution_id="contribution:title-citation")
+        reverted_summary = tools.get_contribution_summary(
+            contribution_id="contribution:title-citation"
+        )
+        reverted_what = next(
+            item
+            for item in reverted_packet["sections"]["contribution_identity"]
+            if item["question_id"] == "identity.what"
+        )
+        assert reverted_packet["contribution"]["title"] == "Human reviewed title"
+        assert reverted_what["supporting_evidence_ids"] == [confirmation_id]
+        assert reverted_summary["contribution"]["title_supporting_evidence_ids"] == [
+            confirmation_id
+        ]
+        compensated_excerpt = tools.get_evidence_excerpt(evidence_id=rename_id)
+        undo_excerpt = tools.get_evidence_excerpt(evidence_id=undo_id)
+        assert compensated_excerpt["decision_context"]["compensated_by_decision_ids"] == [undo_id]
+        assert compensated_excerpt["decision_context"]["active"] is False
+        assert undo_excerpt["decision_context"]["undo_target_id"] == rename_id
+
+        confirmation_undo_id = undo_decision(connection, confirmation_id)
+        downgraded_packet = tools.build_phase4_packet(contribution_id="candidate:title-citation")
+        downgraded_what = next(
+            item
+            for item in downgraded_packet["sections"]["contribution_identity"]
+            if item["question_id"] == "identity.what"
+        )
+        assert downgraded_packet["contribution"]["title"] == "Provider source title"
+        assert downgraded_packet["contribution"]["title_authority"] == ("provider_observed")
+        assert downgraded_what["status"] == "partially_supported"
+        assert downgraded_what["supporting_evidence_ids"] == ["obs:title-citation"]
+        confirmation_after_undo = tools.get_evidence_excerpt(evidence_id=confirmation_id)
+        assert confirmation_after_undo["decision_context"]["compensated_by_decision_ids"] == [
+            confirmation_undo_id
+        ]
+        assert confirmation_after_undo["decision_context"]["active"] is False
+    finally:
+        connection.close()
 
 
 def test_confirm_merge_split_lineage_projects_one_canonical_contribution(
@@ -2415,6 +2581,19 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
         assert summary_b["contribution"]["title"] == "PRIVATE APP B ALIAS"
         with pytest.raises(ScopeViolation):
             builder.contribution_summary("candidate:shared-secondary-alias")
+        with pytest.raises(ScopeViolation):
+            builder.evidence_excerpt(ambiguous, 1_200)
+        excerpt_a = builder.evidence_excerpt(rename_a, 1_200)
+        excerpt_b = builder.evidence_excerpt(rename_b, 1_200)
+        assert (excerpt_a["app_id"], excerpt_a["text"]) == (
+            "sample_store",
+            "Scoped app A alias",
+        )
+        assert (excerpt_b["app_id"], excerpt_b["text"]) == (
+            "other_app",
+            "PRIVATE APP B ALIAS",
+        )
+        assert "APP B ONLY" not in json.dumps(excerpt_b)
 
         export_path = tmp_path / "secondary-alias-collision.json"
         export_app(connection, "sample_store", export_path)
