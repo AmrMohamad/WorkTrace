@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from click.utils import strip_ansi
 from typer.testing import CliRunner
 
 from worktrace.cli import app
@@ -98,7 +99,7 @@ def test_cli_help_init_status_search_export_and_confirmed_purge(
 
     refused = runner.invoke(app, ["purge", "--config", str(config)])
     assert refused.exit_code != 0
-    assert "purge requires --yes" in refused.stderr
+    assert "purge requires --yes" in strip_ansi(refused.stderr)
     assert database.exists()
     assert key.exists()
 
