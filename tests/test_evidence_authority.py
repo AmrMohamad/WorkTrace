@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
 from worktrace.db.queries import evidence_excerpt, search_evidence, source_status
 from worktrace.db.repository import EvidenceRepository
-from worktrace.errors import NotFound
+from worktrace.errors import NotFound, ScopeViolation
 from worktrace.mcp_server.tools import WorkTraceTools
 from worktrace.packets.builder import PacketBuilder
 from worktrace.services import add_manual_evidence, export_app
@@ -1801,5 +1802,498 @@ def test_cli_candidate_limit_is_applied_after_orphan_suppression(tmp_path: Path)
         assert [candidate.id for candidate in list_candidates(connection, "sample_store")] == [
             "candidate:valid-tail"
         ]
+    finally:
+        connection.close()
+
+
+def _insert_candidate_fixture(
+    connection: sqlite3.Connection,
+    candidate_id: str,
+    object_id: str,
+    title: str,
+    *,
+    app_id: str = "sample_store",
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO candidate_groups(
+            id, app_id, seed_object_id, generator_version, suggested_title,
+            suggested_type, generated_at
+        ) VALUES (?, ?, ?, 'fixture', ?, 'feature', '2026-08-27T10:00:00+00:00')
+        """,
+        (candidate_id, app_id, object_id, title),
+    )
+    connection.execute(
+        "INSERT INTO candidate_members VALUES (?, ?, 'seed', 0)",
+        (candidate_id, object_id),
+    )
+
+
+def _summary_member_ids(summary: dict[str, object]) -> set[str]:
+    members = summary["members"]
+    assert isinstance(members, list)
+    return {
+        str(member["object_id"])
+        for member in members
+        if isinstance(member, dict) and member.get("object_id")
+    }
+
+
+def test_confirm_merge_split_lineage_projects_one_canonical_contribution(
+    tmp_path: Path,
+) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        for suffix in ("a", "b"):
+            _insert_remote_observation(
+                connection,
+                run_id=f"run:lineage-{suffix}",
+                object_id=f"obj:lineage-{suffix}",
+                observation_id=f"obs:lineage-{suffix}",
+                status="complete",
+                scope={"selection_policy_version": 2},
+                completed_at=f"2026-08-27T0{8 if suffix == 'a' else 9}:00:00+00:00",
+                title=f"Lineage {suffix.upper()}",
+                source_instance=f"jira-lineage-{suffix}",
+            )
+            _insert_candidate_fixture(
+                connection,
+                f"candidate:lineage-{suffix}",
+                f"obj:lineage-{suffix}",
+                f"Lineage {suffix.upper()}",
+            )
+        connection.commit()
+        append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:lineage-a",
+            {
+                "contribution_id": "contribution:lineage-a",
+                "app_id": "sample_store",
+                "title": "Lineage A",
+                "members": ["obj:lineage-a"],
+            },
+        )
+        append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:lineage-b",
+            {
+                "contribution_id": "contribution:lineage-b",
+                "app_id": "sample_store",
+                "title": "Lineage B",
+                "members": ["obj:lineage-b"],
+            },
+        )
+        append_decision(
+            connection,
+            "merge_contributions",
+            "candidate:lineage-a",
+            {
+                "contribution_id": "contribution:lineage-merged",
+                "candidate_ids": ["candidate:lineage-b"],
+                "app_id": "sample_store",
+                "title": "Merged lineage",
+                "members": ["obj:lineage-a", "obj:lineage-b"],
+            },
+        )
+        append_decision(
+            connection,
+            "rename_contribution",
+            "candidate:lineage-a",
+            {"title": "Canonical merged lineage"},
+        )
+        split_id = append_decision(
+            connection,
+            "split_contribution",
+            "candidate:lineage-a",
+            {
+                "contribution_id": "contribution:lineage-split",
+                "app_id": "sample_store",
+                "title": "Split lineage",
+                "members": ["obj:lineage-a"],
+                "keep_source_object_ids": ["obj:lineage-a"],
+            },
+        )
+
+        builder = PacketBuilder(connection, _config(tmp_path))
+        for identifier in (
+            "candidate:lineage-a",
+            "contribution:lineage-a",
+            "contribution:lineage-b",
+            "contribution:lineage-merged",
+            "contribution:lineage-split",
+        ):
+            summary = builder.contribution_summary(identifier)
+            assert summary["contribution"]["title"] == "Split lineage"
+            assert _summary_member_ids(summary) == {"obj:lineage-a"}
+
+        undo_decision(connection, split_id)
+        with pytest.raises(NotFound):
+            builder.contribution_summary("contribution:lineage-split")
+        for identifier in (
+            "candidate:lineage-a",
+            "contribution:lineage-a",
+            "contribution:lineage-b",
+            "contribution:lineage-merged",
+        ):
+            summary = builder.contribution_summary(identifier)
+            assert summary["contribution"]["title"] == "Canonical merged lineage"
+            assert _summary_member_ids(summary) == {
+                "obj:lineage-a",
+                "obj:lineage-b",
+            }
+    finally:
+        connection.close()
+
+
+def test_cross_app_contribution_collision_is_scoped_for_packets_and_export(
+    tmp_path: Path,
+) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:collision-a",
+            object_id="obj:collision-a",
+            observation_id="obs:collision-a",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T08:00:00+00:00",
+            title="Public app A title",
+            source_instance="jira-collision-a",
+        )
+        _insert_candidate_fixture(
+            connection,
+            "candidate:collision-a",
+            "obj:collision-a",
+            "Public app A title",
+        )
+        connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
+        connection.execute(
+            """
+            INSERT INTO sync_runs(
+                id, app_id, source, source_instance, status, started_at, completed_at,
+                adapter_version, scope_json, completeness
+            ) VALUES ('run:collision-b', 'other_app', 'manual', 'local-user', 'complete',
+                      '2026-08-27T09:00:00+00:00', '2026-08-27T09:00:00+00:00',
+                      'fixture', '{}', 'complete_for_scope')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_objects(
+                id, app_id, source, source_instance, kind, external_id,
+                first_seen_run_id, last_seen_run_id
+            ) VALUES ('obj:collision-b', 'other_app', 'manual', 'local-user',
+                      'manual_evidence', 'collision-b', 'run:collision-b', 'run:collision-b')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO observations(
+                id, source_object_id, sync_run_id, fetched_at, payload_hash, title,
+                body_text, data_json, completeness, adapter_version,
+                normalization_version, redaction_version
+            ) VALUES ('obs:collision-b', 'obj:collision-b', 'run:collision-b',
+                      '2026-08-27T09:00:00+00:00', 'hash:collision-b',
+                      'Private app B title', 'Private app B body', '{}',
+                      'complete_for_scope', 'fixture', '2', '1')
+            """
+        )
+        _insert_candidate_fixture(
+            connection,
+            "candidate:collision-b",
+            "obj:collision-b",
+            "Private app B title",
+            app_id="other_app",
+        )
+        connection.commit()
+
+        confirm_a = append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:collision-a",
+            {
+                "contribution_id": "contribution:shared",
+                "app_id": "sample_store",
+                "title": "Public app A title",
+                "members": ["obj:collision-a"],
+            },
+        )
+        confirm_b = append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:collision-b",
+            {
+                "contribution_id": "contribution:shared",
+                "app_id": "other_app",
+                "title": "Private app B title",
+                "members": ["obj:collision-b"],
+            },
+        )
+        attest_a = append_decision(
+            connection,
+            "attest_claim",
+            "contribution:shared",
+            {
+                "app_id": "sample_store",
+                "claim": "currently_enabled",
+                "statement": "PUBLIC APP A ATTESTATION",
+            },
+        )
+        attest_b = append_decision(
+            connection,
+            "attest_claim",
+            "contribution:shared",
+            {
+                "app_id": "other_app",
+                "claim": "currently_enabled",
+                "statement": "PRIVATE APP B ATTESTATION",
+                "private_payload": {"private": "APP B ONLY"},
+            },
+        )
+        base_config = _config(tmp_path)
+        other_app = AppConfig(
+            id="other_app",
+            name="Other App",
+            market="YY",
+            business_type="fixture",
+            jira_project_keys=(),
+            gitlab_project_ids=(),
+            repo_paths=(),
+            jira_key_patterns=(),
+            production_environments=(),
+            release_tag_patterns=(),
+            ignored_paths=(),
+        )
+        builder = PacketBuilder(
+            connection,
+            replace(base_config, apps=(*base_config.apps, other_app)),
+        )
+        packet_a = builder.build_packet("candidate:collision-a")
+        packet_b = builder.build_packet("candidate:collision-b")
+        current_a = next(
+            item
+            for item in packet_a["sections"]["result"]
+            if item["question_id"] == "result.current_use"
+        )
+        current_b = next(
+            item
+            for item in packet_b["sections"]["result"]
+            if item["question_id"] == "result.current_use"
+        )
+        assert current_a["answer_draft"] == "PUBLIC APP A ATTESTATION"
+        assert current_b["answer_draft"] == "PRIVATE APP B ATTESTATION"
+        excerpt_a = builder.evidence_excerpt(attest_a, 200)
+        excerpt_b = builder.evidence_excerpt(attest_b, 200)
+        assert (excerpt_a["app_id"], excerpt_a["text"]) == (
+            "sample_store",
+            "PUBLIC APP A ATTESTATION",
+        )
+        assert (excerpt_b["app_id"], excerpt_b["text"]) == (
+            "other_app",
+            "PRIVATE APP B ATTESTATION",
+        )
+        with pytest.raises(ScopeViolation):
+            builder.contribution_summary("contribution:shared")
+
+        export_path = tmp_path / "collision-export.json"
+        export_app(connection, "sample_store", export_path)
+        exported_text = export_path.read_text(encoding="utf-8")
+        exported = json.loads(exported_text)
+        assert {row["id"] for row in exported["human_decisions"]} == {
+            confirm_a,
+            attest_a,
+        }
+        assert confirm_b not in exported_text
+        assert attest_b not in exported_text
+        assert "PRIVATE APP B" not in exported_text
+        assert "APP B ONLY" not in exported_text
+    finally:
+        connection.close()
+
+
+def test_export_includes_exact_current_unavailability_provenance(tmp_path: Path) -> None:
+    connection, _ = _ledger(tmp_path)
+    repository = EvidenceRepository(connection)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:available-before",
+            object_id="obj:availability-root",
+            observation_id="obs:available-before",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T08:00:00+00:00",
+            title="Availability root",
+            source_instance="jira-availability-root",
+        )
+        _insert_remote_observation(
+            connection,
+            run_id="run:unrelated-legacy",
+            object_id="obj:unrelated-legacy",
+            observation_id="obs:unrelated-legacy",
+            status="complete",
+            scope={},
+            completed_at="2026-08-27T07:00:00+00:00",
+            title="UNRELATED LEGACY PRIVATE TEXT",
+            source_instance="jira-unrelated-legacy",
+        )
+        connection.commit()
+        unavailable_run = repository.start_sync_run(
+            "sample_store",
+            "jira",
+            "jira-availability-root",
+            {"selection_policy_version": 2},
+        )
+        unavailable_event = repository.record_object_unavailable(
+            unavailable_run,
+            source="jira",
+            source_instance="jira-availability-root",
+            kind="jira_issue",
+            external_id="obj:availability-root",
+        )
+        repository.finish_sync_run(unavailable_run, "complete", "complete_for_scope")
+
+        export_path = tmp_path / "availability-provenance.json"
+        assert export_app(connection, "sample_store", export_path) == 1
+        exported_text = export_path.read_text(encoding="utf-8")
+        exported = json.loads(exported_text)
+        assert {row["id"] for row in exported["sync_runs"]} == {
+            "run:available-before",
+            unavailable_run,
+        }
+        assert [row["id"] for row in exported["source_objects"]] == ["obj:availability-root"]
+        assert [row["id"] for row in exported["observations"]] == ["obs:available-before"]
+        assert [row["id"] for row in exported["source_object_availability_events"]] == [
+            unavailable_event
+        ]
+        exported_runs = {row["id"] for row in exported["sync_runs"]}
+        exported_objects = {row["id"] for row in exported["source_objects"]}
+        for observation in exported["observations"]:
+            assert observation["sync_run_id"] in exported_runs
+            assert observation["source_object_id"] in exported_objects
+        for event in exported["source_object_availability_events"]:
+            assert event["sync_run_id"] in exported_runs
+            assert event["source_object_id"] in exported_objects
+        assert "UNRELATED LEGACY" not in exported_text
+        assert "run:unrelated-legacy" not in exported_text
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("malformed_scope", ["{not-json", "[]", "null", "42"])
+def test_malformed_remote_scope_fails_closed_across_public_reads(
+    tmp_path: Path,
+    malformed_scope: str,
+) -> None:
+    connection, database_path = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:malformed-scope",
+            object_id="obj:malformed-scope",
+            observation_id="obs:malformed-scope",
+            status="complete",
+            scope={},
+            completed_at="2026-08-27T10:00:00+00:00",
+            title="MALFORMED SCOPE PRIVATE TEXT",
+            source_instance="jira-malformed-scope",
+        )
+        connection.execute(
+            "UPDATE sync_runs SET scope_json=? WHERE id='run:malformed-scope'",
+            (malformed_scope,),
+        )
+        _insert_candidate_fixture(
+            connection,
+            "candidate:malformed-scope",
+            "obj:malformed-scope",
+            "MALFORMED SCOPE PRIVATE TEXT",
+        )
+        _insert_remote_observation(
+            connection,
+            run_id="run:valid-scope",
+            object_id="obj:valid-scope",
+            observation_id="obs:valid-scope",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T09:00:00+00:00",
+            title="Valid scope control",
+            source_instance="jira-valid-scope-control",
+        )
+        _insert_candidate_fixture(
+            connection,
+            "candidate:valid-scope",
+            "obj:valid-scope",
+            "Valid scope control",
+        )
+        _insert_remote_observation(
+            connection,
+            run_id="run:manual-scope",
+            object_id="obj:manual-scope",
+            observation_id="obs:manual-scope",
+            status="complete",
+            scope={},
+            completed_at="2026-08-27T08:00:00+00:00",
+            title="Manual scope control",
+            source="manual",
+            source_instance="local-user",
+            kind="manual_evidence",
+        )
+        _insert_candidate_fixture(
+            connection,
+            "candidate:manual-scope",
+            "obj:manual-scope",
+            "Manual scope control",
+        )
+        connection.commit()
+
+        current_ids = {
+            str(row["id"])
+            for row in EvidenceRepository(connection).current_observations("sample_store")
+        }
+        assert current_ids == {"obs:valid-scope", "obs:manual-scope"}
+        assert {
+            row["evidence_id"] for row in search_evidence(connection, "sample_store", "scope")
+        } == {"obs:valid-scope", "obs:manual-scope"}
+        assert (
+            evidence_excerpt(connection, "obs:valid-scope", chars=100)["authoritative_current"]
+            is True
+        )
+        with pytest.raises(NotFound):
+            evidence_excerpt(connection, "obs:malformed-scope", chars=100)
+
+        builder = PacketBuilder(connection, _config(tmp_path))
+        assert {
+            item["candidate_id"]
+            for item in builder.list_candidates(
+                "sample_store", date_from=None, date_to=None, limit=20, offset=0
+            )["candidates"]
+        } == {"candidate:valid-scope", "candidate:manual-scope"}
+        with pytest.raises(NotFound):
+            builder.contribution_summary("candidate:malformed-scope")
+        tools = WorkTraceTools(config=_config(tmp_path), database_path=database_path)
+        assert {
+            item["evidence_id"]
+            for item in tools.search_evidence(query="scope", app_id="sample_store")["results"]
+        } == {"obs:valid-scope", "obs:manual-scope"}
+        with pytest.raises(NotFound):
+            tools.get_contribution_summary(contribution_id="candidate:malformed-scope")
+
+        export_path = tmp_path / "malformed-scope-export.json"
+        export_app(connection, "sample_store", export_path)
+        exported_text = export_path.read_text(encoding="utf-8")
+        exported = json.loads(exported_text)
+        assert {row["id"] for row in exported["observations"]} == {
+            "obs:valid-scope",
+            "obs:manual-scope",
+        }
+        assert "MALFORMED SCOPE PRIVATE TEXT" not in exported_text
+        statuses = source_status(connection, "sample_store")
+        malformed = next(
+            item for item in statuses if item["source_instance"] == "jira-malformed-scope"
+        )
+        assert malformed["authoritative_current"] is False
     finally:
         connection.close()

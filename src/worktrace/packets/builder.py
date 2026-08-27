@@ -7,7 +7,12 @@ from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from typing import cast
 
-from worktrace.candidates.decisions import creation_decision_scope_app
+from worktrace.candidates.decisions import (
+    CREATION_ACTIONS,
+    decision_scope_map,
+    decision_stream,
+    resolve_decision_lineage,
+)
 from worktrace.candidates.projector import CandidateView, project_candidate
 from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.constants import DEFAULT_EXCERPT_CHARS, STALE_AFTER_DAYS
@@ -138,32 +143,6 @@ class PacketBuilder:
     def _app(self, app_id: str) -> AppConfig:
         return self.config.app(app_id)
 
-    def _active_decisions(self) -> list[tuple[str, str, str, dict[str, object], str | None]]:
-        rows = list(
-            self.connection.execute(
-                """
-                SELECT id, action, target_id, payload_json, undo_target_id
-                FROM human_decisions ORDER BY created_at, id
-                """
-            )
-        )
-        canceled = {
-            str(row["undo_target_id"])
-            for row in rows
-            if str(row["action"]) == "undo_decision" and row["undo_target_id"]
-        }
-        return [
-            (
-                str(row["id"]),
-                str(row["action"]),
-                str(row["target_id"]),
-                _parse_json_object(row["payload_json"]),
-                str(row["undo_target_id"]) if row["undo_target_id"] else None,
-            )
-            for row in rows
-            if str(row["id"]) not in canceled and str(row["action"]) != "undo_decision"
-        ]
-
     def _candidate(self, candidate_id: str) -> ContributionView | None:
         try:
             projected = project_candidate(self.connection, candidate_id)
@@ -192,54 +171,76 @@ class PacketBuilder:
         )
 
     def _resolve_contribution(self, identifier: str) -> ContributionView:
-        candidate = self._candidate(identifier)
-        decisions = self._active_decisions()
-        if candidate is not None:
-            state = candidate
-        else:
-            state = ContributionView(
-                id=identifier,
-                app_id="",
-                title=identifier,
-                contribution_type="unknown",
-                member_ids=set(),
-            )
-
-        base_found = candidate is not None
-        for decision_id, action, target_id, payload, _ in decisions:
-            contribution_id = payload.get("contribution_id")
-            creates_identifier = (
-                isinstance(contribution_id, str)
-                and contribution_id == identifier
-                and action in {"confirm_candidate", "merge_contributions", "split_contribution"}
-            )
-            if creates_identifier:
-                scoped_app = creation_decision_scope_app(self.connection, target_id, payload)
-                if scoped_app is None:
+        lineage = resolve_decision_lineage(self.connection, identifier)
+        if lineage is None:
+            candidate = self._candidate(identifier)
+            if candidate is None:
+                raise NotFound(f"contribution not found: {identifier}")
+            scopes = decision_scope_map(self.connection, active_only=True)
+            for decision in decision_stream(self.connection, active_only=True):
+                if decision.target_id != identifier or scopes.get(decision.id) != candidate.app_id:
                     continue
-                base_found = True
-                state.id = identifier
-                if action == "confirm_candidate":
-                    state.candidate_id = target_id
-                state.decision_evidence_ids.add(decision_id)
-                state.member_ids = _member_values(payload) or state.member_ids
-                context = payload.get("context_members")
-                if isinstance(context, list):
-                    state.context_ids = {str(item) for item in context if isinstance(item, str)}
-                if isinstance(payload.get("title"), str):
-                    state.title = str(payload["title"])
-                if isinstance(payload.get("type"), str):
-                    state.contribution_type = str(payload["type"])
-                state.app_id = scoped_app
+                candidate.decision_evidence_ids.add(decision.id)
+                if decision.action not in {"attest", "attest_claim"}:
+                    continue
+                claim = decision.payload.get("claim")
+                statement = decision.payload.get("statement")
+                if not (isinstance(claim, str) and isinstance(statement, str) and statement):
+                    continue
+                source_note = decision.payload.get("source_note")
+                candidate.attestations.append(
+                    HumanAttestation(
+                        decision_id=decision.id,
+                        claim=claim,
+                        statement=statement,
+                        source_note=(str(source_note) if isinstance(source_note, str) else None),
+                    )
+                )
+            return candidate
 
-            applies = target_id == identifier or creates_identifier
-            if not applies:
-                continue
-            state.decision_evidence_ids.add(decision_id)
-            if action == "rename_contribution" and isinstance(payload.get("title"), str):
-                state.title = str(payload["title"])
-            elif action == "set_contribution_type" and isinstance(payload.get("type"), str):
-                state.contribution_type = str(payload["type"])
+        state = ContributionView(
+            id=identifier,
+            candidate_id=lineage.canonical_candidate_id,
+            app_id=lineage.app_id,
+            title=identifier,
+            contribution_type="unknown",
+            member_ids=set(),
+        )
+        ignored = False
+        for decision in lineage.decisions:
+            action = decision.action
+            payload = decision.payload
+            state.decision_evidence_ids.add(decision.id)
+            if action in CREATION_ACTIONS:
+                ignored = False
+                state.candidate_id = decision.target_id
+                state.member_ids = _member_values(payload)
+                raw_context = payload.get("context_members")
+                state.context_ids = (
+                    {str(item) for item in raw_context if isinstance(item, str) and item}
+                    if isinstance(raw_context, list)
+                    else set()
+                )
+                state.member_ids -= state.context_ids
+                title = payload.get("title")
+                if isinstance(title, str) and title:
+                    state.title = title
+                contribution_type = payload.get("type")
+                if isinstance(contribution_type, str) and contribution_type:
+                    state.contribution_type = contribution_type
+            elif action in {"ignore", "ignore_candidate"}:
+                ignored = True
+            elif action in {"rename", "rename_contribution"}:
+                title = payload.get("title")
+                if isinstance(title, str) and title:
+                    state.title = title
+                contribution_type = payload.get("type")
+                if isinstance(contribution_type, str) and contribution_type:
+                    state.contribution_type = contribution_type
+            elif action == "set_contribution_type":
+                contribution_type = payload.get("type")
+                if isinstance(contribution_type, str) and contribution_type:
+                    state.contribution_type = contribution_type
             elif action == "add_member":
                 member = _single_member(payload)
                 if member:
@@ -255,22 +256,23 @@ class PacketBuilder:
                 if member:
                     state.member_ids.discard(member)
                     state.context_ids.add(member)
-            elif action == "attest_claim":
+            elif action in {"attest", "attest_claim"}:
                 claim = payload.get("claim")
                 statement = payload.get("statement")
                 if isinstance(claim, str) and isinstance(statement, str) and statement:
                     source_note = payload.get("source_note")
                     state.attestations.append(
                         HumanAttestation(
-                            decision_id=decision_id,
+                            decision_id=decision.id,
                             claim=claim,
                             statement=statement,
-                            source_note=str(source_note) if isinstance(source_note, str) else None,
+                            source_note=(
+                                str(source_note) if isinstance(source_note, str) else None
+                            ),
                         )
                     )
-
-        if not base_found:
-            raise NotFound(f"contribution not found: {identifier}")
+        if ignored:
+            raise NotFound(f"candidate was ignored by a human decision: {identifier}")
         all_members = state.member_ids | state.context_ids
         if not state.app_id and all_members:
             placeholders = ",".join("?" for _ in all_members)
@@ -1247,10 +1249,10 @@ class PacketBuilder:
         for row in rows:
             try:
                 projected: CandidateView = project_candidate(self.connection, str(row["id"]))
-                candidate = self._candidate(str(row["id"]))
+                candidate = self._resolve_contribution(str(row["id"]))
             except NotFound:
                 continue
-            if candidate is None or projected.status == "ignored":
+            if projected.status == "ignored":
                 continue
             records = self._records(candidate)
             if not records:
@@ -1274,19 +1276,25 @@ class PacketBuilder:
                     if isinstance(item, dict) and item.get("role")
                 }
             )
-            confirmed = next(
-                (
-                    str(payload["contribution_id"])
-                    for _, action, target, payload, _ in self._active_decisions()
-                    if action == "confirm_candidate"
-                    and target == candidate.id
-                    and isinstance(payload.get("contribution_id"), str)
-                ),
-                None,
+            lineage = resolve_decision_lineage(
+                self.connection,
+                str(row["id"]),
+                app_id=app_id,
             )
+            confirmed = None
+            if lineage is not None:
+                confirmed = next(
+                    (
+                        str(decision.payload["contribution_id"])
+                        for decision in reversed(lineage.decisions)
+                        if decision.action in CREATION_ACTIONS
+                        and isinstance(decision.payload.get("contribution_id"), str)
+                    ),
+                    None,
+                )
             visible_items.append(
                 {
-                    "candidate_id": candidate.id,
+                    "candidate_id": str(row["id"]),
                     "confirmed_contribution_id": confirmed,
                     "title": candidate.title,
                     "source_text_is_untrusted": True,
@@ -1519,32 +1527,16 @@ class PacketBuilder:
             "SELECT * FROM human_decisions WHERE id=?", (evidence_id,)
         ).fetchone()
         if decision is not None:
-            target_id = str(decision["target_id"])
-            try:
-                app_id = self._resolve_contribution(target_id).app_id
-            except NotFound:
-                scoped_target = self.connection.execute(
-                    """
-                    SELECT app_id FROM source_objects WHERE id=?
-                    UNION
-                    SELECT so.app_id FROM observations o
-                    JOIN source_objects so ON so.id=o.source_object_id
-                    WHERE o.id=?
-                    """,
-                    (target_id, target_id),
-                ).fetchone()
-                if scoped_target is None:
-                    raise ScopeViolation(
-                        "manual evidence has no configured application scope"
-                    ) from None
-                app_id = str(scoped_target["app_id"])
-                self._app(app_id)
+            decision_app_id = decision_scope_map(self.connection).get(evidence_id)
+            if decision_app_id is None:
+                raise ScopeViolation("manual evidence has no configured application scope")
+            self._app(decision_app_id)
             payload = _parse_json_object(decision["payload_json"])
             statement = payload.get("statement", payload.get("reason", ""))
             text = str(statement)[:max_chars]
             return {
                 "evidence_id": evidence_id,
-                "app_id": app_id,
+                "app_id": decision_app_id,
                 "content_type": "untrusted_source_excerpt",
                 "source_text_is_untrusted": True,
                 "source": "manual",
@@ -1553,7 +1545,7 @@ class PacketBuilder:
                 "truncated": len(str(statement)) > max_chars,
                 "as_of": str(decision["created_at"]),
                 "completeness": "human_attested",
-                "source_status": self.source_status(app_id),
+                "source_status": self.source_status(decision_app_id),
             }
         reference = self.connection.execute(
             f"""

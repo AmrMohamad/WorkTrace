@@ -29,6 +29,7 @@ from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
 from worktrace.db.repository import EvidenceRepository
 from worktrace.importers.orchestrator import import_snapshot
+from worktrace.mcp_server.tools import WorkTraceTools
 from worktrace.normalize.records import build_record
 from worktrace.normalize.redaction import Redactor
 from worktrace.packets.builder import build_phase4_packet
@@ -652,3 +653,106 @@ async def test_mcp_stdio_initializes_and_lists_exactly_six_read_only_tools(
         "search_evidence",
         "get_evidence_excerpt",
     }
+
+
+def test_confirmed_contribution_projects_post_confirm_cli_decisions_and_undo(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "decision-lineage-repository"
+    _run("git", "init", "-q", str(repository), cwd=tmp_path)
+    _run("git", "config", "user.name", "Fixture Engineer", cwd=repository)
+    _run("git", "config", "user.email", "fixture@example.test", cwd=repository)
+    (repository / "first.py").write_text("FIRST = True\n", encoding="utf-8")
+    _run("git", "add", "first.py", cwd=repository)
+    _run("git", "commit", "-q", "-m", "implement first fixture", cwd=repository)
+    (repository / "second.py").write_text("SECOND = True\n", encoding="utf-8")
+    _run("git", "add", "second.py", cwd=repository)
+    _run("git", "commit", "-q", "-m", "implement second fixture", cwd=repository)
+    config = _repository_config(tmp_path, repository)
+    runner = CliRunner()
+
+    assert runner.invoke(app, ["init", "--config", str(config)]).exit_code == 0
+    imported = runner.invoke(
+        app,
+        [
+            "import",
+            "all",
+            "sample_store",
+            "2024-01-01",
+            "2026-12-31",
+            "--config",
+            str(config),
+        ],
+    )
+    assert imported.exit_code == 0, imported.stdout
+    listed = runner.invoke(app, ["candidates", "list", "sample_store", "--config", str(config)])
+    assert listed.exit_code == 0, listed.stdout
+    candidate_ids = [str(item["id"]) for item in json.loads(listed.stdout)]
+    assert len(candidate_ids) == 2
+    primary_id, secondary_id = candidate_ids
+    primary = runner.invoke(app, ["candidates", "show", primary_id, "--config", str(config)])
+    secondary = runner.invoke(app, ["candidates", "show", secondary_id, "--config", str(config)])
+    assert primary.exit_code == secondary.exit_code == 0
+    primary_object_ids = {
+        str(member["source_object_id"]) for member in json.loads(primary.stdout)["members"]
+    }
+    secondary_object_id = str(json.loads(secondary.stdout)["members"][0]["source_object_id"])
+
+    confirmed = runner.invoke(app, ["confirm", primary_id, "--config", str(config)])
+    assert confirmed.exit_code == 0, confirmed.stdout
+    contribution_id = str(json.loads(confirmed.stdout)["contribution_id"])
+    renamed = runner.invoke(
+        app,
+        [
+            "rename",
+            primary_id,
+            "Canonical confirmed contribution",
+            "--config",
+            str(config),
+        ],
+    )
+    added = runner.invoke(
+        app,
+        ["add-member", primary_id, secondary_object_id, "--config", str(config)],
+    )
+    removed = runner.invoke(
+        app,
+        ["remove-member", primary_id, secondary_object_id, "--config", str(config)],
+    )
+    assert renamed.exit_code == added.exit_code == removed.exit_code == 0
+
+    tools = WorkTraceTools(config_path=config)
+    candidate_after_remove = tools.get_contribution_summary(contribution_id=primary_id)
+    contribution_after_remove = tools.get_contribution_summary(contribution_id=contribution_id)
+    assert candidate_after_remove["contribution"]["title"] == ("Canonical confirmed contribution")
+    assert contribution_after_remove["contribution"]["title"] == (
+        "Canonical confirmed contribution"
+    )
+    assert {item["object_id"] for item in candidate_after_remove["members"]} == (primary_object_ids)
+    assert {item["object_id"] for item in contribution_after_remove["members"]} == (
+        primary_object_ids
+    )
+
+    remove_decision_id = str(json.loads(removed.stdout)["decision_id"])
+    undone = runner.invoke(app, ["undo", remove_decision_id, "--config", str(config)])
+    assert undone.exit_code == 0, undone.stdout
+    candidate_after_undo = tools.get_contribution_summary(contribution_id=primary_id)
+    contribution_after_undo = tools.get_contribution_summary(contribution_id=contribution_id)
+    expected_members = primary_object_ids | {secondary_object_id}
+    assert {item["object_id"] for item in candidate_after_undo["members"]} == expected_members
+    assert {item["object_id"] for item in contribution_after_undo["members"]} == expected_members
+    assert (
+        contribution_after_undo["contribution"]["title"]
+        == (candidate_after_undo["contribution"]["title"])
+    )
+    candidate_list = tools.list_contribution_candidates(app_id="sample_store")
+    list_item = next(
+        item for item in candidate_list["candidates"] if item["candidate_id"] == primary_id
+    )
+    assert list_item["confirmed_contribution_id"] == contribution_id
+    assert list_item["title"] == "Canonical confirmed contribution"
+    packet = tools.build_phase4_packet(contribution_id=contribution_id)
+    assert packet["contribution"]["title"] == "Canonical confirmed contribution"
+    assert {item["object_id"] for item in packet["evidence_summary"]["members"]} == (
+        expected_members
+    )

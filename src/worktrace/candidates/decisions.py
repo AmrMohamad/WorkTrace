@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from worktrace.errors import NotFound
+from worktrace.errors import NotFound, ScopeViolation
 from worktrace.normalize.redaction import Redactor
 
 
@@ -19,6 +19,17 @@ class Decision:
     payload: dict[str, object]
     created_at: str
     undo_target_id: str | None = None
+
+
+@dataclass(frozen=True)
+class DecisionLineage:
+    """One app-owned connected component in the immutable decision graph."""
+
+    app_id: str
+    candidate_ids: frozenset[str]
+    contribution_ids: frozenset[str]
+    canonical_candidate_id: str
+    decisions: tuple[Decision, ...]
 
 
 VALID_ACTIONS = {
@@ -199,3 +210,268 @@ def active_decisions(connection: sqlite3.Connection, target_id: str) -> list[Dec
         )
         for row in rows
     ]
+
+
+def decision_stream(
+    connection: sqlite3.Connection,
+    *,
+    active_only: bool = False,
+) -> list[Decision]:
+    """Return immutable decisions in projection order, optionally without compensated rows."""
+
+    rows = list(connection.execute("SELECT * FROM human_decisions ORDER BY created_at, id"))
+    canceled = {
+        str(row["undo_target_id"])
+        for row in rows
+        if str(row["action"]) in {"undo", "undo_decision"} and row["undo_target_id"]
+    }
+    result: list[Decision] = []
+    for row in rows:
+        action = str(row["action"])
+        decision_id = str(row["id"])
+        if active_only and (decision_id in canceled or action in {"undo", "undo_decision"}):
+            continue
+        try:
+            parsed = json.loads(str(row["payload_json"]))
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        result.append(
+            Decision(
+                id=decision_id,
+                action=action,
+                target_id=str(row["target_id"]),
+                payload=dict(parsed) if isinstance(parsed, dict) else {},
+                created_at=str(row["created_at"]),
+                undo_target_id=(str(row["undo_target_id"]) if row["undo_target_id"] else None),
+            )
+        )
+    return result
+
+
+def _declared_app(payload: Mapping[str, object]) -> str | None:
+    value = payload.get("app_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _target_apps(
+    connection: sqlite3.Connection,
+    target_id: str,
+    node_apps: Mapping[str, set[str]],
+) -> set[str]:
+    result = set(node_apps.get(target_id, set()))
+    result.update(
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT app_id FROM candidate_groups WHERE id=?
+            UNION SELECT app_id FROM source_objects WHERE id=?
+            UNION SELECT object.app_id FROM observations observation
+                  JOIN source_objects object ON object.id=observation.source_object_id
+                  WHERE observation.id=?
+            """,
+            (target_id, target_id, target_id),
+        )
+    )
+    return result
+
+
+def scoped_decision_app(
+    connection: sqlite3.Connection,
+    decision: Decision,
+    *,
+    node_apps: Mapping[str, set[str]] | None = None,
+) -> str | None:
+    """Resolve a decision to exactly one app without trusting a bare target string."""
+
+    if decision.action in CREATION_ACTIONS or decision.action in {"confirm", "merge", "split"}:
+        return creation_decision_scope_app(
+            connection,
+            decision.target_id,
+            decision.payload,
+        )
+    target_apps = _target_apps(connection, decision.target_id, node_apps or {})
+    declared = _declared_app(decision.payload)
+    if declared is not None:
+        if declared not in target_apps:
+            return None
+        target_apps = {declared}
+    if decision.action in {"add_member", "remove_member", "mark_context_only"}:
+        source_object_id = decision.payload.get("source_object_id")
+        if not isinstance(source_object_id, str) or not source_object_id:
+            return None
+        member = connection.execute(
+            "SELECT app_id FROM source_objects WHERE id=?", (source_object_id,)
+        ).fetchone()
+        if member is None:
+            return None
+        member_app = str(member[0])
+        target_apps &= {member_app}
+    return next(iter(target_apps)) if len(target_apps) == 1 else None
+
+
+def decision_node_apps(
+    connection: sqlite3.Connection,
+    *,
+    active_only: bool = False,
+) -> dict[str, set[str]]:
+    """Map every declared candidate/contribution lineage identifier to owning apps."""
+
+    result: dict[str, set[str]] = {}
+    for decision in decision_stream(connection, active_only=active_only):
+        if decision.action not in CREATION_ACTIONS:
+            continue
+        app_id = creation_decision_scope_app(
+            connection,
+            decision.target_id,
+            decision.payload,
+        )
+        contribution_id = decision.payload.get("contribution_id")
+        if app_id is None or not isinstance(contribution_id, str) or not contribution_id:
+            continue
+        identifiers = {decision.target_id, contribution_id}
+        raw_candidates = decision.payload.get("candidate_ids")
+        if isinstance(raw_candidates, list):
+            identifiers.update(
+                str(value) for value in raw_candidates if isinstance(value, str) and value
+            )
+        for identifier in identifiers:
+            result.setdefault(identifier, set()).add(app_id)
+    return result
+
+
+def decision_scope_map(
+    connection: sqlite3.Connection,
+    *,
+    active_only: bool = False,
+) -> dict[str, str | None]:
+    """Resolve every decision to one owning app, including its undo closure."""
+
+    decisions = decision_stream(connection, active_only=active_only)
+    node_apps = decision_node_apps(connection, active_only=active_only)
+    result: dict[str, str | None] = {}
+    for decision in decisions:
+        if decision.action in {"undo", "undo_decision"}:
+            result[decision.id] = (
+                result.get(decision.undo_target_id) if decision.undo_target_id else None
+            )
+            continue
+        result[decision.id] = scoped_decision_app(
+            connection,
+            decision,
+            node_apps=node_apps,
+        )
+    return result
+
+
+def decision_lineages(connection: sqlite3.Connection) -> tuple[DecisionLineage, ...]:
+    """Build active app-scoped candidate/contribution lineage components."""
+
+    active = decision_stream(connection, active_only=True)
+    adjacency: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    node_kind: dict[tuple[str, str], str] = {}
+    creation_app: dict[str, str] = {}
+    for decision in active:
+        if decision.action not in CREATION_ACTIONS:
+            continue
+        app_id = creation_decision_scope_app(
+            connection,
+            decision.target_id,
+            decision.payload,
+        )
+        contribution_id = decision.payload.get("contribution_id")
+        if app_id is None or not isinstance(contribution_id, str) or not contribution_id:
+            continue
+        creation_app[decision.id] = app_id
+        candidates = {decision.target_id}
+        raw_candidates = decision.payload.get("candidate_ids")
+        if isinstance(raw_candidates, list):
+            candidates.update(
+                str(value) for value in raw_candidates if isinstance(value, str) and value
+            )
+        contribution_node = (app_id, contribution_id)
+        node_kind[contribution_node] = "contribution"
+        adjacency.setdefault(contribution_node, set())
+        for candidate_id in candidates:
+            candidate_node = (app_id, candidate_id)
+            node_kind[candidate_node] = "candidate"
+            adjacency.setdefault(candidate_node, set()).add(contribution_node)
+            adjacency[contribution_node].add(candidate_node)
+        candidate_nodes = [(app_id, candidate_id) for candidate_id in candidates]
+        for candidate_node in candidate_nodes:
+            adjacency[candidate_node].update(
+                other for other in candidate_nodes if other != candidate_node
+            )
+
+    node_apps = decision_node_apps(connection, active_only=True)
+
+    result: list[DecisionLineage] = []
+    visited: set[tuple[str, str]] = set()
+    for start in sorted(adjacency):
+        if start in visited:
+            continue
+        stack = [start]
+        component: set[tuple[str, str]] = set()
+        while stack:
+            node = stack.pop()
+            if node in component:
+                continue
+            component.add(node)
+            stack.extend(adjacency.get(node, ()))
+        visited.update(component)
+        app_id = start[0]
+        component_ids = {node_id for _, node_id in component}
+        component_candidate_ids = frozenset(
+            node_id for node, node_id in component if node_kind[node, node_id] == "candidate"
+        )
+        component_contribution_ids = frozenset(component_ids - set(component_candidate_ids))
+        scoped: list[Decision] = []
+        creations: list[Decision] = []
+        for decision in active:
+            if decision.target_id not in component_ids:
+                continue
+            decision_app = creation_app.get(decision.id)
+            if decision_app is None:
+                decision_app = scoped_decision_app(
+                    connection,
+                    decision,
+                    node_apps=node_apps,
+                )
+            if decision_app != app_id:
+                continue
+            scoped.append(decision)
+            if decision.action in CREATION_ACTIONS:
+                creations.append(decision)
+        if not creations:
+            continue
+        result.append(
+            DecisionLineage(
+                app_id=app_id,
+                candidate_ids=component_candidate_ids,
+                contribution_ids=component_contribution_ids,
+                canonical_candidate_id=creations[-1].target_id,
+                decisions=tuple(scoped),
+            )
+        )
+    return tuple(result)
+
+
+def resolve_decision_lineage(
+    connection: sqlite3.Connection,
+    identifier: str,
+    *,
+    app_id: str | None = None,
+) -> DecisionLineage | None:
+    matches = [
+        lineage
+        for lineage in decision_lineages(connection)
+        if identifier in lineage.candidate_ids or identifier in lineage.contribution_ids
+        if app_id is None or lineage.app_id == app_id
+    ]
+    matched_apps = {lineage.app_id for lineage in matches}
+    if len(matched_apps) > 1:
+        raise ScopeViolation("contribution identifier belongs to more than one configured app")
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise ScopeViolation("contribution identifier has ambiguous decision lineage")
+    return matches[0]

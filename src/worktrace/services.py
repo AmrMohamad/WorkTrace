@@ -9,7 +9,7 @@ from pathlib import Path
 from worktrace.candidates.decisions import (
     CREATION_ACTIONS,
     active_decisions,
-    creation_decision_scope_app,
+    decision_scope_map,
     snapshot_member_ids,
 )
 from worktrace.candidates.projector import CandidateView, project_candidate
@@ -18,6 +18,7 @@ from worktrace.db.authority import (
     authoritative_current_availability_ctes,
     authoritative_current_participation_ctes,
     authoritative_current_reference_ctes,
+    authoritative_current_run_ctes,
 )
 from worktrace.db.repository import EvidenceRepository
 from worktrace.domain.enums import Completeness
@@ -66,9 +67,9 @@ def add_manual_evidence(
 
 def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -> int:
     current = EvidenceRepository(connection).current_observations(app_id)
-    object_ids = sorted({str(row["source_object_id"]) for row in current})
-    observation_ids = sorted({str(row["id"]) for row in current})
-    sync_run_ids = sorted({str(row["sync_run_id"]) for row in current})
+    current_object_ids = {str(row["source_object_id"]) for row in current}
+    current_observation_ids = {str(row["id"]) for row in current}
+    current_sync_run_ids = {str(row["sync_run_id"]) for row in current}
 
     def placeholders(values: list[str]) -> str:
         return ",".join("?" for _ in values) or "NULL"
@@ -77,6 +78,8 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         dict(row)
         for row in connection.execute("SELECT * FROM human_decisions ORDER BY created_at, id")
     ]
+    decision_scopes = decision_scope_map(connection)
+    active_decision_scopes = decision_scope_map(connection, active_only=True)
     decision_payloads: dict[str, dict[str, object]] = {}
     for decision in all_decisions:
         try:
@@ -91,16 +94,10 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         decision
         for decision in all_decisions
         if str(decision["action"]) in CREATION_ACTIONS
-        and creation_decision_scope_app(
-            connection,
-            str(decision["target_id"]),
-            decision_payloads[str(decision["id"])],
-        )
-        == app_id
+        and decision_scopes.get(str(decision["id"])) == app_id
         and isinstance(decision_payloads[str(decision["id"])].get("contribution_id"), str)
         and decision_payloads[str(decision["id"])]["contribution_id"]
     ]
-    valid_creation_ids = {str(decision["id"]) for decision in valid_creation_decisions}
     history_candidate_ids = {str(decision["target_id"]) for decision in valid_creation_decisions}
     contribution_ids = {
         str(decision_payloads[str(decision["id"])]["contribution_id"])
@@ -110,6 +107,62 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         str(row[0])
         for row in connection.execute("SELECT id FROM source_objects WHERE app_id=?", (app_id,))
     }
+
+    availability_rows = [
+        dict(row)
+        for row in connection.execute(
+            f"""
+            WITH {authoritative_current_availability_ctes()}
+            SELECT event.*
+            FROM authoritative_current_availability_events event
+            JOIN source_objects object ON object.id=event.source_object_id
+            WHERE object.app_id=?
+            ORDER BY event.source_object_id, event.id
+            """,
+            (app_id,),
+        )
+    ]
+    availability_object_ids = {str(row["source_object_id"]) for row in availability_rows}
+    availability_sync_run_ids = {str(row["sync_run_id"]) for row in availability_rows}
+    provenance_object_ids = sorted(availability_object_ids - current_object_ids)
+    provenance_observations = [
+        dict(row)
+        for row in connection.execute(
+            f"""
+            WITH {authoritative_current_run_ctes()},
+            ranked_export_provenance AS (
+                SELECT observation.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY observation.source_object_id
+                        ORDER BY eligible_run.completed_at DESC,
+                                 observation.fetched_at DESC,
+                                 observation.id DESC
+                    ) AS position
+                FROM observations observation
+                JOIN source_objects object
+                  ON object.id=observation.source_object_id
+                JOIN ranked_authoritative_runs eligible_run
+                  ON eligible_run.id=observation.sync_run_id
+                 AND eligible_run.app_id=object.app_id
+                 AND eligible_run.source=object.source
+                 AND eligible_run.source_instance=object.source_instance
+                WHERE object.app_id=?
+                  AND observation.source_object_id IN ({placeholders(provenance_object_ids)})
+            )
+            SELECT * FROM ranked_export_provenance
+            WHERE position=1
+            ORDER BY source_object_id, id
+            """,
+            [app_id, *provenance_object_ids],
+        )
+    ]
+    provenance_observation_ids = {str(row["id"]) for row in provenance_observations}
+    provenance_sync_run_ids = {str(row["sync_run_id"]) for row in provenance_observations}
+    object_ids = sorted(current_object_ids | availability_object_ids)
+    observation_ids = sorted(current_observation_ids | provenance_observation_ids)
+    sync_run_ids = sorted(
+        current_sync_run_ids | availability_sync_run_ids | provenance_sync_run_ids
+    )
 
     candidate_rows = list(
         connection.execute(
@@ -140,24 +193,7 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
     included_decision_ids: set[str] = set()
 
     def decision_is_scoped(decision: dict[str, object]) -> bool:
-        decision_id = str(decision["id"])
-        action = str(decision["action"])
-        payload_data = decision_payloads[decision_id]
-        if action in CREATION_ACTIONS:
-            return decision_id in valid_creation_ids
-        if action in {"add_member", "remove_member", "mark_context_only"}:
-            source_object_id = payload_data.get("source_object_id")
-            return (
-                isinstance(source_object_id, str) and source_object_id in scoped_source_object_ids
-            )
-        if action == "merge":
-            return (
-                creation_decision_scope_app(connection, str(decision["target_id"]), payload_data)
-                == app_id
-            )
-        if action == "split":
-            return snapshot_member_ids(payload_data) <= scoped_source_object_ids
-        return True
+        return decision_scopes.get(str(decision["id"])) == app_id
 
     changed = True
     while changed:
@@ -254,19 +290,7 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
             observation_ids,
         )
     ]
-    payload["source_object_availability_events"] = [
-        dict(row)
-        for row in connection.execute(
-            f"""
-            WITH {authoritative_current_availability_ctes()}
-            SELECT event.* FROM authoritative_current_availability_events event
-            WHERE event.source_object_id IN ({placeholders(object_ids)})
-              AND event.sync_run_id IN ({placeholders(sync_run_ids)})
-            ORDER BY event.source_object_id, event.id
-            """,
-            [*object_ids, *sync_run_ids],
-        )
-    ]
+    payload["source_object_availability_events"] = availability_rows
     payload["references"] = [
         dict(row)
         for row in connection.execute(
@@ -285,11 +309,13 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
             "id": projected.id,
             "app_id": projected.app_id,
             "seed_object_id": (
-                projected.seed_object_id if projected.seed_object_id in object_ids else None
+                projected.seed_object_id if projected.seed_object_id in current_object_ids else None
             ),
             "metadata_source_object_id": projected.metadata_source_object_id,
             "unsupported_seed_object_id": (
-                projected.seed_object_id if projected.seed_object_id not in object_ids else None
+                projected.seed_object_id
+                if projected.seed_object_id not in current_object_ids
+                else None
             ),
             "generator_version": str(row["generator_version"]),
             "suggested_title": projected.title,
@@ -329,7 +355,7 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
             decision.id
             for decision in active_decisions(connection, candidate_id)
             if decision.action in CREATION_ACTIONS
-            and creation_decision_scope_app(connection, candidate_id, decision.payload) == app_id
+            and active_decision_scopes.get(decision.id) == app_id
         }
         creation = next(
             (
@@ -355,7 +381,7 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
                 if unsupported_projected is not None
                 else snapshot_member_ids(creation_payload) & scoped_source_object_ids
             )
-            - set(object_ids)
+            - current_object_ids
         )
         raw_title = creation_payload.get("title")
         unsupported_history.append(

@@ -75,16 +75,18 @@ def authoritative_run_sql(alias: str) -> str:
         AND {alias}.completeness IN ('complete', 'complete_for_scope', 'selection_biased')
         AND (
             {alias}.source NOT IN ('jira', 'gitlab')
-            OR (
-                json_type(
+            OR CASE
+                WHEN COALESCE(json_valid({alias}.scope_json), 0) != 1 THEN 0
+                WHEN json_type({alias}.scope_json) != 'object' THEN 0
+                WHEN json_type(
                     {alias}.scope_json,
                     '$.selection_policy_version'
-                )='integer'
-                AND json_extract(
+                ) != 'integer' THEN 0
+                ELSE json_extract(
                     {alias}.scope_json,
                     '$.selection_policy_version'
                 ) >= {CURRENT_SELECTION_POLICY_VERSION}
-            )
+            END
         )
     """
 
