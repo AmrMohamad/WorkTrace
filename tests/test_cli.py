@@ -8,7 +8,7 @@ import pytest
 from click.utils import strip_ansi
 from typer.testing import CliRunner
 
-from worktrace.cli import app
+from worktrace.cli import _commit_seed_scope, _CommitSeedSelection, app
 
 
 def _write_config(tmp_path: Path, repository: Path) -> Path:
@@ -112,3 +112,26 @@ def test_cli_help_init_status_search_export_and_confirmed_purge(
     assert not database.exists()
     assert not key.exists()
     assert destination.exists()
+
+
+def test_local_commit_seed_cap_records_drops_and_selection_policy() -> None:
+    scope = _commit_seed_scope(
+        _CommitSeedSelection(
+            values=("c" * 40, "b" * 40),
+            total_count=3,
+            limit=2,
+        )
+    )
+
+    assert scope["selection_biased"] is True
+    assert scope["relevant_local_commit_sha_total"] == 3
+    assert scope["selection_events"] == [
+        {
+            "kind": "local_git_commit_seed_cap",
+            "input_count": 3,
+            "selected_count": 2,
+            "dropped_count": 1,
+            "limit": 2,
+            "selection_policy": "source_updated_at_desc_then_sha_desc",
+        }
+    ]

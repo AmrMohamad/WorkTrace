@@ -81,6 +81,65 @@ def test_docs_record_required_truth_and_phase4_invariants() -> None:
     assert "Live provider or proprietary repository validation" in limitations
 
 
+def test_public_contracts_use_the_emitted_v01_vocabulary() -> None:
+    evidence = (DOCS / "evidence-model.md").read_text(encoding="utf-8")
+    packet = (DOCS / "phase4-schema.md").read_text(encoding="utf-8")
+
+    canonical_roles = {
+        "jira_comment_author",
+        "jira_changelog_author",
+        "mr_author",
+        "mr_reviewer",
+    }
+    obsolete_roles = {
+        "jira_commenter",
+        "jira_field_updater",
+        "gitlab_mr_author",
+        "gitlab_reviewer",
+    }
+    assert canonical_roles <= set(evidence.split())
+    assert obsolete_roles.isdisjoint(evidence.split())
+
+    emitted_release_rungs = {
+        "implemented",
+        "merged",
+        "release_associated",
+        "deployed",
+        "released_to_users",
+        "currently_enabled",
+        "measurably_successful",
+    }
+    obsolete_release_rungs = {
+        "implementation_observed",
+        "deployment_observed",
+        "currently_enabled_or_used",
+    }
+    assert emitted_release_rungs <= set(packet.split())
+    assert obsolete_release_rungs.isdisjoint(packet.split())
+
+
+def test_agdr_records_package_runtime_and_authority_tradeoffs() -> None:
+    package_runtime = (
+        DOCS / "agdr" / "AgDR-0003-local-python-runtime-and-evidence-authority.md"
+    ).read_text(encoding="utf-8")
+    required_decisions = {
+        "Python 3.12",
+        "Hatchling",
+        "Typer",
+        "httpx",
+        "MCP",
+        "SQLite",
+        "selection_biased",
+        "selection_policy_version",
+    }
+    assert all(decision in package_runtime for decision in required_decisions)
+
+    evidence_contract = (DOCS / "agdr" / "AgDR-0001-evidence-pipeline-contracts.md").read_text(
+        encoding="utf-8"
+    )
+    assert "No new runtime dependency or service is introduced." not in evidence_contract
+
+
 def test_codex_mcp_example_is_bounded_and_forwards_no_source_credentials() -> None:
     raw = (DOCS / "codex-mcp.example.toml").read_text(encoding="utf-8")
     config = tomllib.loads(raw)

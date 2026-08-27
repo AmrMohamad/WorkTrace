@@ -158,12 +158,12 @@ Other contributors remain visible. Evidence counts may aid inspection within thi
 The packet contains seven independent rungs:
 
 ```text
-implementation_observed
+implemented
 merged
 release_associated
-deployment_observed
+deployed
 released_to_users
-currently_enabled_or_used
+currently_enabled
 measurably_successful
 ```
 

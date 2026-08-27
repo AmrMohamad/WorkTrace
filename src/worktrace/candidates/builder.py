@@ -74,6 +74,20 @@ def _suggest_type(kind: str, title: str) -> str:
     return "unknown"
 
 
+def _has_complete_changed_paths(row: sqlite3.Row) -> bool:
+    if str(row["completeness"]) not in {"complete", "complete_for_scope"}:
+        return False
+    raw_data = json.loads(str(row["data_json"]))
+    data = raw_data if isinstance(raw_data, dict) else {}
+    paths = data.get("changed_paths")
+    return (
+        isinstance(paths, list)
+        and bool(paths)
+        and data.get("overflow") is not True
+        and data.get("scope_complete") is not False
+    )
+
+
 def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
     connection = repository.connection
     current = repository.current_observations(app_id)
@@ -90,9 +104,17 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
         right = str(relation["to_object_id"])
         left_kind = str(objects[left]["kind"]) if left in objects else ""
         right_kind = str(objects[right]["kind"]) if right in objects else ""
-        if left_kind == "gitlab_mr" and "changed_path" in right_kind:
+        if (
+            left_kind == "gitlab_mr"
+            and "changed_path" in right_kind
+            and _has_complete_changed_paths(objects[right])
+        ):
             mr_with_changed_paths.add(left)
-        elif right_kind == "gitlab_mr" and "changed_path" in left_kind:
+        elif (
+            right_kind == "gitlab_mr"
+            and "changed_path" in left_kind
+            and _has_complete_changed_paths(objects[left])
+        ):
             mr_with_changed_paths.add(right)
     roles = _self_roles(connection, app_id)
     linked_ids = {
@@ -201,8 +223,9 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
                         break
                 if overflow:
                     break
+            retained_members = [seed, *sorted(members - {seed})][:MAX_MEMBERS]
+            members = set(retained_members)
             used_structural.update(members)
-            members = set(sorted(members)[:MAX_MEMBERS])
             context = set(sorted(context - members)[:MAX_CONTEXT])
             row = objects[seed]
             title = str(row["title"] or row["external_id"])

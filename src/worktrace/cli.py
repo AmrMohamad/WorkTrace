@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 from typing import Annotated, cast
@@ -153,9 +153,21 @@ def _git_self_ids(configuration: WorkTraceConfig, key: bytes) -> set[str]:
     return {redactor.hash_email(email) for email in configuration.identity.git_author_emails}
 
 
+@dataclass(frozen=True, slots=True)
+class _CommitSeedSelection:
+    values: tuple[str, ...]
+    total_count: int
+    limit: int
+    policy: str = "source_updated_at_desc_then_sha_desc"
+
+    @property
+    def dropped_count(self) -> int:
+        return self.total_count - len(self.values)
+
+
 def _relevant_git_commit_shas(
     repository: EvidenceRepository, app_id: str, *, limit: int = 200
-) -> tuple[str, ...]:
+) -> _CommitSeedSelection:
     """Return bounded current self-authored/coauthored local commit identities."""
 
     allowed_objects = {
@@ -172,16 +184,54 @@ def _relevant_git_commit_shas(
             (app_id,),
         )
     }
-    shas = sorted(
-        {
-            str(row["external_id"]).lower()
-            for row in repository.current_observations(app_id)
-            if str(row["source_object_id"]) in allowed_objects
-            and str(row["source"]) == "git"
-            and str(row["kind"]) == "git_commit"
-        }
+    candidates: dict[str, str] = {}
+    for row in repository.current_observations(app_id):
+        if (
+            str(row["source_object_id"]) not in allowed_objects
+            or str(row["source"]) != "git"
+            or str(row["kind"]) != "git_commit"
+        ):
+            continue
+        sha = str(row["external_id"]).lower()
+        source_updated_at = str(row["source_updated_at"] or "")
+        candidates[sha] = max(source_updated_at, candidates.get(sha, ""))
+    ordered = sorted(
+        candidates,
+        key=lambda sha: (candidates[sha], sha),
+        reverse=True,
     )
-    return tuple(shas[:limit])
+    return _CommitSeedSelection(tuple(ordered[:limit]), len(ordered), limit)
+
+
+def _commit_seed_scope(selection: _CommitSeedSelection) -> dict[str, JsonValue]:
+    details: dict[str, JsonValue] = {
+        "relevant_local_commit_sha_count": len(selection.values),
+        "relevant_local_commit_sha_total": selection.total_count,
+        "relevant_local_commit_sha_limit": selection.limit,
+        "relevant_local_commit_selection_policy": selection.policy,
+    }
+    if selection.dropped_count:
+        limitation = (
+            "Local Git commit seeds exceeded the GitLab association bound; "
+            "the most recently updated seeds were retained deterministically."
+        )
+        details.update(
+            {
+                "selection_biased": True,
+                "limitations": [limitation],
+                "selection_events": [
+                    {
+                        "kind": "local_git_commit_seed_cap",
+                        "input_count": selection.total_count,
+                        "selected_count": len(selection.values),
+                        "dropped_count": selection.dropped_count,
+                        "limit": selection.limit,
+                        "selection_policy": selection.policy,
+                    }
+                ],
+            }
+        )
+    return details
 
 
 def _discovered_jira_keys(
@@ -219,7 +269,7 @@ def _import_summary(
     discovery_reasons: tuple[str, ...] = (),
 ) -> dict[str, object]:
     summary = cast(dict[str, object], asdict(result))
-    summary["completeness"] = "complete" if summary.get("status") == "complete" else "partial"
+    summary["completeness"] = result.completeness
     summary["discovery_counts"] = discovery_counts or {}
     summary["discovery_reasons"] = list(discovery_reasons)
     return summary
@@ -378,7 +428,7 @@ def import_gitlab(
         ):
             raise WorkTraceError("GitLab identity is required for user-scoped discovery")
         key = email_hmac_key(configuration.data_directory, create=False)
-        relevant_shas = _relevant_git_commit_shas(repository, app_id)
+        commit_seeds = _relevant_git_commit_shas(repository, app_id)
         with httpx.Client(
             base_url=credentials.base_url,
             headers={"PRIVATE-TOKEN": credentials.token, "Accept": "application/json"},
@@ -398,7 +448,7 @@ def import_gitlab(
                     user_id=configuration.identity.gitlab_user_id,
                     username=configuration.identity.gitlab_username,
                     production_environments=configured_app.production_environments,
-                    relevant_commit_shas=relevant_shas,
+                    relevant_commit_shas=commit_seeds.values,
                 ),
                 client,
             )
@@ -417,7 +467,7 @@ def import_gitlab(
                 date_to=end,
                 self_actor_ids=own_ids,
                 scope_details={
-                    "relevant_local_commit_sha_count": len(relevant_shas),
+                    **_commit_seed_scope(commit_seeds),
                     "selection_reasons": [
                         "configured identity authored/assigned/reviewed merge requests",
                         "current self-authored/coauthored local commits",
@@ -427,7 +477,11 @@ def import_gitlab(
         _emit(
             _import_summary(
                 result,
-                discovery_counts={"relevant_local_commit_shas": len(relevant_shas)},
+                discovery_counts={
+                    "relevant_local_commit_shas": len(commit_seeds.values),
+                    "relevant_local_commit_shas_total": commit_seeds.total_count,
+                    "relevant_local_commit_shas_dropped": commit_seeds.dropped_count,
+                },
                 discovery_reasons=(
                     "configured identity authored/assigned/reviewed merge requests",
                     "current self-authored/coauthored local commits",
@@ -492,7 +546,7 @@ def import_all(
                 )
             )
 
-        relevant_shas = _relevant_git_commit_shas(repository, app_id)
+        commit_seeds = _relevant_git_commit_shas(repository, app_id)
         gitlab_auth = gitlab_credentials()
         gitlab_identity_configured = (
             configuration.identity.gitlab_user_id is not None
@@ -531,7 +585,11 @@ def import_all(
                         "project_id": project_id,
                         "status": "source_unavailable",
                         "completeness": "partial",
-                        "discovery_counts": {"relevant_local_commit_shas": len(relevant_shas)},
+                        "discovery_counts": {
+                            "relevant_local_commit_shas": len(commit_seeds.values),
+                            "relevant_local_commit_shas_total": commit_seeds.total_count,
+                            "relevant_local_commit_shas_dropped": commit_seeds.dropped_count,
+                        },
                         "discovery_reasons": [
                             "configured identity authored/assigned/reviewed merge requests",
                             "current self-authored/coauthored local commits",
@@ -567,7 +625,7 @@ def import_all(
                             user_id=configuration.identity.gitlab_user_id,
                             username=configuration.identity.gitlab_username,
                             production_environments=configured_app.production_environments,
-                            relevant_commit_shas=relevant_shas,
+                            relevant_commit_shas=commit_seeds.values,
                         ),
                         client,
                     ),
@@ -580,7 +638,7 @@ def import_all(
                     import_session_id=session_id,
                     finish_session=False,
                     scope_details={
-                        "relevant_local_commit_sha_count": len(relevant_shas),
+                        **_commit_seed_scope(commit_seeds),
                         "selection_reasons": [
                             "configured identity authored/assigned/reviewed merge requests",
                             "current self-authored/coauthored local commits",
@@ -590,7 +648,11 @@ def import_all(
                 results.append(
                     _import_summary(
                         result,
-                        discovery_counts={"relevant_local_commit_shas": len(relevant_shas)},
+                        discovery_counts={
+                            "relevant_local_commit_shas": len(commit_seeds.values),
+                            "relevant_local_commit_shas_total": commit_seeds.total_count,
+                            "relevant_local_commit_shas_dropped": commit_seeds.dropped_count,
+                        },
                         discovery_reasons=(
                             "configured identity authored/assigned/reviewed merge requests",
                             "current self-authored/coauthored local commits",

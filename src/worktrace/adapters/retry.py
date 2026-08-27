@@ -71,6 +71,29 @@ def _parse_retry_after(value: str) -> float | None:
         return max((parsed.astimezone(UTC) - datetime.now(UTC)).total_seconds(), 0.0)
 
 
+def _read_bounded_response(response: httpx.Response) -> httpx.Response:
+    declared_length = response.headers.get("Content-Length")
+    if declared_length is not None:
+        normalized_length = declared_length.strip()
+        if normalized_length.isdecimal() and int(normalized_length) > MAX_HTTP_RESPONSE_BYTES:
+            raise PermanentSourceError("Provider response exceeded the configured safety bound")
+
+    content = bytearray()
+    for chunk in response.iter_bytes():
+        if len(content) + len(chunk) > MAX_HTTP_RESPONSE_BYTES:
+            raise PermanentSourceError("Provider response exceeded the configured safety bound")
+        content.extend(chunk)
+    return httpx.Response(
+        response.status_code,
+        headers=response.headers,
+        content=bytes(content),
+        request=response.request,
+        extensions=response.extensions,
+        history=response.history,
+        default_encoding=response.default_encoding,
+    )
+
+
 def request_with_retry(
     client: httpx.Client,
     method: str,
@@ -87,13 +110,40 @@ def request_with_retry(
 
     for attempt in range(1, policy.max_attempts + 1):
         try:
-            response = client.request(
+            request = client.build_request(
                 method,
                 endpoint,
                 params=params,
                 json=json_body,
-                follow_redirects=False,
             )
+            response = client.send(request, stream=True, follow_redirects=False)
+            try:
+                status = response.status_code
+                if 200 <= status < 300:
+                    return _read_bounded_response(response)
+                if status == 401:
+                    raise InvalidCredentials("Provider rejected the configured credentials")
+                if status == 403:
+                    raise PermissionDenied("Provider denied access to the configured scope")
+                if status == 404 and exact_object:
+                    raise SourceObjectUnavailable("Provider exact object is unavailable")
+                if status == 429 or 500 <= status < 600:
+                    if attempt == policy.max_attempts:
+                        raise RetryExhausted(
+                            f"Provider remained unavailable after {policy.max_attempts} attempts "
+                            f"(HTTP {status})"
+                        )
+                    delay = policy.delay_for(
+                        attempt,
+                        response.headers.get("Retry-After"),
+                        random_value=random_value,
+                    )
+                    response.close()
+                    sleep(delay)
+                    continue
+                raise PermanentSourceError(f"Provider request failed with HTTP {status}")
+            finally:
+                response.close()
         except httpx.RequestError:
             if attempt == policy.max_attempts:
                 raise RetryExhausted(
@@ -101,32 +151,5 @@ def request_with_retry(
                 ) from None
             sleep(policy.delay_for(attempt, random_value=random_value))
             continue
-
-        status = response.status_code
-        if 200 <= status < 300:
-            if len(response.content) > MAX_HTTP_RESPONSE_BYTES:
-                raise PermanentSourceError("Provider response exceeded the configured safety bound")
-            return response
-        if status == 401:
-            raise InvalidCredentials("Provider rejected the configured credentials")
-        if status == 403:
-            raise PermissionDenied("Provider denied access to the configured scope")
-        if status == 404 and exact_object:
-            raise SourceObjectUnavailable("Provider exact object is unavailable")
-        if status == 429 or 500 <= status < 600:
-            if attempt == policy.max_attempts:
-                raise RetryExhausted(
-                    f"Provider remained unavailable after {policy.max_attempts} attempts "
-                    f"(HTTP {status})"
-                )
-            sleep(
-                policy.delay_for(
-                    attempt,
-                    response.headers.get("Retry-After"),
-                    random_value=random_value,
-                )
-            )
-            continue
-        raise PermanentSourceError(f"Provider request failed with HTTP {status}")
 
     raise AssertionError("bounded retry loop exited unexpectedly")

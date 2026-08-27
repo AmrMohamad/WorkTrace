@@ -7,8 +7,16 @@ from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from typing import cast
 
+from worktrace.candidates.projector import CandidateView, project_candidate
 from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.constants import DEFAULT_EXCERPT_CHARS, STALE_AFTER_DAYS
+from worktrace.db.authority import (
+    authoritative_run_sql,
+    authority_limitation,
+    parse_scope,
+    run_is_authoritative,
+    selection_policy_version,
+)
 from worktrace.domain.enums import ClaimStatus, ObservationType
 from worktrace.errors import NotFound, ScopeViolation
 from worktrace.packets.authority import (
@@ -151,33 +159,28 @@ class PacketBuilder:
         ]
 
     def _candidate(self, candidate_id: str) -> ContributionView | None:
-        row = self.connection.execute(
-            "SELECT * FROM candidate_groups WHERE id=?", (candidate_id,)
-        ).fetchone()
-        if row is None:
+        try:
+            projected = project_candidate(self.connection, candidate_id)
+        except NotFound:
             return None
+        if projected.status == "ignored":
+            raise NotFound(f"candidate was ignored by a human decision: {candidate_id}")
         members = {
             str(member["source_object_id"])
-            for member in self.connection.execute(
-                "SELECT source_object_id FROM candidate_members "
-                "WHERE candidate_id=? AND context_only=0",
-                (candidate_id,),
-            )
+            for member in projected.members
+            if not bool(member.get("context_only"))
         }
         context = {
             str(member["source_object_id"])
-            for member in self.connection.execute(
-                "SELECT source_object_id FROM candidate_members "
-                "WHERE candidate_id=? AND context_only=1",
-                (candidate_id,),
-            )
+            for member in projected.members
+            if bool(member.get("context_only"))
         }
         return ContributionView(
             id=candidate_id,
             candidate_id=candidate_id,
-            app_id=str(row["app_id"]),
-            title=str(row["suggested_title"]),
-            contribution_type=str(row["suggested_type"]),
+            app_id=projected.app_id,
+            title=projected.title,
+            contribution_type=projected.contribution_type,
             member_ids=members,
             context_ids=context,
         )
@@ -279,21 +282,13 @@ class PacketBuilder:
 
     def _record_for_object(self, object_id: str, context_only: bool) -> EvidenceRecord | None:
         row = self.connection.execute(
-            """
+            f"""
             WITH ranked_runs AS (
                 SELECT id, source, ROW_NUMBER() OVER (
                     PARTITION BY app_id, source, source_instance
                     ORDER BY completed_at DESC, id DESC
                 ) AS position
-                FROM sync_runs WHERE status='complete'
-                  AND (
-                    source NOT IN ('jira', 'gitlab')
-                    OR CAST(
-                        COALESCE(json_extract(scope_json, '$.selection_policy_version'), 0)
-                        AS INTEGER
-                    ) >= 2
-                    OR json_extract(scope_json, '$.date_from') IS NULL
-                  )
+                FROM sync_runs sr WHERE {authoritative_run_sql("sr")}
             ), eligible_runs AS (
                 SELECT id, position FROM ranked_runs
             ), ranked_current AS (
@@ -422,17 +417,26 @@ class PacketBuilder:
                     "complete",
                     "complete_for_scope",
                 }
-                scope = _parse_json_object(row["scope_json"])
-                raw_selection_version = scope.get("selection_policy_version", 0)
-                selection_version = (
-                    raw_selection_version if isinstance(raw_selection_version, int) else 0
+                scope = parse_scope(row["scope_json"])
+                selection_version = selection_policy_version(scope)
+                authoritative = run_is_authoritative(source, str(row["status"]), scope)
+                progress = _parse_json_object(row["progress_json"])
+                progress_limitations = progress.get("limitations", [])
+                limitations = (
+                    [value for value in progress_limitations if isinstance(value, str) and value]
+                    if isinstance(progress_limitations, list)
+                    else []
                 )
-                legacy_overbroad = (
-                    source in {"jira", "gitlab"}
-                    and scope.get("date_from") is not None
-                    and selection_version < 2
+                limitation = authority_limitation(source, scope)
+                if limitation and limitation not in limitations:
+                    limitations.append(limitation)
+                raw_selection_events = progress.get("selection_events", [])
+                selection_events = (
+                    [value for value in raw_selection_events if isinstance(value, dict)]
+                    if isinstance(raw_selection_events, list)
+                    else []
                 )
-                complete = complete and not legacy_overbroad
+                complete = complete and authoritative
                 instances.append(
                     {
                         "source_instance": str(row["source_instance"]),
@@ -443,16 +447,10 @@ class PacketBuilder:
                         "complete": complete,
                         "stale": stale,
                         "error_summary": row["error_summary"],
-                        "selection_policy_version": selection_version or None,
-                        "authoritative_current": not legacy_overbroad,
-                        "limitations": (
-                            [
-                                "Legacy project-wide discovery is excluded until a scoped "
-                                "reimport completes."
-                            ]
-                            if legacy_overbroad
-                            else []
-                        ),
+                        "selection_policy_version": selection_version,
+                        "authoritative_current": authoritative,
+                        "limitations": limitations,
+                        "selection_events": selection_events,
                     }
                 )
             result[source] = {
@@ -579,10 +577,31 @@ class PacketBuilder:
             result.append((path, is_generated or path in generated))
         return result
 
+    @staticmethod
+    def _changed_path_scope_is_complete(record: EvidenceRecord) -> bool:
+        return (
+            record.completeness in {"complete", "complete_for_scope"}
+            and record.data.get("overflow") is not True
+            and record.data.get("scope_complete") is not False
+        )
+
+    @classmethod
+    def _changed_path_scope_is_limited(cls, record: EvidenceRecord) -> bool:
+        return (
+            record.data.get("overflow") is True
+            or record.data.get("scope_complete") is False
+            or (
+                bool(cls._changed_paths(record))
+                and record.completeness not in {"complete", "complete_for_scope"}
+            )
+        )
+
     def _modules(self, records: Sequence[EvidenceRecord]) -> tuple[list[str], list[EvidenceRecord]]:
         modules: set[str] = set()
         evidence: list[EvidenceRecord] = []
         for record in records:
+            if not self._changed_path_scope_is_complete(record):
+                continue
             app = self._app(record.app_id)
             record_modules: set[str] = set()
             for path, is_generated in self._changed_paths(record):
@@ -617,6 +636,9 @@ class PacketBuilder:
         date_from, date_to = self._date_range(records)
         as_of = max((record.fetched_at for record in records), default=None)
         modules, module_evidence = self._modules(records)
+        limited_changed_path_records = [
+            record for record in records if self._changed_path_scope_is_limited(record)
+        ]
         unsupported_member_ids = self._unsupported_member_ids(contribution, records)
         return {
             "contribution": {
@@ -669,6 +691,15 @@ class PacketBuilder:
                         "observation; legacy overbroad evidence was not used."
                     ]
                     if unsupported_member_ids
+                    else []
+                ),
+                *(
+                    [
+                        "One or more changed-path observations are incomplete or truncated; "
+                        "their retained paths were not used for module, implementation, or "
+                        "affected-scope claims."
+                    ]
+                    if limited_changed_path_records
                     else []
                 ),
             ],
@@ -972,7 +1003,7 @@ class PacketBuilder:
                 question_id="result.changed",
                 question=by_id["result.changed"],
                 answer_draft=str(merged_rung.get("statement")),
-                status=ClaimStatus.SUPPORTED,
+                status=(ClaimStatus.CONTRADICTED if contradiction_ids else ClaimStatus.SUPPORTED),
                 observation_types=(ObservationType.SOURCE_ASSERTED,),
                 supporting_evidence_ids=tuple(
                     str(value) for value in merged_rung.get("supporting_evidence_ids", [])
@@ -1172,15 +1203,19 @@ class PacketBuilder:
             self.connection.execute(
                 """
                 SELECT * FROM candidate_groups WHERE app_id=?
-                ORDER BY generated_at DESC, id LIMIT ? OFFSET ?
+                ORDER BY generated_at DESC, id
                 """,
-                (app_id, limit + 1, offset),
+                (app_id,),
             )
         )
-        items: list[dict[str, object]] = []
-        for row in rows[:limit]:
-            candidate = self._candidate(str(row["id"]))
-            if candidate is None:
+        visible_items: list[dict[str, object]] = []
+        for row in rows:
+            try:
+                projected: CandidateView = project_candidate(self.connection, str(row["id"]))
+                candidate = self._candidate(str(row["id"]))
+            except NotFound:
+                continue
+            if candidate is None or projected.status == "ignored":
                 continue
             records = self._records(candidate)
             period_from, period_to = self._date_range(records)
@@ -1212,7 +1247,7 @@ class PacketBuilder:
                 ),
                 None,
             )
-            items.append(
+            visible_items.append(
                 {
                     "candidate_id": candidate.id,
                     "confirmed_contribution_id": confirmed,
@@ -1222,7 +1257,7 @@ class PacketBuilder:
                     "period_from": period_from,
                     "period_to": period_to,
                     "suggested_type": candidate.contribution_type,
-                    "status": str(row["status"]),
+                    "status": projected.status,
                     "source_coverage": coverage,
                     "participation_indicators": indicators,
                     "warnings": [
@@ -1230,6 +1265,7 @@ class PacketBuilder:
                     ],
                 }
             )
+        items = visible_items[offset : offset + limit]
         as_of = max(
             (
                 str(row["completed_at"])
@@ -1246,7 +1282,7 @@ class PacketBuilder:
             "as_of": as_of,
             "source_status": self.source_status(app_id),
             "candidates": items,
-            "next_offset": offset + limit if len(rows) > limit else None,
+            "next_offset": offset + limit if len(visible_items) > offset + limit else None,
         }
 
     def search_evidence(
@@ -1300,15 +1336,7 @@ class PacketBuilder:
                         PARTITION BY app_id, source, source_instance
                         ORDER BY completed_at DESC, id DESC
                     ) AS position
-                    FROM sync_runs WHERE app_id=? AND status='complete'
-                      AND (
-                        source NOT IN ('jira', 'gitlab')
-                        OR CAST(
-                            COALESCE(json_extract(scope_json, '$.selection_policy_version'), 0)
-                            AS INTEGER
-                        ) >= 2
-                        OR json_extract(scope_json, '$.date_from') IS NULL
-                      )
+                    FROM sync_runs sr WHERE app_id=? AND {authoritative_run_sql("sr")}
                 ), current_runs AS (
                     SELECT id FROM ranked_runs WHERE source='manual' OR position=1
                 ), latest AS (
@@ -1355,38 +1383,27 @@ class PacketBuilder:
 
     def evidence_excerpt(self, evidence_id: str, max_chars: int) -> dict[str, object]:
         row = self.connection.execute(
-            """
-            SELECT o.*, so.app_id, so.source, so.source_instance, so.kind, so.external_id
+            f"""
+            WITH ranked_runs AS (
+                SELECT sr.id, sr.source, ROW_NUMBER() OVER (
+                    PARTITION BY sr.app_id, sr.source, sr.source_instance
+                    ORDER BY sr.completed_at DESC, sr.id DESC
+                ) AS position
+                FROM sync_runs sr WHERE {authoritative_run_sql("sr")}
+            ), current_runs AS (
+                SELECT id FROM ranked_runs WHERE source='manual' OR position=1
+            )
+            SELECT o.*, so.app_id, so.source, so.source_instance, so.kind, so.external_id,
+                   sr.status AS run_status, sr.completeness AS run_completeness
             FROM observations o JOIN source_objects so ON so.id=o.source_object_id
             JOIN sync_runs sr ON sr.id=o.sync_run_id
-            WHERE o.id=? AND (
-                sr.source NOT IN ('jira', 'gitlab')
-                OR CAST(
-                    COALESCE(json_extract(sr.scope_json, '$.selection_policy_version'), 0)
-                    AS INTEGER
-                ) >= 2
-                OR json_extract(sr.scope_json, '$.date_from') IS NULL
-            )
+            JOIN current_runs current_run ON current_run.id=sr.id
+            WHERE o.id=? OR so.id=?
+            ORDER BY CASE WHEN o.id=? THEN 0 ELSE 1 END, o.fetched_at DESC, o.id DESC
+            LIMIT 1
             """,
-            (evidence_id,),
+            (evidence_id, evidence_id, evidence_id),
         ).fetchone()
-        if row is None:
-            row = self.connection.execute(
-                """
-                SELECT o.*, so.app_id, so.source, so.source_instance, so.kind, so.external_id
-                FROM source_objects so JOIN observations o ON o.source_object_id=so.id
-                JOIN sync_runs sr ON sr.id=o.sync_run_id
-                WHERE so.id=? AND (
-                    sr.source NOT IN ('jira', 'gitlab')
-                    OR CAST(
-                        COALESCE(json_extract(sr.scope_json, '$.selection_policy_version'), 0)
-                        AS INTEGER
-                    ) >= 2
-                    OR json_extract(sr.scope_json, '$.date_from') IS NULL
-                ) ORDER BY o.fetched_at DESC, o.id DESC LIMIT 1
-                """,
-                (evidence_id,),
-            ).fetchone()
         if row is not None:
             app_id = str(row["app_id"])
             self._app(app_id)
@@ -1407,13 +1424,31 @@ class PacketBuilder:
                 "truncated": len(text) > max_chars,
                 "as_of": str(row["fetched_at"]),
                 "completeness": str(row["completeness"]),
+                "run_status": str(row["run_status"]),
+                "run_completeness": str(row["run_completeness"]),
+                "authoritative_current": True,
                 "source_status": self.source_status(app_id),
             }
         participation = self.connection.execute(
-            """
-            SELECT p.*, a.display_name, a.is_self, so.app_id, so.source, so.kind, so.external_id
+            f"""
+            WITH ranked_runs AS (
+                SELECT sr.id, sr.source, ROW_NUMBER() OVER (
+                    PARTITION BY sr.app_id, sr.source, sr.source_instance
+                    ORDER BY sr.completed_at DESC, sr.id DESC
+                ) AS position
+                FROM sync_runs sr WHERE {authoritative_run_sql("sr")}
+            ), current_runs AS (
+                SELECT id FROM ranked_runs WHERE source='manual' OR position=1
+            )
+            SELECT p.*, a.display_name, a.is_self, so.app_id, so.source, so.kind,
+                   so.external_id, sr.status AS run_status,
+                   sr.completeness AS run_completeness
             FROM participations p JOIN actors a ON a.id=p.actor_id
-            JOIN source_objects so ON so.id=p.source_object_id WHERE p.id=?
+            JOIN source_objects so ON so.id=p.source_object_id
+            JOIN observations o ON o.id=p.observation_id
+            JOIN sync_runs sr ON sr.id=o.sync_run_id
+            JOIN current_runs current_run ON current_run.id=sr.id
+            WHERE p.id=?
             """,
             (evidence_id,),
         ).fetchone()
@@ -1432,6 +1467,9 @@ class PacketBuilder:
                 "is_self": bool(participation["is_self"]),
                 "effective_from": participation["effective_from"],
                 "effective_to": participation["effective_to"],
+                "run_status": str(participation["run_status"]),
+                "run_completeness": str(participation["run_completeness"]),
+                "authoritative_current": True,
                 "source_status": self.source_status(app_id),
             }
         decision = self.connection.execute(

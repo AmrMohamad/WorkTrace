@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from worktrace.adapters.base import NormalizedRecord, SnapshotAdapter
@@ -28,6 +28,9 @@ class ImportResult:
     pages: int
     records: int
     error: str | None = None
+    completeness: str = Completeness.COMPLETE.value
+    limitations: tuple[str, ...] = ()
+    selection_events: tuple[dict[str, JsonValue], ...] = field(default_factory=tuple)
 
 
 def _timestamp(value: str | None) -> datetime | None:
@@ -57,6 +60,8 @@ def record_to_object(
     record: NormalizedRecord,
     self_actor_ids: set[str],
     self_display_names: set[str] | None = None,
+    *,
+    completeness: Completeness = Completeness.COMPLETE,
 ) -> NormalizedObject:
     identity = record.identity
     payload = dict(record.payload)
@@ -145,7 +150,7 @@ def record_to_object(
         participations=tuple(participations),
         pending_references=references,
         data=payload,
-        completeness=Completeness.COMPLETE,
+        completeness=completeness,
     )
 
 
@@ -188,27 +193,64 @@ def import_snapshot(
     )
     pages = 0
     records = 0
+    selection_biased = scope.get("selection_biased") is True
+    raw_limitations = scope.get("limitations")
+    limitations = (
+        [value for value in raw_limitations if isinstance(value, str) and value]
+        if isinstance(raw_limitations, list)
+        else []
+    )
+    raw_selection_events = scope.get("selection_events")
+    selection_events = (
+        [dict(value) for value in raw_selection_events if isinstance(value, dict)]
+        if isinstance(raw_selection_events, list)
+        else []
+    )
+    if limitations or selection_events:
+        selection_biased = True
     try:
         for page in adapter.iter_pages():
             if page.source_kind != source or page.source_instance != source_instance:
                 raise SourceError("adapter page escaped its configured source scope")
+            for limitation in page.limitations:
+                if limitation and limitation not in limitations:
+                    limitations.append(limitation)
+            for event in page.selection_events:
+                normalized_event = dict(event)
+                if normalized_event not in selection_events:
+                    selection_events.append(normalized_event)
+            if page.limitations or page.selection_events:
+                selection_biased = True
+            record_completeness = (
+                Completeness.SELECTION_BIASED
+                if page.records_selection_biased
+                else Completeness.COMPLETE
+            )
             normalized = [
                 record_to_object(
                     record,
                     self_actor_ids or set(),
                     self_display_names,
+                    completeness=record_completeness,
                 )
                 for record in page.records
             ]
+            progress: dict[str, JsonValue] = {
+                "pages": pages + 1,
+                "records": records + len(normalized),
+                "resource_type": page.resource_type,
+                "cursor": page.next_cursor,
+            }
+            if selection_biased:
+                progress["selection_biased"] = True
+            if limitations:
+                progress["limitations"] = list(limitations)
+            if selection_events:
+                progress["selection_events"] = list(selection_events)
             repository.store_page(
                 run_id,
                 normalized,
-                {
-                    "pages": pages + 1,
-                    "records": records + len(normalized),
-                    "resource_type": page.resource_type,
-                    "cursor": page.next_cursor,
-                },
+                progress,
                 unavailable_objects=(
                     AvailabilityObservation(
                         source=page.source_kind,
@@ -231,12 +273,34 @@ def import_snapshot(
                 "partial",
                 {"source": source, "pages": pages, "records": records, "error": message},
             )
-        return ImportResult(session_id, run_id, "partial", pages, records, message)
-    repository.finish_sync_run(run_id, "complete", Completeness.COMPLETE.value)
+        return ImportResult(
+            session_id,
+            run_id,
+            "partial",
+            pages,
+            records,
+            message,
+            completeness=Completeness.PARTIAL.value,
+            limitations=tuple(limitations),
+            selection_events=tuple(selection_events),
+        )
+    completeness = (
+        Completeness.SELECTION_BIASED.value if selection_biased else Completeness.COMPLETE.value
+    )
+    repository.finish_sync_run(run_id, "complete", completeness)
     if finish_session:
         repository.finish_import_session(
             session_id,
             "complete",
             {"source": source, "pages": pages, "records": records},
         )
-    return ImportResult(session_id, run_id, "complete", pages, records)
+    return ImportResult(
+        session_id,
+        run_id,
+        "complete",
+        pages,
+        records,
+        completeness=completeness,
+        limitations=tuple(limitations),
+        selection_events=tuple(selection_events),
+    )

@@ -968,6 +968,18 @@ def _scenario_gitlab_pages(
             return httpx.Response(200, json=[merge_request], request=request)
         if path.endswith(f"/merge_requests/{iid}"):
             return httpx.Response(200, json=merge_request, request=request)
+        if path.endswith(f"/merge_requests/{iid}/reviewers"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "user": merge_request["reviewers"][0],
+                        "state": "reviewed",
+                        "created_at": "2026-01-11T00:00:00Z",
+                    }
+                ],
+                request=request,
+            )
         if path.endswith(f"/merge_requests/{iid}/commits"):
             return httpx.Response(200, json=mixed_commits, request=request)
         if path.endswith(f"/merge_requests/{iid}/discussions"):
@@ -1230,6 +1242,18 @@ def _production_gitlab_pages(app: AppConfig, commit_sha: str) -> tuple[Normalize
             return httpx.Response(200, json=[], request=request)
         if path.endswith("/merge_requests/7"):
             return httpx.Response(200, json=merge_request, request=request)
+        if path.endswith("/merge_requests/7/reviewers"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "user": merge_request["reviewers"][0],
+                        "state": "reviewed",
+                        "created_at": "2026-01-11T00:00:00Z",
+                    }
+                ],
+                request=request,
+            )
         if path.endswith("/merge_requests"):
             return httpx.Response(200, json=[merge_request], request=request)
         if path.endswith("/merge_requests/7/commits"):

@@ -119,12 +119,15 @@ class LocalGitAdapter:
         yield from self._ref_pages(observed_at)
 
     def _commit_pages(self, observed_at: str) -> Iterator[NormalizedPage]:
-        arguments = ["rev-list", "--all", "--reverse"]
+        authorized_refs = self._authorized_ref_names()
+        arguments = ["rev-list", "--reverse"]
         if self._config.date_from:
             arguments.append(f"--since={self._config.date_from.isoformat()}T00:00:00Z")
         if self._config.date_to:
             arguments.append(f"--until={self._config.date_to.isoformat()}T23:59:59Z")
-        output = self._run_git(tuple(arguments))
+        arguments.extend(authorized_refs)
+        arguments.append("--")
+        output = self._run_git(tuple(arguments)) if authorized_refs else ""
         shas = [sha for sha in output.splitlines() if _COMMIT_SHA.fullmatch(sha)]
         if not shas:
             yield NormalizedPage(
@@ -150,6 +153,22 @@ class LocalGitAdapter:
                 is_last=next_offset >= len(shas),
                 records=records,
             )
+
+    def _authorized_ref_names(self) -> tuple[str, ...]:
+        output = self._run_git(
+            (
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            )
+        )
+        allowed_prefixes = ("refs/heads/", "refs/remotes/", "refs/tags/")
+        refs = {
+            ref_name for ref_name in output.splitlines() if ref_name.startswith(allowed_prefixes)
+        }
+        return tuple(sorted(refs))
 
     def _commit_record(self, sha: str, observed_at: str) -> NormalizedRecord:
         if not _COMMIT_SHA.fullmatch(sha):

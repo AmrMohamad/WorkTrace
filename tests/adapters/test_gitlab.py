@@ -42,6 +42,18 @@ def test_gitlab_snapshot_keeps_release_ladder_facts_separate() -> None:
             return httpx.Response(200, json=[], request=request)
         if request.url.path.endswith("/merge_requests/12"):
             return httpx.Response(200, json=merge_request_document, request=request)
+        if request.url.path.endswith("/merge_requests/12/reviewers"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "user": {"id": 3, "name": "Reviewer", "username": "review"},
+                        "state": "reviewed",
+                        "created_at": "2026-01-01T12:00:00Z",
+                    }
+                ],
+                request=request,
+            )
         if request.url.path.endswith(("/commits", "/discussions")):
             return httpx.Response(200, json=[], request=request)
         if request.url.path.endswith("/changes"):
@@ -124,6 +136,125 @@ def test_gitlab_snapshot_keeps_release_ladder_facts_separate() -> None:
     assert "released_to_users" not in release.payload
     assert "currently_enabled" not in deployment.payload
     assert "dev@example.com" not in repr(merge_request)
+
+
+def test_reviewer_assignment_is_context_until_provider_reports_reviewed() -> None:
+    merge_request_document: dict[str, object] = {
+        "project_id": 77,
+        "iid": 12,
+        "title": "Reviewer state fixture",
+        "state": "opened",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "author": {"id": 1, "name": "Author", "username": "author"},
+        "reviewers": [
+            {"id": 2, "name": "Pending Reviewer", "username": "pending"},
+            {"id": 3, "name": "Completed Reviewer", "username": "completed"},
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v4/user":
+            return httpx.Response(200, json={"id": 1, "username": "author"}, request=request)
+        if path.endswith("/repository/commits"):
+            return httpx.Response(200, json=[], request=request)
+        if path.endswith("/merge_requests/12/reviewers"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "user": {
+                            "id": 2,
+                            "name": "Pending Reviewer",
+                            "username": "pending",
+                        },
+                        "state": "unreviewed",
+                        "created_at": "2026-01-01T10:00:00Z",
+                    },
+                    {
+                        "user": {
+                            "id": 3,
+                            "name": "Completed Reviewer",
+                            "username": "completed",
+                        },
+                        "state": "reviewed",
+                        "created_at": "2026-01-01T11:00:00Z",
+                    },
+                ],
+                request=request,
+            )
+        if path.endswith("/merge_requests/12"):
+            return httpx.Response(200, json=merge_request_document, request=request)
+        if path.endswith("/merge_requests"):
+            return httpx.Response(200, json=[merge_request_document], request=request)
+        if path.endswith(("/commits", "/discussions")):
+            return httpx.Response(200, json=[], request=request)
+        if path.endswith("/changes"):
+            return httpx.Response(
+                200,
+                json={"project_id": 77, "iid": 12, "changes": []},
+                request=request,
+            )
+        if path.endswith("/releases"):
+            return httpx.Response(200, json=[], request=request)
+        raise AssertionError(f"unexpected GitLab request: {request.url}")
+
+    with httpx.Client(
+        base_url="https://gitlab.example",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        pages = list(
+            GitLabAdapter(
+                GitLabConfig(
+                    base_url="https://gitlab.example",
+                    source_instance="gitlab-main",
+                    app_id="sample_store",
+                    project_id=77,
+                    email_key=b"test-key",
+                    date_from=date(2026, 1, 1),
+                    date_to=date(2026, 1, 31),
+                    user_id=1,
+                ),
+                client,
+            ).iter_pages()
+        )
+
+    merge_request = next(
+        page.records[0] for page in pages if page.resource_type == "merge_requests"
+    )
+    reviewer_participations = [
+        item for item in merge_request.participations if item.role is ParticipationRole.REVIEWER
+    ]
+    assert [item.actor.source_actor_id for item in reviewer_participations] == ["3"]
+    assert merge_request.payload["reviewer_assignments"] == [
+        {"reviewer_actor_id": "2"},
+        {"reviewer_actor_id": "3"},
+    ]
+    assert merge_request.payload["reviewer_states"] == [
+        {
+            "reviewer_actor_id": "2",
+            "review_state": "unreviewed",
+            "assigned_at": "2026-01-01T10:00:00Z",
+        },
+        {
+            "reviewer_actor_id": "3",
+            "review_state": "reviewed",
+            "assigned_at": "2026-01-01T11:00:00Z",
+        },
+    ]
+    persisted = record_to_object(merge_request, set())
+    assert [item.role for item in persisted.participations if item.role == "mr_reviewer"] == [
+        "mr_reviewer"
+    ]
+    reviewer_state_page = next(
+        page for page in pages if page.resource_type == "merge_request_reviewer_states"
+    )
+    assert {
+        str(record.payload["reviewer_actor_id"]): record.payload["review_state"]
+        for record in reviewer_state_page.records
+    } == {"2": "unreviewed", "3": "reviewed"}
+    assert all(record.participations == () for record in reviewer_state_page.records)
 
 
 def test_gitlab_uses_date_filters_and_validated_link_pagination() -> None:
@@ -653,3 +784,113 @@ def test_gitlab_requires_configured_user_identity() -> None:
             ),
             client,
         )
+
+
+def test_gitlab_caps_prefer_recent_mrs_and_report_changed_path_overflow() -> None:
+    older = {
+        "project_id": 77,
+        "iid": 2,
+        "title": "Older merge request",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+    }
+    newer = {
+        "project_id": 77,
+        "iid": 9,
+        "title": "Newer merge request",
+        "created_at": "2026-01-03T00:00:00Z",
+        "updated_at": "2026-01-20T00:00:00Z",
+    }
+    hydrated_iids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v4/user":
+            return httpx.Response(200, json={"id": 41, "username": "fixture-self"}, request=request)
+        if path.endswith("/repository/commits"):
+            return httpx.Response(200, json=[], request=request)
+        if path.endswith("/merge_requests/9"):
+            hydrated_iids.append("9")
+            return httpx.Response(200, json=newer, request=request)
+        if path.endswith("/merge_requests"):
+            return httpx.Response(200, json=[older, newer], request=request)
+        if path.endswith(("/commits", "/discussions")):
+            return httpx.Response(200, json=[], request=request)
+        if path.endswith("/merge_requests/9/changes"):
+            return httpx.Response(
+                200,
+                json={
+                    "project_id": 77,
+                    "iid": 9,
+                    "changes_count": "1000+",
+                    "overflow": True,
+                    "changes": [
+                        {
+                            "old_path": "Sources/Retained.swift",
+                            "new_path": "Sources/Retained.swift",
+                            "new_file": False,
+                            "renamed_file": False,
+                            "deleted_file": False,
+                        }
+                    ],
+                },
+                request=request,
+            )
+        if path.endswith("/releases"):
+            return httpx.Response(200, json=[], request=request)
+        raise AssertionError(f"unexpected GitLab request: {request.url}")
+
+    with httpx.Client(
+        base_url="https://gitlab.example",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        pages = list(
+            GitLabAdapter(
+                GitLabConfig(
+                    base_url="https://gitlab.example",
+                    source_instance="gitlab-main",
+                    app_id="sample_store",
+                    project_id=77,
+                    email_key=b"test-key",
+                    date_from=date(2026, 1, 1),
+                    date_to=date(2026, 1, 31),
+                    user_id=41,
+                    max_merge_request_hydrations=1,
+                ),
+                client,
+            ).iter_pages()
+        )
+
+    assert hydrated_iids == ["9"]
+    merge_request_page = next(page for page in pages if page.resource_type == "merge_requests")
+    assert merge_request_page.records[0].payload["iid"] == "9"
+    hydration_event = next(
+        event
+        for event in merge_request_page.selection_events
+        if event["kind"] == "gitlab_merge_request_hydration_cap"
+    )
+    assert hydration_event == {
+        "kind": "gitlab_merge_request_hydration_cap",
+        "input_count": 2,
+        "selected_count": 1,
+        "dropped_count": 1,
+        "limit": 1,
+        "selection_policy": "updated_at_desc_then_iid_desc",
+    }
+
+    changed_paths_page = next(
+        page for page in pages if page.resource_type == "merge_request_changed_paths"
+    )
+    assert changed_paths_page.records_selection_biased is True
+    assert changed_paths_page.records[0].payload["scope_complete"] is False
+    assert changed_paths_page.selection_events == (
+        {
+            "kind": "gitlab_changed_paths_overflow",
+            "mr_iid": "9",
+            "retained_count": 1,
+            "reported_changes_count": "1000+",
+            "dropped_count_at_least": 999,
+            "reported_count_is_lower_bound": True,
+            "selection_policy": "provider_returned_prefix",
+        },
+    )

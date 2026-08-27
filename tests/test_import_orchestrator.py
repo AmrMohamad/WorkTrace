@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -226,5 +227,68 @@ def test_exact_object_unavailability_flows_through_page_transaction(tmp_path: Pa
             (second.run_id,),
         ).fetchone()
         assert tuple(event) == ("unavailable", "not_found")
+    finally:
+        connection.close()
+
+
+def test_selection_events_mark_run_and_affected_observation_selection_biased(
+    tmp_path: Path,
+) -> None:
+    connection, repository = _repository(tmp_path)
+    try:
+        page = NormalizedPage(
+            source_kind="git",
+            source_instance="fixture-repository",
+            resource_type="commits",
+            cursor=None,
+            next_cursor=None,
+            is_last=True,
+            records=(_record(title="Bounded snapshot", observed_at="2026-01-11T12:00:00Z"),),
+            limitations=("Synthetic provider selection was truncated.",),
+            selection_events=(
+                {
+                    "kind": "synthetic_cap",
+                    "input_count": 3,
+                    "selected_count": 1,
+                    "dropped_count": 2,
+                    "selection_policy": "newest_first",
+                },
+            ),
+            records_selection_biased=True,
+        )
+        result = import_snapshot(
+            _app(),
+            StaticAdapter((page,)),
+            repository,
+            source="git",
+            source_instance="fixture-repository",
+            date_from=date(2026, 1, 1),
+            date_to=date(2026, 1, 31),
+        )
+
+        assert result.status == "complete"
+        assert result.completeness == "selection_biased"
+        assert result.limitations == ("Synthetic provider selection was truncated.",)
+        run = connection.execute(
+            "SELECT status, completeness, progress_json FROM sync_runs WHERE id=?",
+            (result.run_id,),
+        ).fetchone()
+        assert (run["status"], run["completeness"]) == ("complete", "selection_biased")
+        progress = json.loads(str(run["progress_json"]))
+        assert progress["selection_biased"] is True
+        assert progress["selection_events"] == [
+            {
+                "kind": "synthetic_cap",
+                "input_count": 3,
+                "selected_count": 1,
+                "dropped_count": 2,
+                "selection_policy": "newest_first",
+            }
+        ]
+        observation = connection.execute(
+            "SELECT completeness FROM observations WHERE sync_run_id=?",
+            (result.run_id,),
+        ).fetchone()
+        assert observation["completeness"] == "selection_biased"
     finally:
         connection.close()

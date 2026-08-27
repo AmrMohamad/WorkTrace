@@ -137,7 +137,10 @@ def test_repeated_rebuilds_produce_byte_stable_semantic_inventories(
         repository.finish_sync_run(git_run, "complete", "complete_for_scope")
 
         jira_run = repository.start_sync_run(
-            "sample_store", "jira", "https://fixture.example", {"mode": "fixture"}
+            "sample_store",
+            "jira",
+            "https://fixture.example",
+            {"mode": "fixture", "selection_policy_version": 2},
         )
         repository.store_page(
             jira_run,

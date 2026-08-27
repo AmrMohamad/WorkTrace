@@ -39,7 +39,8 @@ Chosen:
 - Legacy overbroad runs remain historical but are not current candidate, confirmed-member packet, search, excerpt, MCP, or export evidence after the selection-policy change. Unsupported confirmed members become explicit gaps. Removal requires an app/source/run-scoped, user-confirmed CLI purge.
 - Migration `003` seeds pre-existing objects with deterministic visible baseline events tied to their last-seen runs, adds projected reason/time, and preserves stable source, observation, evidence, candidate, and human-decision IDs. Failed/partial runs cannot update the projection; reappearance appends a visible event.
 - Default doctor remains offline; authenticated checks require `doctor --live`.
-- No new runtime dependency or service is introduced.
+- No additional runtime dependency beyond the package baseline recorded in AgDR-0003, and no
+  external service, is introduced by this remediation.
 
 ## Reversal triggers
 
@@ -56,4 +57,5 @@ Revisit only if provider APIs cannot support bounded user-root discovery, if exa
 ## Artifacts
 
 - `docs/technical-designs/worktrace-v0.1-evidence-pipeline-remediation.md`
+- `docs/agdr/AgDR-0003-local-python-runtime-and-evidence-authority.md`
 - `migrations/003_availability_events.sql`

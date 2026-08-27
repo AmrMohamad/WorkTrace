@@ -8,11 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from worktrace.candidates.decisions import append_decision, undo_decision
 from worktrace.config import AppConfig, IdentityConfig, WorkTraceConfig
 from worktrace.constants import MAX_RESPONSE_CHARS
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
-from worktrace.errors import ScopeViolation
+from worktrace.errors import NotFound, ScopeViolation
 from worktrace.mcp_server.limits import enforce_total_limit
 from worktrace.mcp_server.server import SERVER_INSTRUCTIONS, build_mcp_server
 from worktrace.mcp_server.tools import WorkTraceTools
@@ -322,3 +323,60 @@ def test_manual_runs_remain_visible_and_unscoped_decisions_are_rejected(
 
     with pytest.raises(ScopeViolation, match="manual evidence has no configured application scope"):
         tools.get_evidence_excerpt(evidence_id="decision:unscoped")
+
+
+def test_mcp_candidate_reads_apply_canonical_human_decisions(tmp_path: Path) -> None:
+    database_path, _, tools = _mcp_state(tmp_path)
+    connection = connect(database_path)
+    try:
+        append_decision(
+            connection,
+            "rename_contribution",
+            "candidate:manual_1",
+            {"title": "Human-reviewed title", "type": "migration"},
+        )
+        append_decision(
+            connection,
+            "add_member",
+            "candidate:manual_1",
+            {"source_object_id": "obj:manual_2"},
+        )
+        append_decision(
+            connection,
+            "split_contribution",
+            "candidate:manual_1",
+            {"keep_source_object_ids": ["obj:manual_2"]},
+        )
+    finally:
+        connection.close()
+
+    projected = tools.list_contribution_candidates(app_id="sample_store")
+    item = next(
+        candidate
+        for candidate in projected["candidates"]
+        if candidate["candidate_id"] == "candidate:manual_1"
+    )
+    assert item["title"] == "Human-reviewed title"
+    assert item["suggested_type"] == "migration"
+    summary = tools.get_contribution_summary(contribution_id="candidate:manual_1")
+    assert [member["object_id"] for member in summary["members"]] == ["obj:manual_2"]
+
+    connection = connect(database_path)
+    try:
+        ignored = append_decision(connection, "ignore_candidate", "candidate:manual_1")
+    finally:
+        connection.close()
+    projected = tools.list_contribution_candidates(app_id="sample_store")
+    assert all(
+        candidate["candidate_id"] != "candidate:manual_1" for candidate in projected["candidates"]
+    )
+    with pytest.raises(NotFound):
+        tools.get_contribution_summary(contribution_id="candidate:manual_1")
+
+    connection = connect(database_path)
+    try:
+        undo_decision(connection, ignored)
+    finally:
+        connection.close()
+    restored = tools.get_contribution_summary(contribution_id="candidate:manual_1")
+    assert restored["contribution"]["title"] == "Human-reviewed title"

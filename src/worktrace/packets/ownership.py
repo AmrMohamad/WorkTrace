@@ -63,7 +63,13 @@ def build_participation_summary(
             left = record_by_object[str(relation["from_object_id"])]
             right = record_by_object[str(relation["to_object_id"])]
             mr, paths = (right, left) if "changed_path" in left.kind else (left, right)
-            if "changed_path" in paths.kind and paths.data.get("changed_paths"):
+            if (
+                "changed_path" in paths.kind
+                and paths.completeness in {"complete", "complete_for_scope"}
+                and paths.data.get("overflow") is not True
+                and paths.data.get("scope_complete") is not False
+                and paths.data.get("changed_paths")
+            ):
                 mr_path_support.setdefault(mr.object_id, set()).add(paths.evidence_id)
 
     classified_data: dict[str, dict[str, object]] = {}

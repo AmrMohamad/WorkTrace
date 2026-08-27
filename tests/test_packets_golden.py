@@ -13,6 +13,7 @@ from worktrace.config import (
 )
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
+from worktrace.db.queries import source_status as query_source_status
 from worktrace.mcp_server.tools import WorkTraceTools
 from worktrace.packets.builder import PacketBuilder
 
@@ -68,7 +69,7 @@ def _insert_run(
         INSERT INTO sync_runs(
             id, app_id, source, source_instance, status, started_at, completed_at,
             adapter_version, scope_json, completeness
-        ) VALUES (?, 'sample_store', ?, ?, ?, ?, ?, 'fixture', '{}', ?)
+        ) VALUES (?, 'sample_store', ?, ?, ?, ?, ?, 'fixture', ?, ?)
         """,
         (
             run_id,
@@ -77,6 +78,7 @@ def _insert_run(
             status,
             completed_at,
             completed_at,
+            json.dumps({"selection_policy_version": 2} if source in {"jira", "gitlab"} else {}),
             completeness,
         ),
     )
@@ -385,7 +387,9 @@ def test_packet_reports_partial_stale_contradictory_and_module_rule_state(
 ) -> None:
     connection, _, config, candidate_id = _packet_state(tmp_path)
     try:
-        summary = PacketBuilder(connection, config).contribution_summary(candidate_id)
+        builder = PacketBuilder(connection, config)
+        summary = builder.contribution_summary(candidate_id)
+        packet = builder.build_packet(candidate_id)
     finally:
         connection.close()
 
@@ -396,6 +400,105 @@ def test_packet_reports_partial_stale_contradictory_and_module_rule_state(
     assert source_status["jira"]["complete"] is False
     assert source_status["jira"]["instances"][0]["status"] == "failed"
     assert any(item["kind"] == "recorded_revert" for item in summary["contradictions"])
+    result_changed = next(
+        question
+        for question in packet["sections"]["result"]
+        if question["question_id"] == "result.changed"
+    )
+    assert result_changed["status"] == "contradicted"
+    assert result_changed["contradicting_evidence_ids"]
+    assert "result.changed" not in packet["defensibility"]["well_supported_question_ids"]
+
+
+def test_selection_biased_changed_paths_do_not_support_scope_claims(tmp_path: Path) -> None:
+    connection, _, config, candidate_id = _packet_state(tmp_path)
+    connection.execute(
+        """
+        UPDATE observations
+        SET completeness='selection_biased',
+            data_json=?
+        WHERE id='obs:commit'
+        """,
+        (
+            json.dumps(
+                {
+                    "changed_paths": ["src/checkout/Validation.py"],
+                    "overflow": True,
+                    "scope_complete": False,
+                    "limitations": ["Changed paths were truncated by the provider."],
+                },
+                sort_keys=True,
+            ),
+        ),
+    )
+    connection.commit()
+    try:
+        builder = PacketBuilder(connection, config)
+        summary = builder.contribution_summary(candidate_id)
+        packet = builder.build_packet(candidate_id)
+    finally:
+        connection.close()
+
+    assert summary["modules"] == []
+    assert any("changed-path" in item.casefold() for item in summary["limitations"])
+    questions = {item["question_id"]: item for item in _all_questions(packet)}
+    assert questions["problem.affected"]["status"] == "unknown"
+    assert questions["action.implemented"]["status"] in {"unknown", "unresolved"}
+    assert questions["action.implemented"]["answer_draft"] is None
+    assert questions["action.implemented"]["supporting_evidence_ids"] == []
+    assert questions["result.scope"]["status"] == "unknown"
+
+
+def test_source_status_surfaces_bounded_selection_as_incomplete(tmp_path: Path) -> None:
+    connection, _, config, _ = _packet_state(tmp_path)
+    limitation = "GitLab hydration exceeded its configured bound."
+    connection.execute(
+        """
+        UPDATE sync_runs
+        SET completeness='selection_biased', progress_json=?
+        WHERE id='run:gitlab'
+        """,
+        (
+            json.dumps(
+                {
+                    "selection_biased": True,
+                    "limitations": [limitation],
+                    "selection_events": [
+                        {
+                            "kind": "gitlab_merge_request_hydration_cap",
+                            "input_count": 501,
+                            "selected_count": 500,
+                            "dropped_count": 1,
+                            "limit": 500,
+                            "selection_policy": "updated_at_desc_then_iid_desc",
+                        }
+                    ],
+                },
+                sort_keys=True,
+            ),
+        ),
+    )
+    connection.commit()
+    try:
+        status = PacketBuilder(connection, config).source_status("sample_store")["gitlab"]
+        query_status = next(
+            item
+            for item in query_source_status(connection, "sample_store")
+            if item["source"] == "gitlab"
+        )
+    finally:
+        connection.close()
+
+    assert status["complete"] is False
+    instance = status["instances"][0]
+    assert instance["status"] == "complete"
+    assert instance["completeness"] == "selection_biased"
+    assert instance["complete"] is False
+    assert instance["limitations"] == [limitation]
+    assert instance["selection_events"][0]["dropped_count"] == 1
+    assert query_status["complete"] is False
+    assert query_status["limitations"] == [limitation]
+    assert query_status["selection_events"][0]["dropped_count"] == 1
 
 
 def test_date_to_is_inclusive_for_candidate_and_evidence_search(tmp_path: Path) -> None:

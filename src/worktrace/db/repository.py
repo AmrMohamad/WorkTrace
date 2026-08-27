@@ -10,6 +10,7 @@ from typing import cast
 
 from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.constants import ADAPTER_VERSION, NORMALIZATION_VERSION, REDACTION_VERSION
+from worktrace.db.authority import authoritative_run_sql
 from worktrace.domain.models import (
     ActorObservation,
     AvailabilityObservation,
@@ -225,7 +226,10 @@ class EvidenceRepository:
         external_actor_id = (
             redactor.hash_email(actor.external_actor_id)
             if "@" in actor.external_actor_id
-            else actor.external_actor_id
+            else redactor.protect_identifier(
+                actor.external_actor_id,
+                namespace=f"actor:{actor.source}:{actor.source_instance}",
+            )
         )
         display_name = redactor.redact_text(actor.display_name)
         email_hash = actor.email_hash
@@ -250,7 +254,7 @@ class EvidenceRepository:
             ON CONFLICT(source, source_instance, external_actor_id) DO UPDATE SET
                 display_name=excluded.display_name,
                 email_hash=COALESCE(excluded.email_hash, actors.email_hash),
-                is_self=MAX(actors.is_self, excluded.is_self)
+                is_self=excluded.is_self
             """,
             (
                 actor_id,
@@ -271,13 +275,31 @@ class EvidenceRepository:
 
     def _store_object(self, run_id: str, item: NormalizedObject) -> str:
         identity = item.identity
+        validation_redactor = self.redactor or Redactor(b"worktrace-validation-only")
+        external_id = validation_redactor.protect_identifier(
+            identity.external_id,
+            namespace=f"object:{identity.source}:{identity.kind}",
+        )
+        canonical_url: str | None = None
+        if identity.canonical_url is not None:
+            redacted_url = validation_redactor.redact_payload(
+                identity.canonical_url,
+                field_name="url",
+            )
+            if not isinstance(redacted_url, str):
+                raise DatabaseError("canonical URL redaction produced an invalid value")
+            canonical_url = redacted_url
+        if self.redactor is None and (
+            external_id != identity.external_id or canonical_url != identity.canonical_url
+        ):
+            raise DatabaseError("redaction is required before source identity persistence")
         object_id = stable_id(
             "obj",
             item.app_id,
             identity.source,
             identity.source_instance,
             identity.kind,
-            identity.external_id,
+            external_id,
         )
         self.connection.execute(
             """
@@ -295,8 +317,8 @@ class EvidenceRepository:
                 identity.source,
                 identity.source_instance,
                 identity.kind,
-                identity.external_id,
-                identity.canonical_url,
+                external_id,
+                canonical_url,
                 run_id,
                 run_id,
             ),
@@ -311,7 +333,7 @@ class EvidenceRepository:
                 identity.source,
                 identity.source_instance,
                 identity.kind,
-                identity.external_id,
+                external_id,
             ),
         ).fetchone()
         assert row is not None
@@ -328,7 +350,6 @@ class EvidenceRepository:
             else "observed",
         )
 
-        validation_redactor = self.redactor or Redactor(b"worktrace-validation-only")
         if self.redactor is None:
             validated_title = (
                 validation_redactor.redact_text(item.title) if item.title else item.title
@@ -357,17 +378,36 @@ class EvidenceRepository:
         if not isinstance(raw_data, dict):
             raise DatabaseError("evidence payload must be an object")
         persisted_data = raw_data
-        persisted_data["_pending_references"] = [
-            {
-                "target_source": reference.target_source,
-                "target_kind": reference.target_kind,
-                "target_external_id": reference.target_external_id,
-                "relationship_type": reference.relationship_type,
-                "extraction_method": reference.extraction_method,
-                "exact_value": reference.exact_value,
+        pending_references: list[JsonValue] = []
+        for reference in item.pending_references:
+            persisted_reference: dict[str, JsonValue] = {
+                "target_source": validation_redactor.redact_text(reference.target_source),
+                "target_kind": validation_redactor.redact_text(reference.target_kind),
+                "target_external_id": validation_redactor.protect_identifier(
+                    reference.target_external_id,
+                    namespace=f"object:{reference.target_source}:{reference.target_kind}",
+                ),
+                "relationship_type": validation_redactor.redact_text(reference.relationship_type),
+                "extraction_method": validation_redactor.redact_text(reference.extraction_method),
+                "exact_value": (
+                    validation_redactor.redact_text(reference.exact_value)
+                    if reference.exact_value is not None
+                    else None
+                ),
             }
-            for reference in item.pending_references
-        ]
+            if self.redactor is None:
+                raw_reference = {
+                    "target_source": reference.target_source,
+                    "target_kind": reference.target_kind,
+                    "target_external_id": reference.target_external_id,
+                    "relationship_type": reference.relationship_type,
+                    "extraction_method": reference.extraction_method,
+                    "exact_value": reference.exact_value,
+                }
+                if persisted_reference != raw_reference:
+                    raise DatabaseError("redaction is required before reference persistence")
+            pending_references.append(persisted_reference)
+        persisted_data["_pending_references"] = pending_references
         digest = payload_hash(title, body_text, persisted_data)
         observation_id = stable_id("obs", object_id, run_id, digest)
         self.connection.execute(
@@ -489,6 +529,13 @@ class EvidenceRepository:
             or str(run["source_instance"]) != unavailable.source_instance
         ):
             raise DatabaseError("availability event escaped its source scope")
+        validation_redactor = self.redactor or Redactor(b"worktrace-validation-only")
+        external_id = validation_redactor.protect_identifier(
+            unavailable.external_id,
+            namespace=f"object:{unavailable.source}:{unavailable.kind}",
+        )
+        if self.redactor is None and external_id != unavailable.external_id:
+            raise DatabaseError("redaction is required before source identity persistence")
         row = self.connection.execute(
             """
             SELECT id FROM source_objects
@@ -499,7 +546,7 @@ class EvidenceRepository:
                 unavailable.source,
                 unavailable.source_instance,
                 unavailable.kind,
-                unavailable.external_id,
+                external_id,
             ),
         ).fetchone()
         if row is None:
@@ -509,7 +556,7 @@ class EvidenceRepository:
                 unavailable.source,
                 unavailable.source_instance,
                 unavailable.kind,
-                unavailable.external_id,
+                external_id,
             )
             self.connection.execute(
                 """
@@ -524,7 +571,7 @@ class EvidenceRepository:
                     unavailable.source,
                     unavailable.source_instance,
                     unavailable.kind,
-                    unavailable.external_id,
+                    external_id,
                     run_id,
                     run_id,
                 ),
@@ -536,7 +583,7 @@ class EvidenceRepository:
     def current_observations(self, app_id: str) -> list[sqlite3.Row]:
         return list(
             self.connection.execute(
-                """
+                f"""
                 WITH current_runs AS (
                     SELECT id FROM (
                         SELECT id, source,
@@ -544,17 +591,8 @@ class EvidenceRepository:
                                 PARTITION BY app_id, source, source_instance
                                 ORDER BY completed_at DESC, id DESC
                             ) AS position
-                        FROM sync_runs
-                        WHERE app_id=? AND status='complete'
-                          AND (
-                            source NOT IN ('jira', 'gitlab')
-                            OR CAST(
-                                COALESCE(
-                                    json_extract(scope_json, '$.selection_policy_version'), 0
-                                ) AS INTEGER
-                            ) >= 2
-                            OR json_extract(scope_json, '$.date_from') IS NULL
-                          )
+                        FROM sync_runs sr
+                        WHERE app_id=? AND {authoritative_run_sql("sr")}
                     ) WHERE position=1 OR source='manual'
                 ), latest AS (
                     SELECT o.*,

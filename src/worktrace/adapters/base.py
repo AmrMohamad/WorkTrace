@@ -117,6 +117,9 @@ class NormalizedPage:
     is_last: bool
     records: tuple[NormalizedRecord, ...]
     unavailable_objects: tuple[UnavailableObjectDescriptor, ...] = ()
+    limitations: tuple[str, ...] = ()
+    selection_events: tuple[dict[str, JSONValue], ...] = ()
+    records_selection_biased: bool = False
 
 
 class SnapshotAdapter(Protocol):

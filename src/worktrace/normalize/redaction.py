@@ -102,6 +102,15 @@ class Redactor:
         digest = hmac.new(self.email_key, normalized, hashlib.sha256).hexdigest()
         return f"email_hmac_sha256:{digest}"
 
+    def protect_identifier(self, value: str, *, namespace: str = "provider") -> str:
+        """Preserve ordinary IDs and pseudonymize any ID whose text requires redaction."""
+
+        if self.redact_text(value) == value:
+            return value
+        canonical = f"{namespace}\x1f{value}".encode("utf-8", errors="strict")
+        digest = hmac.new(self.email_key, canonical, hashlib.sha256).hexdigest()
+        return f"provider_hmac_sha256:{digest}"
+
     def redact_text(self, value: str) -> str:
         redacted = _EMAIL_PATTERN.sub(lambda match: self.hash_email(match.group(1)), value)
         redacted = _INLINE_SECRET_PATTERN.sub("[REDACTED_SECRET]", redacted)
@@ -128,7 +137,7 @@ class Redactor:
             return value
         if isinstance(value, str):
             if key in _URL_KEYS:
-                return _sanitize_url(value)
+                return self.redact_text(_sanitize_url(value))
             if key is not None and (key == "email" or key.endswith("_email")):
                 return self.hash_email(value)
             # WorkTrace-generated stable IDs are opaque structured values, not

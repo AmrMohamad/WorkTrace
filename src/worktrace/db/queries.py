@@ -5,6 +5,13 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 from worktrace.constants import MAX_RECORDS, STALE_AFTER_DAYS
+from worktrace.db.authority import (
+    authoritative_run_sql,
+    authority_limitation,
+    parse_scope,
+    run_is_authoritative,
+    selection_policy_version,
+)
 from worktrace.errors import NotFound, ScopeViolation
 
 
@@ -30,16 +37,24 @@ def source_status(connection: sqlite3.Connection, app_id: str) -> list[dict[str,
             stale = datetime.fromisoformat(completed.replace("Z", "+00:00")) < cutoff
         except ValueError:
             stale = True
-        scope = json.loads(str(row["scope_json"]))
-        selection_version = (
-            int(scope.get("selection_policy_version", 0)) if isinstance(scope, dict) else 0
+        scope = parse_scope(row["scope_json"])
+        selection_version = selection_policy_version(scope)
+        authoritative = run_is_authoritative(str(row["source"]), str(row["status"]), scope)
+        try:
+            raw_progress = json.loads(str(row["progress_json"]))
+        except (TypeError, json.JSONDecodeError):
+            raw_progress = {}
+        progress = raw_progress if isinstance(raw_progress, dict) else {}
+        raw_limitations = progress.get("limitations", [])
+        limitations = (
+            [value for value in raw_limitations if isinstance(value, str) and value]
+            if isinstance(raw_limitations, list)
+            else []
         )
-        legacy_overbroad = (
-            str(row["source"]) in {"jira", "gitlab"}
-            and isinstance(scope, dict)
-            and scope.get("date_from") is not None
-            and selection_version < 2
-        )
+        limitation = authority_limitation(str(row["source"]), scope)
+        if limitation and limitation not in limitations:
+            limitations.append(limitation)
+        complete = authoritative and str(row["completeness"]) in {"complete", "complete_for_scope"}
         result.append(
             {
                 "source": str(row["source"]),
@@ -49,14 +64,12 @@ def source_status(connection: sqlite3.Connection, app_id: str) -> list[dict[str,
                 "completed_at": row["completed_at"],
                 "stale": stale,
                 "error": row["error_summary"],
-                "progress": json.loads(str(row["progress_json"])),
-                "selection_policy_version": selection_version or None,
-                "authoritative_current": not legacy_overbroad,
-                "limitations": (
-                    ["Legacy project-wide discovery is excluded until a scoped reimport completes."]
-                    if legacy_overbroad
-                    else []
-                ),
+                "progress": progress,
+                "complete": complete,
+                "selection_policy_version": selection_version,
+                "authoritative_current": authoritative,
+                "limitations": limitations,
+                "selection_events": progress.get("selection_events", []),
             }
         )
     return result
@@ -87,15 +100,7 @@ def search_evidence(
               PARTITION BY app_id, source, source_instance
               ORDER BY completed_at DESC, id DESC
             ) AS position
-            FROM sync_runs WHERE app_id=? AND status='complete'
-              AND (
-                source NOT IN ('jira', 'gitlab')
-                OR CAST(
-                    COALESCE(json_extract(scope_json, '$.selection_policy_version'), 0)
-                    AS INTEGER
-                ) >= 2
-                OR json_extract(scope_json, '$.date_from') IS NULL
-              )
+            FROM sync_runs sr WHERE app_id=? AND {authoritative_run_sql("sr")}
           ) WHERE position=1 OR source='manual'
         ), latest AS (
           SELECT o.*, ROW_NUMBER() OVER (
@@ -123,19 +128,23 @@ def evidence_excerpt(
     chars: int,
 ) -> dict[str, object]:
     row = connection.execute(
-        """
+        f"""
+        WITH ranked_runs AS (
+          SELECT sr.id, sr.source, ROW_NUMBER() OVER (
+            PARTITION BY sr.app_id, sr.source, sr.source_instance
+            ORDER BY sr.completed_at DESC, sr.id DESC
+          ) AS position
+          FROM sync_runs sr WHERE {authoritative_run_sql("sr")}
+        ), current_runs AS (
+          SELECT id FROM ranked_runs WHERE source='manual' OR position=1
+        )
         SELECT o.id AS evidence_id, so.app_id, so.source, so.kind, so.external_id,
-               o.title, o.body_text, o.data_json, o.completeness, o.fetched_at
+               o.title, o.body_text, o.data_json, o.completeness, o.fetched_at,
+               sr.status AS run_status, sr.completeness AS run_completeness
         FROM observations o JOIN source_objects so ON so.id=o.source_object_id
         JOIN sync_runs sr ON sr.id=o.sync_run_id
-        WHERE o.id=? AND (
-            sr.source NOT IN ('jira', 'gitlab')
-            OR CAST(
-                COALESCE(json_extract(sr.scope_json, '$.selection_policy_version'), 0)
-                AS INTEGER
-            ) >= 2
-            OR json_extract(sr.scope_json, '$.date_from') IS NULL
-        )
+        JOIN current_runs cr ON cr.id=sr.id
+        WHERE o.id=?
         """,
         (evidence_id,),
     ).fetchone()
@@ -152,5 +161,8 @@ def evidence_excerpt(
         "truncated": len(text) > chars,
         "source_text_is_untrusted": True,
         "completeness": str(row["completeness"]),
+        "run_status": str(row["run_status"]),
+        "run_completeness": str(row["run_completeness"]),
+        "authoritative_current": True,
         "as_of": str(row["fetched_at"]),
     }

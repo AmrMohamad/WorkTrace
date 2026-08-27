@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, quote, urljoin, urlsplit
 import httpx
 
 from worktrace.adapters.base import (
+    JSONValue,
     NormalizedPage,
     NormalizedRecord,
     Participation,
@@ -224,18 +225,14 @@ class GitLabAdapter:
                     iid = self._scoped_merge_request_iid(value)
                     discovered.setdefault(iid, value)
 
+        limitations: list[str] = []
+        selection_events: list[dict[str, JSONValue]] = []
         commit_endpoint = f"/api/v4/projects/{self._encoded_project}/repository/commits"
-        lookup_count = 0
-        associated_shas: set[str] = set()
-        for sha in self._relevant_commit_shas:
-            if lookup_count >= self._config.max_commit_association_lookups:
-                break
-            self._add_commit_associated_merge_requests(commit_endpoint, sha, discovered)
-            associated_shas.add(sha)
-            lookup_count += 1
-
+        association_candidates: dict[str, tuple[int, str]] = {
+            sha: (1, "") for sha in self._relevant_commit_shas
+        }
         author = self._verified_email or self._verified_username
-        if author and lookup_count < self._config.max_commit_association_lookups:
+        if author:
             commit_params: dict[str, str | int] = {
                 "author": author,
                 "since": self._iso(self._window_start),
@@ -244,8 +241,6 @@ class GitLabAdapter:
             }
             for commits in self._collection_documents(commit_endpoint, commit_params):
                 for raw_commit in commits:
-                    if lookup_count >= self._config.max_commit_association_lookups:
-                        break
                     if not self._subresource_within_window(
                         raw_commit,
                         ("committed_date", "authored_date", "created_at"),
@@ -257,19 +252,75 @@ class GitLabAdapter:
                     if provider_sha is None:
                         raise PermanentSourceError("GitLab discovery commit omitted its id")
                     normalized_sha = provider_sha.casefold()
-                    if normalized_sha in associated_shas:
-                        continue
                     if _COMMIT_SHA.fullmatch(normalized_sha) is None:
                         raise PermanentSourceError("GitLab discovery returned an invalid commit id")
-                    self._add_commit_associated_merge_requests(
-                        commit_endpoint, normalized_sha, discovered
+                    committed_at = next(
+                        (
+                            _text(commit.get(field))
+                            for field in ("committed_date", "authored_date", "created_at")
+                            if _text(commit.get(field))
+                        ),
+                        "",
                     )
-                    associated_shas.add(normalized_sha)
-                    lookup_count += 1
-                if lookup_count >= self._config.max_commit_association_lookups:
-                    break
+                    priority, existing_timestamp = association_candidates.get(
+                        normalized_sha, (0, "")
+                    )
+                    association_candidates[normalized_sha] = (
+                        priority,
+                        max(existing_timestamp, committed_at or ""),
+                    )
 
-        selected_iids = sorted(discovered, key=int)[: self._config.max_merge_request_hydrations]
+        association_policy = "relevant_seed_desc_then_committed_at_desc_then_sha_desc"
+        ordered_association_shas = sorted(
+            association_candidates,
+            key=lambda sha: (*association_candidates[sha], sha),
+            reverse=True,
+        )
+        selected_association_shas = ordered_association_shas[
+            : self._config.max_commit_association_lookups
+        ]
+        association_dropped = len(ordered_association_shas) - len(selected_association_shas)
+        if association_dropped:
+            limitations.append(
+                "GitLab commit-to-merge-request association candidates exceeded the configured "
+                "lookup bound; explicit local seeds and the newest provider commits were retained."
+            )
+            selection_events.append(
+                {
+                    "kind": "gitlab_commit_association_cap",
+                    "input_count": len(ordered_association_shas),
+                    "selected_count": len(selected_association_shas),
+                    "dropped_count": association_dropped,
+                    "limit": self._config.max_commit_association_lookups,
+                    "selection_policy": association_policy,
+                }
+            )
+        for sha in selected_association_shas:
+            self._add_commit_associated_merge_requests(commit_endpoint, sha, discovered)
+
+        hydration_policy = "updated_at_desc_then_iid_desc"
+        ordered_iids = sorted(
+            discovered,
+            key=lambda iid: (self._timestamp_for("merge_requests", discovered[iid]), int(iid)),
+            reverse=True,
+        )
+        selected_iids = ordered_iids[: self._config.max_merge_request_hydrations]
+        hydration_dropped = len(ordered_iids) - len(selected_iids)
+        if hydration_dropped:
+            limitations.append(
+                "Discovered GitLab merge requests exceeded the configured hydration bound; "
+                "the most recently updated merge requests were retained deterministically."
+            )
+            selection_events.append(
+                {
+                    "kind": "gitlab_merge_request_hydration_cap",
+                    "input_count": len(ordered_iids),
+                    "selected_count": len(selected_iids),
+                    "dropped_count": hydration_dropped,
+                    "limit": self._config.max_merge_request_hydrations,
+                    "selection_policy": hydration_policy,
+                }
+            )
         if not selected_iids:
             yield NormalizedPage(
                 source_kind="gitlab",
@@ -279,6 +330,8 @@ class GitLabAdapter:
                 next_cursor=None,
                 is_last=True,
                 records=(),
+                limitations=tuple(limitations),
+                selection_events=tuple(selection_events),
             )
             return
         for index, iid in enumerate(selected_iids):
@@ -308,6 +361,8 @@ class GitLabAdapter:
                             external_id=f"{self._project_id}:{iid}",
                         ),
                     ),
+                    limitations=tuple(limitations) if index == 0 else (),
+                    selection_events=tuple(selection_events) if index == 0 else (),
                 )
                 continue
             try:
@@ -318,7 +373,27 @@ class GitLabAdapter:
                 raise PermanentSourceError("GitLab returned an invalid hydrated MR document")
             if self._scoped_merge_request_iid(hydrated) != iid:
                 raise ScopeViolation("GitLab hydrated a different merge request")
-            record = self._merge_request(hydrated, observed_at)
+            reviewer_state_page: NormalizedPage | None = None
+            completed_reviewers: tuple[Participation, ...] = ()
+            reviewer_states: tuple[dict[str, JSONValue], ...] = ()
+            reviewers = hydrated.get("reviewers")
+            if isinstance(reviewers, list) and reviewers:
+                (
+                    reviewer_state_page,
+                    completed_reviewers,
+                    reviewer_states,
+                ) = self._merge_request_reviewers_page(
+                    endpoint=f"{hydrate_endpoint}/reviewers",
+                    iid=iid,
+                    merge_request_updated_at=_text(hydrated.get("updated_at")),
+                    observed_at=observed_at,
+                )
+            record = self._merge_request(
+                hydrated,
+                observed_at,
+                completed_reviewers=completed_reviewers,
+                reviewer_states=reviewer_states,
+            )
             yield NormalizedPage(
                 source_kind="gitlab",
                 source_instance=self._config.source_instance,
@@ -327,8 +402,14 @@ class GitLabAdapter:
                 next_cursor=(f"hydrate:{index + 1}" if index + 1 < len(selected_iids) else None),
                 is_last=index + 1 >= len(selected_iids),
                 records=(record,),
+                limitations=tuple(limitations) if index == 0 else (),
+                selection_events=tuple(selection_events) if index == 0 else (),
             )
-            yield from self._merge_request_evidence_pages(hydrated, observed_at)
+            yield from self._merge_request_evidence_pages(
+                hydrated,
+                observed_at,
+                reviewer_state_page=reviewer_state_page,
+            )
 
     def _add_commit_associated_merge_requests(
         self,
@@ -485,11 +566,15 @@ class GitLabAdapter:
         self,
         merge_request: Mapping[str, object],
         observed_at: str,
+        *,
+        reviewer_state_page: NormalizedPage | None = None,
     ) -> Iterator[NormalizedPage]:
         iid = _identifier(merge_request.get("iid"))
         if iid is None or not iid.isdecimal() or int(iid) < 1:
             raise PermanentSourceError("GitLab merge request omitted a valid iid")
         base = f"/api/v4/projects/{self._encoded_project}/merge_requests/{iid}"
+        if reviewer_state_page is not None:
+            yield reviewer_state_page
         yield from self._merge_request_collection_pages(
             endpoint=f"{base}/commits",
             resource_type="merge_request_commits",
@@ -507,6 +592,101 @@ class GitLabAdapter:
             iid=iid,
             merge_request_updated_at=_text(merge_request.get("updated_at")),
             observed_at=observed_at,
+        )
+
+    def _merge_request_reviewers_page(
+        self,
+        *,
+        endpoint: str,
+        iid: str,
+        merge_request_updated_at: str | None,
+        observed_at: str,
+    ) -> tuple[
+        NormalizedPage,
+        tuple[Participation, ...],
+        tuple[dict[str, JSONValue], ...],
+    ]:
+        response = request_with_retry(
+            self._client,
+            "GET",
+            endpoint,
+            policy=self._config.retry_policy,
+        )
+        try:
+            document = response.json()
+        except ValueError:
+            raise PermanentSourceError("GitLab returned invalid MR reviewer-state JSON") from None
+        if not isinstance(document, list):
+            raise PermanentSourceError("GitLab returned an invalid MR reviewer-state document")
+        records: list[NormalizedRecord] = []
+        completed_reviewers: list[Participation] = []
+        reviewer_states: list[dict[str, JSONValue]] = []
+        for raw_state in document:
+            state_document = _mapping(raw_state)
+            actor_document = _mapping(state_document.get("user"))
+            actor_id = _identifier(actor_document.get("id"))
+            if actor_id is None or not actor_id.isdecimal() or int(actor_id) < 1:
+                raise PermanentSourceError("GitLab MR reviewer state omitted a valid user id")
+            review_state = _text(state_document.get("state"))
+            if review_state is None:
+                raise PermanentSourceError("GitLab MR reviewer state omitted its state")
+            assigned_at = _text(state_document.get("created_at"))
+            actor = actor_identity(
+                source_kind="gitlab",
+                source_instance=self._config.source_instance,
+                redactor=self._redactor,
+                provider_actor_id=actor_id,
+                display_name=_text(actor_document.get("name")),
+                username=_text(actor_document.get("username")),
+                email=_text(actor_document.get("public_email"))
+                or _text(actor_document.get("email")),
+            )
+            if review_state == "reviewed":
+                completed_reviewers.append(
+                    Participation(actor=actor, role=ParticipationRole.REVIEWER)
+                )
+            reviewer_states.append(
+                {
+                    "reviewer_actor_id": actor.source_actor_id,
+                    "review_state": review_state,
+                    "assigned_at": assigned_at,
+                }
+            )
+            records.append(
+                build_record(
+                    source_kind="gitlab",
+                    source_instance=self._config.source_instance,
+                    object_type="merge_request_reviewer_state",
+                    external_id=f"{self._project_id}:{iid}:reviewer:{actor_id}",
+                    app_id=self._config.app_id,
+                    observed_at=observed_at,
+                    source_updated_at=merge_request_updated_at or assigned_at,
+                    payload={
+                        "project_id": self._project_id,
+                        "mr_iid": iid,
+                        "reviewer_actor_id": actor.source_actor_id,
+                        "review_state": review_state,
+                        "assigned_at": assigned_at,
+                    },
+                    redactor=self._redactor,
+                    references=(self._merge_request_reference(iid, "gitlab_mr_reviewer_state"),),
+                )
+            )
+        records.sort(key=lambda record: record.identity.external_id)
+        completed_reviewers.sort(key=lambda item: item.actor.source_actor_id)
+        reviewer_states.sort(key=lambda item: str(item["reviewer_actor_id"]))
+        return (
+            NormalizedPage(
+                source_kind="gitlab",
+                source_instance=self._config.source_instance,
+                resource_type="merge_request_reviewer_states",
+                cursor=f"{iid}:1",
+                next_cursor=None,
+                is_last=True,
+                records=tuple(records),
+            ),
+            tuple(completed_reviewers),
+            tuple(reviewer_states),
         )
 
     def _merge_request_collection_pages(
@@ -783,6 +963,13 @@ class GitLabAdapter:
                     else False,
                 }
             )
+        changes_count = _text(document.get("changes_count"))
+        raw_overflow = document.get("overflow")
+        overflow = raw_overflow if isinstance(raw_overflow, bool) else False
+        limitation = (
+            "GitLab truncated the changed-path list for this merge request; retained paths "
+            "cannot support a complete scope claim."
+        )
         record = build_record(
             source_kind="gitlab",
             source_instance=self._config.source_instance,
@@ -794,16 +981,41 @@ class GitLabAdapter:
             payload={
                 "project_id": self._project_id,
                 "mr_iid": iid,
-                "changes_count": _text(document.get("changes_count")),
-                "overflow": document.get("overflow")
-                if isinstance(document.get("overflow"), bool)
-                else False,
+                "changes_count": changes_count,
+                "overflow": overflow,
+                "scope_complete": not overflow,
+                "limitations": [limitation] if overflow else [],
                 "changed_paths": changed_paths,
             },
             redactor=self._redactor,
             references=(self._merge_request_reference(iid, "gitlab_mr_changed_paths"),),
             untrusted_text_fields=("changed_paths[].old_path", "changed_paths[].new_path"),
         )
+        selection_events: tuple[dict[str, JSONValue], ...] = ()
+        limitations: tuple[str, ...] = ()
+        if overflow:
+            reported_minimum = 0
+            count_is_lower_bound = False
+            if changes_count:
+                count_is_lower_bound = changes_count.endswith("+")
+                numeric_count = changes_count.removesuffix("+")
+                if numeric_count.isdecimal():
+                    reported_minimum = int(numeric_count)
+            selection_events = (
+                {
+                    "kind": "gitlab_changed_paths_overflow",
+                    "mr_iid": iid,
+                    "retained_count": len(changed_paths),
+                    "reported_changes_count": changes_count,
+                    "dropped_count_at_least": max(
+                        reported_minimum - len(changed_paths),
+                        1,
+                    ),
+                    "reported_count_is_lower_bound": count_is_lower_bound,
+                    "selection_policy": "provider_returned_prefix",
+                },
+            )
+            limitations = (limitation,)
         return NormalizedPage(
             source_kind="gitlab",
             source_instance=self._config.source_instance,
@@ -812,6 +1024,9 @@ class GitLabAdapter:
             next_cursor=None,
             is_last=True,
             records=(record,),
+            limitations=limitations,
+            selection_events=selection_events,
+            records_selection_biased=overflow,
         )
 
     def _merge_request_reference(self, iid: str, reference_type: str) -> Reference:
@@ -952,6 +1167,9 @@ class GitLabAdapter:
         self,
         value: Mapping[str, object],
         observed_at: str,
+        *,
+        completed_reviewers: tuple[Participation, ...] = (),
+        reviewer_states: tuple[dict[str, JSONValue], ...] = (),
     ) -> NormalizedRecord:
         iid = _identifier(value.get("iid"))
         if iid is None:
@@ -971,11 +1189,14 @@ class GitLabAdapter:
                 if participation:
                     participations.append(participation)
         reviewers = value.get("reviewers")
+        reviewer_assignments: list[dict[str, JSONValue]] = []
         if isinstance(reviewers, list):
             for actor in reviewers:
-                participation = self._actor_participation(actor, ParticipationRole.REVIEWER)
-                if participation:
-                    participations.append(participation)
+                actor_id = _identifier(_mapping(actor).get("id"))
+                if actor_id is None or not actor_id.isdecimal() or int(actor_id) < 1:
+                    raise PermanentSourceError("GitLab reviewer assignment omitted a valid user id")
+                reviewer_assignments.append({"reviewer_actor_id": actor_id})
+        participations.extend(completed_reviewers)
         merger_value = value.get("merge_user") or value.get("merged_by")
         merger = self._actor_participation(
             merger_value,
@@ -1042,6 +1263,8 @@ class GitLabAdapter:
                 if isinstance(labels, list)
                 else [],
                 "milestone": _text(milestone.get("title")),
+                "reviewer_assignments": reviewer_assignments,
+                "reviewer_states": list(reviewer_states),
             },
             redactor=self._redactor,
             participations=participations,

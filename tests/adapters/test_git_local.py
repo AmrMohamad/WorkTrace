@@ -248,3 +248,46 @@ def test_changed_paths_preserve_deletion_and_rename_status(tmp_path: Path) -> No
     assert str(renamed["status_code"]).startswith("R")
     assert renamed["renamed_file"] is True
     assert renamed["deleted_file"] is False
+
+
+def test_commit_snapshot_excludes_stash_and_arbitrary_internal_refs(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    visible_head = _git(repo, "rev-parse", "HEAD").strip()
+    hidden_commit = _git(
+        repo,
+        "commit-tree",
+        "HEAD^{tree}",
+        "-p",
+        "HEAD",
+        "-m",
+        "Internal-only fixture commit",
+    ).strip()
+    _git(repo, "update-ref", "refs/stash", hidden_commit)
+    _git(repo, "update-ref", "refs/worktrace/internal", hidden_commit)
+
+    pages = list(
+        LocalGitAdapter(
+            LocalGitConfig(
+                repository_path=repo,
+                allowed_root=tmp_path,
+                source_instance="sample-store-local",
+                app_id="sample_store",
+                email_key=b"test-key",
+            )
+        ).iter_pages()
+    )
+    imported_commit_ids = {
+        record.identity.external_id
+        for page in pages
+        if page.resource_type == "commit"
+        for record in page.records
+    }
+
+    assert visible_head in imported_commit_ids
+    assert hidden_commit not in imported_commit_ids
+    assert all(
+        not str(record.payload["ref_name"]).startswith(("refs/stash", "refs/worktrace/"))
+        for page in pages
+        if page.resource_type == "ref"
+        for record in page.records
+    )

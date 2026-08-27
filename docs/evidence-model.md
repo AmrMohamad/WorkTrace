@@ -45,16 +45,22 @@ Participations attach an actor to a source object, and optionally an observation
 git_author
 git_committer
 git_coauthor
+jira_creator
+jira_comment_author
+jira_changelog_author
 jira_assignee
 jira_reporter
-jira_commenter
-jira_field_updater
-gitlab_mr_author
-gitlab_reviewer
-gitlab_assignee
+mr_author
+mr_assignee
+mr_reviewer
+mr_merger
+gitlab_commit_author
+gitlab_commit_coauthor
+gitlab_commit_committer
+gitlab_commit_reviewer
 gitlab_discussion_author
-gitlab_merger
 gitlab_deployer
+gitlab_release_author
 ```
 
 Assignment is an observed relationship, not ownership. A commit with another author and the local user as committer remains `committer_only` evidence for the local user.
