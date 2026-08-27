@@ -288,6 +288,22 @@ def _declared_app(payload: Mapping[str, object]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _undo_ancestry_target(
+    decision: Decision,
+    decisions_by_id: Mapping[str, Decision],
+) -> Decision | None:
+    """Return a structurally valid historical undo edge, without activating it."""
+
+    target_id = decision.undo_target_id
+    target = decisions_by_id.get(target_id) if target_id is not None else None
+    if target is None or target.target_id != decision.target_id:
+        return None
+    compensates = decision.payload.get("compensates")
+    if compensates is not None and compensates != target_id:
+        return None
+    return target
+
+
 def _target_apps(
     connection: sqlite3.Connection,
     target_id: str,
@@ -379,10 +395,16 @@ def decision_scope_map(
     *,
     active_only: bool = False,
 ) -> dict[str, str | None]:
-    """Resolve every decision to one owning app, including its undo closure."""
+    """Resolve every decision to one owning app, including its undo ancestry.
+
+    Historical ledgers may contain undo-of-undo rows that current write paths reject. Their
+    timestamps are not a trustworthy graph order, so resolve those rows by stable decision ID
+    ancestry while keeping malformed, cyclic, or cross-target chains unscoped.
+    """
 
     decisions = decision_stream(connection, active_only=active_only)
     node_apps = decision_node_apps(connection, active_only=active_only)
+    decisions_by_id = {decision.id: decision for decision in decisions}
     result: dict[str, str | None] = {}
     for decision in decisions:
         if decision.action in UNDO_ACTIONS:
@@ -393,10 +415,33 @@ def decision_scope_map(
             node_apps=node_apps,
         )
     for decision in decisions:
-        if decision.action in UNDO_ACTIONS:
-            result[decision.id] = (
-                result.get(decision.undo_target_id) if decision.undo_target_id else None
-            )
+        if decision.action not in UNDO_ACTIONS or decision.id in result:
+            continue
+        current_id = decision.id
+        trail: list[Decision] = []
+        seen: set[str] = set()
+        while current_id not in result:
+            if current_id in seen:
+                break
+            seen.add(current_id)
+            current = decisions_by_id.get(current_id)
+            if current is None or current.action not in UNDO_ACTIONS:
+                break
+            trail.append(current)
+            target = _undo_ancestry_target(current, decisions_by_id)
+            if target is None:
+                break
+            current_id = target.id
+        else:
+            resolved_app = result[current_id]
+            for item in reversed(trail):
+                declared_app = _declared_app(item.payload)
+                if declared_app is not None and declared_app != resolved_app:
+                    resolved_app = None
+                result[item.id] = resolved_app
+            continue
+        for item in trail:
+            result[item.id] = None
     return result
 
 

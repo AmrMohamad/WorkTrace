@@ -225,6 +225,7 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
                 if (
                     target_id in scoped_targets
                     and undo_target_id in included_decision_ids
+                    and decision_is_scoped(decision)
                     and decision_id not in included_decision_ids
                 ):
                     included_decision_ids.add(decision_id)

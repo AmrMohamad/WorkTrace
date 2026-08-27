@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 
 from worktrace.candidates.builder import rebuild_candidates
-from worktrace.candidates.decisions import append_decision, undo_decision
+from worktrace.candidates.decisions import (
+    append_decision,
+    decision_scope_map,
+    decision_stream,
+    undo_decision,
+)
 from worktrace.candidates.projector import list_candidates, project_candidate
 from worktrace.config import AppConfig, IdentityConfig, WorkTraceConfig
 from worktrace.db.connection import connect
@@ -2010,6 +2015,226 @@ def test_human_title_claims_cite_active_decisions_and_expose_bounded_context(
         connection.close()
 
 
+def test_legacy_nested_undo_scope_follows_lineage_not_timestamp_order(
+    tmp_path: Path,
+) -> None:
+    connection, database_path = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:legacy-undo-order",
+            object_id="obj:legacy-undo-order",
+            observation_id="obs:legacy-undo-order",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T10:00:00+00:00",
+            title="Provider title",
+        )
+        _insert_candidate_fixture(
+            connection,
+            "candidate:legacy-undo-order",
+            "obj:legacy-undo-order",
+            "Provider title",
+        )
+        connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
+        connection.commit()
+
+        confirmation_id = append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:legacy-undo-order",
+            {
+                "contribution_id": "contribution:legacy-undo-order",
+                "app_id": "sample_store",
+                "title": "Human title",
+                "members": ["obj:legacy-undo-order"],
+            },
+        )
+        rename_id = append_decision(
+            connection,
+            "rename_contribution",
+            "contribution:legacy-undo-order",
+            {"title": "Compensated title"},
+        )
+        undo_id = undo_decision(connection, rename_id)
+
+        first_nested_id = "decision:legacy-nested-undo-first"
+        second_nested_id = "decision:legacy-nested-undo-second"
+        cross_app_id = "decision:legacy-nested-undo-cross-app"
+        mismatched_target_id = "decision:legacy-nested-undo-mismatched-target"
+        mismatched_compensation_id = "decision:legacy-undo-mismatched-compensation"
+        mismatched_nested_compensation_id = "decision:legacy-nested-mismatched-compensation"
+        for decision_id, target_id, payload, created_at, undo_target_id in (
+            (
+                first_nested_id,
+                "contribution:legacy-undo-order",
+                {
+                    "compensates": undo_id,
+                    "private_payload": "[REDACTED_SECRET]",
+                },
+                "2020-01-02T00:00:00+00:00",
+                undo_id,
+            ),
+            (
+                second_nested_id,
+                "contribution:legacy-undo-order",
+                {"compensates": first_nested_id},
+                "2020-01-01T00:00:00+00:00",
+                first_nested_id,
+            ),
+            (
+                cross_app_id,
+                "contribution:legacy-undo-order",
+                {"app_id": "other_app", "compensates": undo_id},
+                "2019-12-31T00:00:00+00:00",
+                undo_id,
+            ),
+            (
+                mismatched_target_id,
+                "candidate:legacy-undo-order",
+                {"compensates": undo_id},
+                "2020-01-04T00:00:00+00:00",
+                undo_id,
+            ),
+            (
+                mismatched_compensation_id,
+                "contribution:legacy-undo-order",
+                {"compensates": "decision:not-the-undo-target"},
+                "2020-01-03T00:00:00+00:00",
+                undo_id,
+            ),
+            (
+                mismatched_nested_compensation_id,
+                "contribution:legacy-undo-order",
+                {"compensates": undo_id},
+                "2020-01-01T12:00:00+00:00",
+                first_nested_id,
+            ),
+        ):
+            connection.execute(
+                """
+                INSERT INTO human_decisions(
+                    id, action, target_id, payload_json, actor_label, created_at, undo_target_id
+                ) VALUES (?, 'undo_decision', ?, ?, 'local-user', ?, ?)
+                """,
+                (
+                    decision_id,
+                    target_id,
+                    json.dumps(payload, sort_keys=True),
+                    created_at,
+                    undo_target_id,
+                ),
+            )
+
+        first_cycle_id = "decision:legacy-undo-cycle-first"
+        second_cycle_id = "decision:legacy-undo-cycle-second"
+        for decision_id, created_at in (
+            (first_cycle_id, "2020-01-05T00:00:00+00:00"),
+            (second_cycle_id, "2020-01-06T00:00:00+00:00"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO human_decisions(
+                    id, action, target_id, payload_json, actor_label, created_at, undo_target_id
+                ) VALUES (?, 'undo_decision', 'contribution:legacy-undo-order', '{}',
+                          'local-user', ?, NULL)
+                """,
+                (decision_id, created_at),
+            )
+        connection.execute(
+            "UPDATE human_decisions SET undo_target_id=? WHERE id=?",
+            (second_cycle_id, first_cycle_id),
+        )
+        connection.execute(
+            "UPDATE human_decisions SET undo_target_id=? WHERE id=?",
+            (first_cycle_id, second_cycle_id),
+        )
+        connection.commit()
+
+        active_ids = {decision.id for decision in decision_stream(connection, active_only=True)}
+        assert confirmation_id in active_ids
+        assert rename_id not in active_ids
+        assert {
+            undo_id,
+            first_nested_id,
+            second_nested_id,
+            cross_app_id,
+            mismatched_target_id,
+            mismatched_compensation_id,
+            mismatched_nested_compensation_id,
+            first_cycle_id,
+            second_cycle_id,
+        }.isdisjoint(active_ids)
+
+        tools = WorkTraceTools(config=_config(tmp_path), database_path=database_path)
+        summary = tools.get_contribution_summary(contribution_id="contribution:legacy-undo-order")
+        assert summary["contribution"]["title"] == "Human title"
+        assert summary["contribution"]["title_supporting_evidence_ids"] == [confirmation_id]
+
+        scopes = decision_scope_map(connection)
+        assert scopes[undo_id] == "sample_store"
+        assert scopes[first_nested_id] == "sample_store"
+        assert scopes[second_nested_id] == "sample_store"
+        assert scopes[cross_app_id] is None
+        assert scopes[mismatched_target_id] is None
+        assert scopes[mismatched_compensation_id] is None
+        assert scopes[mismatched_nested_compensation_id] is None
+        assert scopes[first_cycle_id] is None
+        assert scopes[second_cycle_id] is None
+        excerpt = tools.get_evidence_excerpt(evidence_id=second_nested_id)
+        assert excerpt["evidence_id"] == second_nested_id
+        assert excerpt["app_id"] == "sample_store"
+        assert excerpt["decision_context"]["active"] is False
+        assert excerpt["decision_context"]["undo_target_id"] == first_nested_id
+        assert excerpt["decision_context"]["lineage"] == {
+            "app_id": "sample_store",
+            "candidate_ids": ["candidate:legacy-undo-order"],
+            "contribution_ids": ["contribution:legacy-undo-order"],
+            "truncated": False,
+        }
+        assert "private_payload" not in json.dumps(excerpt)
+        for unscoped_id in (
+            cross_app_id,
+            mismatched_target_id,
+            mismatched_compensation_id,
+            mismatched_nested_compensation_id,
+            first_cycle_id,
+            second_cycle_id,
+        ):
+            with pytest.raises(
+                ScopeViolation,
+                match="manual evidence has no configured application scope",
+            ):
+                tools.get_evidence_excerpt(evidence_id=unscoped_id)
+
+        export_path = tmp_path / "legacy-nested-undo-order.json"
+        export_app(connection, "sample_store", export_path)
+        exported = json.loads(export_path.read_text(encoding="utf-8"))
+        assert {row["id"] for row in exported["human_decisions"]} == {
+            confirmation_id,
+            rename_id,
+            undo_id,
+            first_nested_id,
+            second_nested_id,
+        }
+        exported_text = export_path.read_text(encoding="utf-8")
+        for excluded_id in (
+            cross_app_id,
+            mismatched_target_id,
+            mismatched_compensation_id,
+            mismatched_nested_compensation_id,
+            first_cycle_id,
+            second_cycle_id,
+        ):
+            assert excluded_id not in exported_text
+        first_nested = next(
+            row for row in exported["human_decisions"] if row["id"] == first_nested_id
+        )
+        assert json.loads(first_nested["payload_json"])["private_payload"] == ("[REDACTED_SECRET]")
+    finally:
+        connection.close()
+
+
 def test_confirm_merge_split_lineage_projects_one_canonical_contribution(
     tmp_path: Path,
 ) -> None:
@@ -2632,6 +2857,47 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
             connection.execute("SELECT COUNT(*) FROM human_decisions").fetchone()[0]
             == before_ambiguous_undo
         )
+        ambiguous_undo = "decision:legacy-ambiguous-undo"
+        ambiguous_nested_undo = "decision:legacy-ambiguous-nested-undo"
+        connection.execute(
+            """
+            INSERT INTO human_decisions(
+                id, action, target_id, payload_json, actor_label, created_at, undo_target_id
+            ) VALUES (?, 'undo_decision', 'candidate:shared-secondary-alias', ?, 'local-user',
+                      '2020-02-02T00:00:00+00:00', ?)
+            """,
+            (
+                ambiguous_undo,
+                json.dumps({"compensates": ambiguous}, sort_keys=True),
+                ambiguous,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO human_decisions(
+                id, action, target_id, payload_json, actor_label, created_at, undo_target_id
+            ) VALUES (?, 'undo_decision', 'candidate:shared-secondary-alias', ?, 'local-user',
+                      '2020-02-01T00:00:00+00:00', ?)
+            """,
+            (
+                ambiguous_nested_undo,
+                json.dumps({"compensates": ambiguous_undo}, sort_keys=True),
+                ambiguous_undo,
+            ),
+        )
+        connection.commit()
+        ambiguous_scopes = decision_scope_map(connection)
+        assert ambiguous_scopes[ambiguous] is None
+        assert ambiguous_scopes[ambiguous_undo] is None
+        assert ambiguous_scopes[ambiguous_nested_undo] is None
+        active_ids = {decision.id for decision in decision_stream(connection, active_only=True)}
+        assert {ambiguous, ambiguous_undo, ambiguous_nested_undo}.isdisjoint(active_ids)
+        for ambiguous_id in (ambiguous_undo, ambiguous_nested_undo):
+            with pytest.raises(
+                ScopeViolation,
+                match="manual evidence has no configured application scope",
+            ):
+                builder.evidence_excerpt(ambiguous_id, 1_200)
         excerpt_a = builder.evidence_excerpt(rename_a, 1_200)
         excerpt_b = builder.evidence_excerpt(rename_b, 1_200)
         assert (excerpt_a["app_id"], excerpt_a["text"]) == (
@@ -2654,6 +2920,8 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
         }
         assert creation_b not in exported_text
         assert ambiguous not in exported_text
+        assert ambiguous_undo not in exported_text
+        assert ambiguous_nested_undo not in exported_text
         assert rename_b not in exported_text
         assert "PRIVATE APP B" not in exported_text
         assert "APP B ONLY" not in exported_text
@@ -2673,6 +2941,8 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
         assert creation_b not in inactive_export_text
         assert undo_b not in inactive_export_text
         assert ambiguous not in inactive_export_text
+        assert ambiguous_undo not in inactive_export_text
+        assert ambiguous_nested_undo not in inactive_export_text
         assert rename_b not in inactive_export_text
         assert "PRIVATE APP B" not in inactive_export_text
         assert "APP B ONLY" not in inactive_export_text

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import zlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,6 +21,9 @@ from worktrace.errors import (
 )
 
 MAX_HTTP_RESPONSE_BYTES = 10_000_000
+_DECODE_OUTPUT_CHUNK_BYTES = 64 * 1024
+_ACCEPT_ENCODING = "gzip, deflate"
+_SUPPORTED_CONTENT_ENCODINGS = frozenset({"identity", "gzip", "deflate"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +75,94 @@ def _parse_retry_after(value: str) -> float | None:
         return max((parsed.astimezone(UTC) - datetime.now(UTC)).total_seconds(), 0.0)
 
 
+class _BoundedZlibDecoder:
+    def __init__(self, window_bits: int) -> None:
+        self._decompressor = zlib.decompressobj(window_bits)
+
+    @property
+    def unconsumed_input(self) -> bytes:
+        return self._decompressor.unconsumed_tail
+
+    @property
+    def has_trailing_input(self) -> bool:
+        return bool(self._decompressor.unused_data)
+
+    @property
+    def is_complete(self) -> bool:
+        return self._decompressor.eof
+
+    def decode(self, data: bytes, *, max_output: int) -> bytes:
+        try:
+            return self._decompressor.decompress(data, max_output)
+        except zlib.error:
+            raise PermanentSourceError("Provider response could not be decoded") from None
+
+
+def _content_encoding(response: httpx.Response) -> str:
+    encodings = [
+        value.strip().lower()
+        for value in response.headers.get_list("Content-Encoding", split_commas=True)
+        if value.strip()
+    ]
+    if not encodings:
+        return "identity"
+    if len(encodings) != 1 or encodings[0] not in _SUPPORTED_CONTENT_ENCODINGS:
+        raise PermanentSourceError("Provider response used an unsupported content encoding")
+    return encodings[0]
+
+
+def _is_zlib_wrapped_deflate(prefix: bytes) -> bool:
+    """Recognize a complete zlib CMF/FLG header without decoding provider data."""
+
+    if len(prefix) != 2:
+        raise ValueError("deflate detection requires exactly two bytes")
+    cmf, flg = prefix
+    return (cmf & 0x0F) == zlib.DEFLATED and (cmf >> 4) <= 7 and ((cmf << 8) + flg) % 31 == 0
+
+
+def _response_decoder(
+    encoding: str, *, deflate_prefix: bytes | None = None
+) -> _BoundedZlibDecoder | None:
+    if encoding == "gzip":
+        return _BoundedZlibDecoder(zlib.MAX_WBITS | 16)
+    if encoding == "deflate":
+        if deflate_prefix is None or len(deflate_prefix) < 2:
+            raise ValueError("deflate decoder requires a two-byte prefix")
+        window_bits = (
+            zlib.MAX_WBITS if _is_zlib_wrapped_deflate(deflate_prefix[:2]) else -zlib.MAX_WBITS
+        )
+        return _BoundedZlibDecoder(window_bits)
+    return None
+
+
+def _append_bounded(content: bytearray, chunk: bytes) -> None:
+    if len(content) + len(chunk) > MAX_HTTP_RESPONSE_BYTES:
+        raise PermanentSourceError("Provider response exceeded the configured safety bound")
+    content.extend(chunk)
+
+
+def _decode_bounded(
+    content: bytearray,
+    decoder: _BoundedZlibDecoder,
+    raw_chunk: bytes,
+) -> None:
+    pending = raw_chunk
+    while True:
+        remaining = MAX_HTTP_RESPONSE_BYTES - len(content)
+        max_output = min(_DECODE_OUTPUT_CHUNK_BYTES, remaining + 1)
+        decoded_chunk = decoder.decode(pending, max_output=max_output)
+        if decoder.has_trailing_input:
+            raise PermanentSourceError("Provider response could not be decoded")
+        _append_bounded(content, decoded_chunk)
+        pending = decoder.unconsumed_input
+        if pending:
+            continue
+        if len(decoded_chunk) == max_output:
+            pending = b""
+            continue
+        return
+
+
 def _read_bounded_response(response: httpx.Response) -> httpx.Response:
     declared_length = response.headers.get("Content-Length")
     if declared_length is not None:
@@ -78,14 +170,43 @@ def _read_bounded_response(response: httpx.Response) -> httpx.Response:
         if normalized_length.isdecimal() and int(normalized_length) > MAX_HTTP_RESPONSE_BYTES:
             raise PermanentSourceError("Provider response exceeded the configured safety bound")
 
+    encoding = _content_encoding(response)
+    decoder = _response_decoder(encoding) if encoding == "gzip" else None
     content = bytearray()
-    for chunk in response.iter_bytes():
-        if len(content) + len(chunk) > MAX_HTTP_RESPONSE_BYTES:
-            raise PermanentSourceError("Provider response exceeded the configured safety bound")
-        content.extend(chunk)
+    if response.is_stream_consumed:
+        _append_bounded(content, response.content)
+    else:
+        encoded_bytes = 0
+        deflate_prefix = bytearray()
+        for raw_chunk in response.iter_raw(chunk_size=_DECODE_OUTPUT_CHUNK_BYTES):
+            encoded_bytes += len(raw_chunk)
+            if encoded_bytes > MAX_HTTP_RESPONSE_BYTES:
+                raise PermanentSourceError("Provider response exceeded the configured safety bound")
+            if decoder is None:
+                if encoding == "deflate":
+                    deflate_prefix.extend(raw_chunk)
+                    if len(deflate_prefix) < 2:
+                        continue
+                    decoder = _response_decoder("deflate", deflate_prefix=bytes(deflate_prefix[:2]))
+                    raw_chunk = bytes(deflate_prefix)
+                    deflate_prefix.clear()
+                else:
+                    _append_bounded(content, raw_chunk)
+                    continue
+            if decoder is not None:
+                _decode_bounded(content, decoder, raw_chunk)
+        if decoder is not None and (not decoder.is_complete or decoder.has_trailing_input):
+            raise PermanentSourceError("Provider response could not be decoded")
+        if encoding == "deflate" and decoder is None:
+            raise PermanentSourceError("Provider response could not be decoded")
+
+    decoded_headers = response.headers.copy()
+    if encoding != "identity":
+        for header in ("Content-Encoding", "Content-Length", "Transfer-Encoding"):
+            decoded_headers.pop(header, None)
     return httpx.Response(
         response.status_code,
-        headers=response.headers,
+        headers=decoded_headers,
         content=bytes(content),
         request=response.request,
         extensions=response.extensions,
@@ -113,6 +234,7 @@ def request_with_retry(
             request = client.build_request(
                 method,
                 endpoint,
+                headers={"Accept-Encoding": _ACCEPT_ENCODING},
                 params=params,
                 json=json_body,
             )

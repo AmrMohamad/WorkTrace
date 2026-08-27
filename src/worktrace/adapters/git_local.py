@@ -96,6 +96,7 @@ class LocalGitAdapter:
         ):
             environment.pop(variable, None)
         environment["GIT_OPTIONAL_LOCKS"] = "0"
+        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
         environment["GIT_TERMINAL_PROMPT"] = "0"
         try:
             result = subprocess.run(

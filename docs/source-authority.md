@@ -12,7 +12,7 @@ Authority belongs to a source for a particular claim, not to the source in gener
 | Git commit author | Authorship of that Git object | Sole feature ownership, business context, deployment |
 | Git commit committer | Integration/commit action for that Git object | Implementation authorship |
 | Co-authored-by trailer | Explicit co-author participation on that commit | Share of ownership or impact |
-| Local refs/tags | Reachability and release association in the local clone | Fresh remote state or deployment |
+| Authorized local branches, remote-tracking branches, and tags | Reachability and release association in the local clone, with replacement objects disabled | Internal refs, replace-ref projections, fresh remote state, or deployment |
 | GitLab MR author | Authorship of the merge request | Authorship of every patch or overall feature ownership |
 | GitLab reviewers/discussions | Review participation and recorded technical discussion | Implementation authorship unless separate code evidence exists |
 | GitLab merged state | That GitLab recorded the MR as merged | Deployment or user availability |

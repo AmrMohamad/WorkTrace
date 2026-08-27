@@ -291,3 +291,61 @@ def test_commit_snapshot_excludes_stash_and_arbitrary_internal_refs(tmp_path: Pa
         if page.resource_type == "ref"
         for record in page.records
     )
+
+
+def test_snapshot_ignores_replace_refs_behind_authorized_namespaces(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    authorized_commit = _git(repo, "rev-parse", "HEAD").strip()
+    hidden_commit = _git(
+        repo,
+        "commit-tree",
+        "HEAD^{tree}",
+        "-m",
+        "Replace-only hidden commit",
+    ).strip()
+    replacement_commit = _git(
+        repo,
+        "commit-tree",
+        "HEAD^{tree}",
+        "-p",
+        hidden_commit,
+        "-m",
+        "Replacement metadata",
+    ).strip()
+    _git(repo, "update-ref", f"refs/replace/{authorized_commit}", replacement_commit)
+
+    pages = list(
+        LocalGitAdapter(
+            LocalGitConfig(
+                repository_path=repo,
+                allowed_root=tmp_path,
+                source_instance="sample-store-local",
+                app_id="sample_store",
+                email_key=b"test-key",
+            )
+        ).iter_pages()
+    )
+    commit_records = [
+        record for page in pages if page.resource_type == "commit" for record in page.records
+    ]
+    ref_records = [
+        record for page in pages if page.resource_type == "ref" for record in page.records
+    ]
+
+    assert _git(repo, "rev-parse", f"refs/replace/{authorized_commit}").strip() == (
+        replacement_commit
+    )
+    assert {record.identity.external_id for record in commit_records} == {authorized_commit}
+    authorized_record = commit_records[0]
+    assert authorized_record.payload["subject"] == "Implement MOB-42"
+    assert authorized_record.payload["parent_shas"] == []
+    assert {record.payload["ref_kind"] for record in ref_records} == {
+        "local_branch",
+        "remote_tracking_branch",
+        "tag",
+    }
+    assert all(
+        str(record.payload["ref_name"]).startswith(("refs/heads/", "refs/remotes/", "refs/tags/"))
+        for record in ref_records
+    )
+    assert all(record.payload["target_commit_sha"] == authorized_commit for record in ref_records)
