@@ -2482,7 +2482,7 @@ def test_export_preserves_inactive_multi_hop_alias_history(tmp_path: Path) -> No
 def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_closed(
     tmp_path: Path,
 ) -> None:
-    connection, _ = _ledger(tmp_path)
+    connection, database_path = _ledger(tmp_path)
     try:
         connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
         for app_id, suffix, hour in (
@@ -2518,7 +2518,6 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
                 "contribution_id": "contribution:alias-collision-a",
                 "candidate_ids": ["candidate:shared-secondary-alias"],
                 "app_id": "sample_store",
-                "title": "App A merge",
                 "members": ["obj:alias-collision-a"],
             },
         )
@@ -2530,7 +2529,6 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
                 "contribution_id": "contribution:alias-collision-b",
                 "candidate_ids": ["candidate:shared-secondary-alias"],
                 "app_id": "other_app",
-                "title": "PRIVATE APP B MERGE",
                 "members": ["obj:alias-collision-b"],
             },
         )
@@ -2539,22 +2537,6 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
             "rename_contribution",
             "candidate:shared-secondary-alias",
             {"title": "AMBIGUOUS ALIAS PAYLOAD"},
-        )
-        rename_a = append_decision(
-            connection,
-            "rename_contribution",
-            "candidate:shared-secondary-alias",
-            {"app_id": "sample_store", "title": "Scoped app A alias"},
-        )
-        rename_b = append_decision(
-            connection,
-            "rename_contribution",
-            "candidate:shared-secondary-alias",
-            {
-                "app_id": "other_app",
-                "title": "PRIVATE APP B ALIAS",
-                "private_payload": "APP B ONLY",
-            },
         )
 
         base_config = _config(tmp_path)
@@ -2571,14 +2553,66 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
             release_tag_patterns=(),
             ignored_paths=(),
         )
-        builder = PacketBuilder(
+        combined_config = replace(base_config, apps=(*base_config.apps, other_app))
+        builder = PacketBuilder(connection, combined_config)
+        tools = WorkTraceTools(config=combined_config, database_path=database_path)
+
+        ambiguous_list = tools.list_contribution_candidates(app_id="sample_store")
+        ambiguous_candidate = next(
+            item
+            for item in ambiguous_list["candidates"]
+            if item["candidate_id"] == "candidate:alias-collision-a"
+        )
+        ambiguous_summary = tools.get_contribution_summary(
+            contribution_id="candidate:alias-collision-a"
+        )
+        ambiguous_packet = tools.build_phase4_packet(contribution_id="candidate:alias-collision-a")
+        for title_projection in (
+            ambiguous_candidate,
+            ambiguous_summary["contribution"],
+            ambiguous_packet["contribution"],
+        ):
+            assert title_projection["title"] is None
+            assert title_projection["source_text_is_untrusted"] is False
+            assert title_projection["title_content_type"] is None
+            assert title_projection["title_authority"] == "unknown"
+            assert title_projection["title_status"] == "unknown"
+            assert title_projection["title_supporting_evidence_ids"] == []
+            assert ambiguous not in title_projection["title_supporting_evidence_ids"]
+            assert "AMBIGUOUS ALIAS PAYLOAD" not in json.dumps(title_projection)
+
+        rename_a = append_decision(
             connection,
-            replace(base_config, apps=(*base_config.apps, other_app)),
+            "rename_contribution",
+            "candidate:shared-secondary-alias",
+            {"app_id": "sample_store", "title": "Scoped app A alias"},
+        )
+        rename_b = append_decision(
+            connection,
+            "rename_contribution",
+            "candidate:shared-secondary-alias",
+            {
+                "app_id": "other_app",
+                "title": "PRIVATE APP B ALIAS",
+                "private_payload": "APP B ONLY",
+            },
         )
         summary_a = builder.contribution_summary("contribution:alias-collision-a")
         summary_b = builder.contribution_summary("contribution:alias-collision-b")
         assert summary_a["contribution"]["title"] == "Scoped app A alias"
         assert summary_b["contribution"]["title"] == "PRIVATE APP B ALIAS"
+        listed_a = next(
+            item
+            for item in tools.list_contribution_candidates(app_id="sample_store")["candidates"]
+            if item["candidate_id"] == "candidate:alias-collision-a"
+        )
+        packet_a = tools.build_phase4_packet(contribution_id="contribution:alias-collision-a")
+        for title_projection in (listed_a, summary_a["contribution"], packet_a["contribution"]):
+            assert title_projection["title"] == "Scoped app A alias"
+            assert title_projection["source_text_is_untrusted"] is False
+            assert title_projection["title_authority"] == "human_decision"
+            assert title_projection["title_supporting_evidence_ids"] == [rename_a]
+            assert ambiguous not in title_projection["title_supporting_evidence_ids"]
         with pytest.raises(ScopeViolation):
             builder.contribution_summary("candidate:shared-secondary-alias")
         with pytest.raises(ScopeViolation):

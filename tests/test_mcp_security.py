@@ -380,3 +380,146 @@ def test_mcp_candidate_reads_apply_canonical_human_decisions(tmp_path: Path) -> 
         connection.close()
     restored = tools.get_contribution_summary(contribution_id="candidate:manual_1")
     assert restored["contribution"]["title"] == "Human-reviewed title"
+
+
+def test_mcp_title_provenance_is_shared_across_candidate_summary_and_packet(
+    tmp_path: Path,
+) -> None:
+    database_path, _, tools = _mcp_state(tmp_path)
+
+    title_fields = (
+        "title",
+        "source_text_is_untrusted",
+        "title_content_type",
+        "title_authority",
+        "title_status",
+        "title_observation_types",
+        "title_supporting_evidence_ids",
+        "title_limitations",
+    )
+
+    def title_projection() -> tuple[dict[str, object], dict[str, object]]:
+        candidates = tools.list_contribution_candidates(app_id="sample_store")
+        candidate = next(
+            item
+            for item in candidates["candidates"]
+            if item["candidate_id"] == "candidate:manual_1"
+        )
+        summary = tools.get_contribution_summary(contribution_id="candidate:manual_1")
+        packet = tools.build_phase4_packet(contribution_id="candidate:manual_1")
+        summary_title = {key: summary["contribution"][key] for key in title_fields}
+        packet_title = {key: packet["contribution"][key] for key in title_fields}
+        candidate_title = {key: candidate[key] for key in title_fields}
+        assert candidate_title == summary_title == packet_title
+        identity_what = next(
+            item
+            for item in packet["sections"]["contribution_identity"]
+            if item["question_id"] == "identity.what"
+        )
+        assert identity_what["status"] == candidate["title_status"]
+        assert identity_what["observation_types"] == candidate["title_observation_types"]
+        assert (
+            identity_what["supporting_evidence_ids"] == candidate["title_supporting_evidence_ids"]
+        )
+        assert identity_what["limitations"] == candidate["title_limitations"]
+        return candidate_title, identity_what
+
+    provider, _ = title_projection()
+    assert provider == {
+        "title": "Synthetic evidence 1",
+        "source_text_is_untrusted": True,
+        "title_content_type": "untrusted_source_text",
+        "title_authority": "provider_observed",
+        "title_status": "partially_supported",
+        "title_observation_types": ["source_asserted", "derived"],
+        "title_supporting_evidence_ids": ["obs:manual_1"],
+        "title_limitations": [
+            "The title is a provider-observed candidate suggestion unless confirmed by a decision."
+        ],
+    }
+
+    connection = connect(database_path)
+    try:
+        unrelated_attestation = append_decision(
+            connection,
+            "attest_claim",
+            "candidate:manual_1",
+            {"claim": "result", "statement": "This must not become title evidence."},
+        )
+        confirmation = append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:manual_1",
+            {
+                "contribution_id": "contribution:manual_1",
+                "app_id": "sample_store",
+                "title": "Confirmed human title",
+                "members": ["obj:manual_1"],
+            },
+        )
+    finally:
+        connection.close()
+
+    confirmed, _ = title_projection()
+    assert confirmed["title"] == "Confirmed human title"
+    assert confirmed["source_text_is_untrusted"] is False
+    assert confirmed["title_content_type"] == "human_decision_text"
+    assert confirmed["title_authority"] == "human_decision"
+    assert confirmed["title_status"] == "human_attested"
+    assert confirmed["title_observation_types"] == ["human_attested"]
+    assert confirmed["title_supporting_evidence_ids"] == [confirmation]
+    assert unrelated_attestation not in confirmed["title_supporting_evidence_ids"]
+
+    connection = connect(database_path)
+    try:
+        rename = append_decision(
+            connection,
+            "rename_contribution",
+            "contribution:manual_1",
+            {"title": "Renamed human title"},
+        )
+    finally:
+        connection.close()
+
+    renamed, _ = title_projection()
+    assert renamed["title"] == "Renamed human title"
+    assert renamed["title_supporting_evidence_ids"] == [rename]
+
+    connection = connect(database_path)
+    try:
+        undo_decision(connection, rename)
+    finally:
+        connection.close()
+    rename_undone, _ = title_projection()
+    assert rename_undone["title"] == "Confirmed human title"
+    assert rename_undone["title_supporting_evidence_ids"] == [confirmation]
+
+    connection = connect(database_path)
+    try:
+        undo_decision(connection, confirmation)
+    finally:
+        connection.close()
+    confirmation_undone, _ = title_projection()
+    assert confirmation_undone["title"] == "Synthetic evidence 1"
+    assert confirmation_undone["title_authority"] == "provider_observed"
+    assert confirmation_undone["title_supporting_evidence_ids"] == ["obs:manual_1"]
+
+    connection = connect(database_path)
+    try:
+        invalid_cross_app = append_decision(
+            connection,
+            "rename_contribution",
+            "candidate:manual_1",
+            {
+                "app_id": "other_app",
+                "title": "PRIVATE CROSS-APP TITLE MUST NOT LEAK",
+            },
+        )
+    finally:
+        connection.close()
+    cross_app_rejected, _ = title_projection()
+    assert cross_app_rejected["title"] == "Synthetic evidence 1"
+    assert cross_app_rejected["title_authority"] == "provider_observed"
+    assert cross_app_rejected["title_supporting_evidence_ids"] == ["obs:manual_1"]
+    assert invalid_cross_app not in cross_app_rejected["title_supporting_evidence_ids"]
+    assert "PRIVATE CROSS-APP" not in json.dumps(cross_app_rejected)

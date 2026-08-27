@@ -40,6 +40,32 @@ class HumanAttestation:
     source_note: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class TitleProvenance:
+    """Bounded title value plus the exact authority that supports it."""
+
+    title: str | None
+    source_text_is_untrusted: bool
+    content_type: str | None
+    authority: str
+    status: ClaimStatus
+    observation_types: tuple[ObservationType, ...] = ()
+    supporting_evidence_ids: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+
+    def as_fields(self) -> dict[str, object]:
+        return {
+            "title": self.title,
+            "source_text_is_untrusted": self.source_text_is_untrusted,
+            "title_content_type": self.content_type,
+            "title_authority": self.authority,
+            "title_status": self.status.value,
+            "title_observation_types": [value.value for value in self.observation_types],
+            "title_supporting_evidence_ids": list(self.supporting_evidence_ids),
+            "title_limitations": list(self.limitations),
+        }
+
+
 @dataclass(slots=True)
 class ContributionView:
     id: str

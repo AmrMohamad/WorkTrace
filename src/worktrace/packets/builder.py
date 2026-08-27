@@ -44,6 +44,7 @@ from worktrace.packets.models import (
     EvidenceRecord,
     HumanAttestation,
     QuestionAnswer,
+    TitleProvenance,
 )
 from worktrace.packets.ownership import build_participation_summary
 from worktrace.packets.release import build_release_ladder
@@ -689,56 +690,105 @@ class PacketBuilder:
         return sorted(modules)[:50], evidence
 
     @staticmethod
-    def _title_answer(
+    def _title_provenance(
         contribution: ContributionView,
         records: Sequence[EvidenceRecord],
-        question: str,
-    ) -> QuestionAnswer:
-        if contribution.title_evidence_ids:
-            return QuestionAnswer(
-                question_id="identity.what",
-                question=question,
-                answer_draft=(
-                    f"Evidence is grouped under the reviewed title: {contribution.title}."
-                ),
+    ) -> TitleProvenance:
+        if len(contribution.title_evidence_ids) == 1:
+            raw_title = contribution.title
+            title = _bounded_value(raw_title, _MAX_DECISION_VALUE_CHARS)
+            limitations = ["The title is a local-user decision, not provider-observed text."]
+            if title != raw_title:
+                limitations.append(
+                    f"The reviewed title is truncated to {_MAX_DECISION_VALUE_CHARS} characters."
+                )
+            return TitleProvenance(
+                title=title,
+                source_text_is_untrusted=False,
+                content_type="human_decision_text",
+                authority="human_decision",
                 status=ClaimStatus.HUMAN_ATTESTED,
                 observation_types=(ObservationType.HUMAN_ATTESTED,),
                 supporting_evidence_ids=tuple(sorted(contribution.title_evidence_ids)),
-                limitations=("The title is a local-user decision, not provider-observed text.",),
+                limitations=tuple(limitations),
             )
         provider_records = [
             record
             for record in records
             if not record.context_only and record.object_id == contribution.title_source_object_id
         ]
-        if provider_records:
-            return supported_answer(
-                "identity.what",
-                question,
-                f"Evidence is grouped under the provider-observed title: {contribution.title}.",
-                provider_records,
+        if len(provider_records) == 1:
+            record = provider_records[0]
+            raw_title = record.title or record.external_id
+            title = _bounded_value(raw_title, _MAX_DECISION_VALUE_CHARS)
+            limitations = [
+                "The title is a provider-observed candidate suggestion unless confirmed "
+                "by a decision."
+            ]
+            if title != raw_title:
+                limitations.append(
+                    f"The provider title is truncated to {_MAX_DECISION_VALUE_CHARS} characters."
+                )
+            return TitleProvenance(
+                title=title,
+                source_text_is_untrusted=True,
+                content_type="untrusted_source_text",
+                authority="provider_observed",
                 status=ClaimStatus.PARTIALLY_SUPPORTED,
                 observation_types=(ObservationType.SOURCE_ASSERTED, ObservationType.DERIVED),
-                limitations=(
-                    "The title is a provider-observed candidate suggestion unless confirmed "
-                    "by a decision.",
+                supporting_evidence_ids=(record.evidence_id,),
+                limitations=tuple(limitations),
+            )
+        return TitleProvenance(
+            title=None,
+            source_text_is_untrusted=False,
+            content_type=None,
+            authority="unknown",
+            status=ClaimStatus.UNKNOWN,
+            limitations=("No citable evidence establishes a contribution title.",),
+        )
+
+    @classmethod
+    def _title_answer(
+        cls,
+        contribution: ContributionView,
+        records: Sequence[EvidenceRecord],
+        question: str,
+    ) -> QuestionAnswer:
+        provenance = cls._title_provenance(contribution, records)
+        if provenance.authority == "human_decision" and provenance.title is not None:
+            return QuestionAnswer(
+                question_id="identity.what",
+                question=question,
+                answer_draft=(f"Evidence is grouped under the reviewed title: {provenance.title}."),
+                status=provenance.status,
+                observation_types=provenance.observation_types,
+                supporting_evidence_ids=provenance.supporting_evidence_ids,
+                limitations=provenance.limitations,
+            )
+        if provenance.authority == "provider_observed" and provenance.title is not None:
+            return QuestionAnswer(
+                question_id="identity.what",
+                question=question,
+                answer_draft=(
+                    f"Evidence is grouped under the provider-observed title: {provenance.title}."
                 ),
+                status=provenance.status,
+                observation_types=provenance.observation_types,
+                supporting_evidence_ids=provenance.supporting_evidence_ids,
+                limitations=provenance.limitations,
             )
         return unknown_answer(
             "identity.what",
             question,
             "Add an authoritative provider title or confirm a reviewed human title.",
-            limitations=("No citable evidence establishes a contribution title.",),
+            limitations=provenance.limitations,
         )
 
     def contribution_summary(self, identifier: str) -> dict[str, object]:
         contribution = self._resolve_contribution(identifier)
         records = self._records(contribution)
-        title_answer = self._title_answer(
-            contribution,
-            records,
-            "What was the contribution?",
-        )
+        title_provenance = self._title_provenance(contribution, records)
         participation = build_participation_summary(
             self.connection, records, contribution.attestations
         )
@@ -762,28 +812,7 @@ class PacketBuilder:
                 "id": contribution.id,
                 "candidate_id": contribution.candidate_id,
                 "app_id": contribution.app_id,
-                "title": contribution.title if title_answer.answer_draft is not None else None,
-                "source_text_is_untrusted": title_answer.answer_draft is not None,
-                "title_content_type": (
-                    "human_decision_text"
-                    if title_answer.status is ClaimStatus.HUMAN_ATTESTED
-                    else (
-                        "untrusted_source_text" if title_answer.answer_draft is not None else None
-                    )
-                ),
-                "title_authority": (
-                    "human_decision"
-                    if title_answer.status is ClaimStatus.HUMAN_ATTESTED
-                    else (
-                        "provider_observed" if title_answer.answer_draft is not None else "unknown"
-                    )
-                ),
-                "title_status": title_answer.status.value,
-                "title_observation_types": [
-                    value.value for value in title_answer.observation_types
-                ],
-                "title_supporting_evidence_ids": list(title_answer.supporting_evidence_ids),
-                "title_limitations": list(title_answer.limitations),
+                **title_provenance.as_fields(),
                 "type": contribution.contribution_type,
                 "date_from": date_from,
                 "date_to": date_to,
@@ -1380,9 +1409,7 @@ class PacketBuilder:
                 {
                     "candidate_id": str(row["id"]),
                     "confirmed_contribution_id": confirmed,
-                    "title": candidate.title,
-                    "source_text_is_untrusted": True,
-                    "title_content_type": "untrusted_source_text",
+                    **self._title_provenance(candidate, records).as_fields(),
                     "period_from": period_from,
                     "period_to": period_to,
                     "suggested_type": candidate.contribution_type,
