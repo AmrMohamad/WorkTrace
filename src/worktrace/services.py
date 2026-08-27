@@ -6,10 +6,18 @@ import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+from worktrace.candidates.decisions import active_decisions
+from worktrace.candidates.projector import CandidateView, project_candidate
 from worktrace.config import AppConfig, WorkTraceConfig
+from worktrace.db.authority import (
+    authoritative_current_availability_ctes,
+    authoritative_current_participation_ctes,
+    authoritative_current_reference_ctes,
+)
 from worktrace.db.repository import EvidenceRepository
 from worktrace.domain.enums import Completeness
 from worktrace.domain.models import NormalizedObject, SourceIdentity
+from worktrace.errors import NotFound
 
 
 def add_manual_evidence(
@@ -60,24 +68,86 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
     def placeholders(values: list[str]) -> str:
         return ",".join("?" for _ in values) or "NULL"
 
-    candidate_ids = sorted(
-        str(row[0])
-        for row in connection.execute(
-            f"""
-            SELECT candidate.id FROM candidate_groups candidate
-            WHERE candidate.app_id=?
-              AND (
-                  candidate.seed_object_id IN ({placeholders(object_ids)})
-                  OR EXISTS (
-                      SELECT 1 FROM candidate_members member
-                      WHERE member.candidate_id=candidate.id
-                        AND member.source_object_id IN ({placeholders(object_ids)})
-                  )
-              )
-            """,
-            [app_id, *object_ids, *object_ids],
+    candidate_rows = list(
+        connection.execute(
+            "SELECT * FROM candidate_groups WHERE app_id=? ORDER BY generated_at, id",
+            (app_id,),
         )
     )
+    projected_candidates: list[tuple[sqlite3.Row, CandidateView]] = []
+    unsupported_candidates: list[tuple[sqlite3.Row, CandidateView]] = []
+    for candidate_row in candidate_rows:
+        try:
+            projected = project_candidate(connection, str(candidate_row["id"]))
+        except NotFound:
+            continue
+        if projected.seed_object_id is None:
+            if projected.status == "confirmed":
+                unsupported_candidates.append((candidate_row, projected))
+            continue
+        projected_candidates.append((candidate_row, projected))
+    candidate_ids = sorted(projected.id for _, projected in projected_candidates)
+
+    decision_roots = {
+        *candidate_ids,
+        *(projected.id for _, projected in unsupported_candidates),
+        *object_ids,
+    }
+    all_decisions = [
+        dict(row)
+        for row in connection.execute("SELECT * FROM human_decisions ORDER BY created_at, id")
+    ]
+    included_decision_ids: set[str] = set()
+    contribution_ids: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        scoped_targets = decision_roots | contribution_ids
+        for decision in all_decisions:
+            decision_id = str(decision["id"])
+            target_id = str(decision["target_id"])
+            undo_target_id = (
+                str(decision["undo_target_id"]) if decision.get("undo_target_id") else None
+            )
+            if (
+                target_id not in scoped_targets
+                and decision_id not in included_decision_ids
+                and undo_target_id not in included_decision_ids
+            ):
+                continue
+            if decision_id not in included_decision_ids:
+                included_decision_ids.add(decision_id)
+                changed = True
+            if str(decision["action"]) in {
+                "confirm_candidate",
+                "merge_contributions",
+                "split_contribution",
+            }:
+                try:
+                    raw_payload = json.loads(str(decision["payload_json"]))
+                except json.JSONDecodeError:
+                    raw_payload = {}
+                payload_data = raw_payload if isinstance(raw_payload, dict) else {}
+                contribution_id = payload_data.get("contribution_id")
+                if (
+                    isinstance(contribution_id, str)
+                    and contribution_id
+                    and contribution_id not in contribution_ids
+                ):
+                    contribution_ids.add(contribution_id)
+                    changed = True
+        for decision in all_decisions:
+            decision_id = str(decision["id"])
+            undo_target_id = (
+                str(decision["undo_target_id"]) if decision.get("undo_target_id") else None
+            )
+            if (
+                decision_id in included_decision_ids
+                and undo_target_id
+                and undo_target_id not in included_decision_ids
+            ):
+                included_decision_ids.add(undo_target_id)
+                changed = True
 
     payload: dict[str, object] = {
         "schema": "worktrace-export-v2",
@@ -123,8 +193,11 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
     payload["participations"] = [
         dict(row)
         for row in connection.execute(
-            "SELECT * FROM participations WHERE observation_id IN "
-            f"({placeholders(observation_ids)})",
+            f"""
+            WITH {authoritative_current_participation_ctes()}
+            SELECT * FROM authoritative_current_participations
+            WHERE observation_id IN ({placeholders(observation_ids)})
+            """,
             observation_ids,
         )
     ]
@@ -132,7 +205,9 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         dict(row)
         for row in connection.execute(
             f"""
-            SELECT DISTINCT a.* FROM actors a JOIN participations p ON p.actor_id=a.id
+            WITH {authoritative_current_participation_ctes()}
+            SELECT DISTINCT a.* FROM actors a
+            JOIN authoritative_current_participations p ON p.actor_id=a.id
             WHERE p.observation_id IN ({placeholders(observation_ids)})
             """,
             observation_ids,
@@ -142,9 +217,11 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         dict(row)
         for row in connection.execute(
             f"""
-            SELECT * FROM source_object_availability_events
-            WHERE source_object_id IN ({placeholders(object_ids)})
-              AND sync_run_id IN ({placeholders(sync_run_ids)})
+            WITH {authoritative_current_availability_ctes()}
+            SELECT event.* FROM authoritative_current_availability_events event
+            WHERE event.source_object_id IN ({placeholders(object_ids)})
+              AND event.sync_run_id IN ({placeholders(sync_run_ids)})
+            ORDER BY event.source_object_id, event.id
             """,
             [*object_ids, *sync_run_ids],
         )
@@ -153,7 +230,8 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         dict(row)
         for row in connection.execute(
             f"""
-            SELECT * FROM "references" WHERE app_id=?
+            WITH {authoritative_current_reference_ctes()}
+            SELECT * FROM authoritative_current_references WHERE app_id=?
               AND from_object_id IN ({placeholders(object_ids)})
               AND to_object_id IN ({placeholders(object_ids)})
               AND supporting_observation_id IN ({placeholders(observation_ids)})
@@ -162,33 +240,68 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         )
     ]
     payload["candidate_groups"] = [
-        dict(row)
-        for row in connection.execute(
-            f"SELECT * FROM candidate_groups WHERE id IN ({placeholders(candidate_ids)})",
-            candidate_ids,
-        )
+        {
+            "id": projected.id,
+            "app_id": projected.app_id,
+            "seed_object_id": projected.seed_object_id,
+            "generator_version": str(row["generator_version"]),
+            "suggested_title": projected.title,
+            "suggested_type": projected.contribution_type,
+            "status": projected.status,
+            "generated_at": str(row["generated_at"]),
+            "projection_version": 2,
+            "unsupported_member_ids": list(projected.unsupported_member_ids),
+        }
+        for row, projected in projected_candidates
     ]
     payload["candidate_members"] = [
-        dict(row)
-        for row in connection.execute(
-            f"""
-            SELECT * FROM candidate_members
-            WHERE candidate_id IN ({placeholders(candidate_ids)})
-              AND source_object_id IN ({placeholders(object_ids)})
-            """,
-            [*candidate_ids, *object_ids],
-        )
+        {
+            "candidate_id": projected.id,
+            "source_object_id": str(member["source_object_id"]),
+            "membership_reason": str(member["membership_reason"]),
+            "context_only": int(bool(member["context_only"])),
+        }
+        for _, projected in projected_candidates
+        for member in projected.members
     ]
     payload["human_decisions"] = [
-        dict(row)
-        for row in connection.execute(
-            f"""
-            SELECT * FROM human_decisions
-            WHERE target_id IN ({placeholders([*candidate_ids, *object_ids])})
-            """,
-            [*candidate_ids, *object_ids],
-        )
+        decision for decision in all_decisions if str(decision["id"]) in included_decision_ids
     ]
+
+    unsupported_history: list[dict[str, object]] = []
+    for _, projected in unsupported_candidates:
+        creation = next(
+            (
+                decision
+                for decision in reversed(active_decisions(connection, projected.id))
+                if decision.action
+                in {"confirm_candidate", "merge_contributions", "split_contribution"}
+                and isinstance(decision.payload.get("contribution_id"), str)
+            ),
+            None,
+        )
+        if creation is None:
+            continue
+        contribution_id = str(creation.payload["contribution_id"])
+        history_decision_ids = [
+            str(decision["id"])
+            for decision in all_decisions
+            if str(decision["id"]) in included_decision_ids
+            and str(decision["target_id"]) in {projected.id, contribution_id}
+        ]
+        unsupported_history.append(
+            {
+                "app_id": app_id,
+                "candidate_id": projected.id,
+                "contribution_id": contribution_id,
+                "current_evidence_available": False,
+                "decision_ids": history_decision_ids,
+                "status": "confirmed_history_unsupported",
+                "title": projected.title,
+                "unsupported_member_ids": list(projected.unsupported_member_ids),
+            }
+        )
+    payload["unsupported_contribution_history"] = unsupported_history
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:

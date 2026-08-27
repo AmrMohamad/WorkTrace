@@ -212,6 +212,14 @@ def import_snapshot(
         for page in adapter.iter_pages():
             if page.source_kind != source or page.source_instance != source_instance:
                 raise SourceError("adapter page escaped its configured source scope")
+            if any(
+                record.identity.source_kind != source
+                or record.identity.source_instance != source_instance
+                for record in page.records
+            ):
+                raise SourceError("adapter record escaped its configured source scope")
+            if any(record.identity.app_id != app.id for record in page.records):
+                raise SourceError("adapter record escaped its configured application scope")
             for limitation in page.limitations:
                 if limitation and limitation not in limitations:
                     limitations.append(limitation)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 
 REMOTE_POLICY_SOURCES = frozenset({"jira", "gitlab"})
 CURRENT_SELECTION_POLICY_VERSION = 2
@@ -122,12 +122,105 @@ def authoritative_current_observation_ctes() -> str:
                     ORDER BY o.fetched_at DESC, o.id DESC
                 ) AS position
             FROM observations o
+            JOIN source_objects authority_object
+              ON authority_object.id=o.source_object_id
             JOIN authoritative_current_runs current_run
               ON current_run.id=o.sync_run_id
+             AND current_run.app_id=authority_object.app_id
+             AND current_run.source=authority_object.source
+             AND current_run.source_instance=authority_object.source_instance
         ),
         authoritative_current_observations AS (
             SELECT * FROM ranked_authoritative_observations WHERE position=1
         )
+    """
+
+
+def authoritative_current_participation_ctes() -> str:
+    """Return current participations whose complete origin chain is coherent."""
+
+    return f"""
+        {authoritative_current_observation_ctes()},
+        authoritative_current_participations AS (
+            SELECT participation.*
+            FROM participations participation
+            JOIN authoritative_current_observations observation
+              ON observation.id=participation.observation_id
+             AND observation.source_object_id=participation.source_object_id
+            JOIN source_objects authority_object
+              ON authority_object.id=participation.source_object_id
+            JOIN actors authority_actor
+              ON authority_actor.id=participation.actor_id
+             AND authority_actor.source=authority_object.source
+             AND authority_actor.source_instance=authority_object.source_instance
+        )
+    """
+
+
+def authoritative_current_reference_ctes() -> str:
+    """Return current typed references backed by their declaring source object."""
+
+    return f"""
+        {authoritative_current_observation_ctes()},
+        authoritative_current_references AS (
+            SELECT reference.*
+            FROM "references" reference
+            JOIN source_objects from_object
+              ON from_object.id=reference.from_object_id
+             AND from_object.app_id=reference.app_id
+            JOIN source_objects to_object
+              ON to_object.id=reference.to_object_id
+             AND to_object.app_id=reference.app_id
+            JOIN authoritative_current_observations supporting_observation
+              ON supporting_observation.id=reference.supporting_observation_id
+             AND supporting_observation.source_object_id=reference.from_object_id
+        )
+    """
+
+
+def authoritative_availability_event_ctes() -> str:
+    """Return current availability CTEs after a ranked_authoritative_runs CTE.
+
+    The event and its source object must share the producing run's complete origin tuple.
+    The projected object fields are the final guard that the cited event is still current.
+    """
+
+    return """
+        ranked_authoritative_availability_events AS (
+            SELECT event.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY event.source_object_id
+                    ORDER BY eligible_run.completed_at DESC,
+                             event.observed_at DESC, event.id DESC
+                ) AS position
+            FROM source_object_availability_events event
+            JOIN ranked_authoritative_runs eligible_run
+              ON eligible_run.id=event.sync_run_id
+            JOIN source_objects authority_object
+              ON authority_object.id=event.source_object_id
+             AND authority_object.app_id=eligible_run.app_id
+             AND authority_object.source=eligible_run.source
+             AND authority_object.source_instance=eligible_run.source_instance
+        ),
+        authoritative_current_availability_events AS (
+            SELECT event.*
+            FROM ranked_authoritative_availability_events event
+            JOIN source_objects projected_object
+              ON projected_object.id=event.source_object_id
+            WHERE event.position=1
+              AND projected_object.availability=event.state
+              AND projected_object.availability_reason=event.reason
+              AND projected_object.availability_observed_at=event.observed_at
+        )
+    """
+
+
+def authoritative_current_availability_ctes() -> str:
+    """Return self-contained CTEs for current citable availability events."""
+
+    return f"""
+        {authoritative_current_run_ctes()},
+        {authoritative_availability_event_ctes()}
     """
 
 
@@ -170,18 +263,6 @@ def authoritative_current_object_ids(
     return frozenset(
         str(row["source_object_id"])
         for row in authoritative_current_observations(connection, app_id)
-    )
-
-
-def supporting_observation_is_authoritative(
-    supporting_observation_id: object,
-    current_observation_ids: Collection[str],
-) -> bool:
-    """Fail closed unless a typed fact is backed by a current citable observation."""
-
-    return (
-        isinstance(supporting_observation_id, str)
-        and supporting_observation_id in current_observation_ids
     )
 
 

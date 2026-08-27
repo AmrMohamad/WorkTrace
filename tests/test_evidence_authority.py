@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 from worktrace.candidates.builder import rebuild_candidates
-from worktrace.candidates.decisions import append_decision
+from worktrace.candidates.decisions import append_decision, undo_decision
+from worktrace.candidates.projector import list_candidates, project_candidate
 from worktrace.config import AppConfig, IdentityConfig, WorkTraceConfig
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
@@ -77,16 +78,20 @@ def _insert_remote_observation(
     title: str,
     completeness: str = "complete_for_scope",
     source_instance: str = "jira-main",
+    source: str = "jira",
+    kind: str = "jira_issue",
+    data: dict[str, object] | None = None,
 ) -> None:
     connection.execute(
         """
         INSERT INTO sync_runs(
             id, app_id, source, source_instance, status, started_at, completed_at,
             adapter_version, scope_json, completeness
-        ) VALUES (?, 'sample_store', 'jira', ?, ?, ?, ?, 'fixture', ?, ?)
+        ) VALUES (?, 'sample_store', ?, ?, ?, ?, ?, 'fixture', ?, ?)
         """,
         (
             run_id,
+            source,
             source_instance,
             status,
             completed_at,
@@ -100,10 +105,10 @@ def _insert_remote_observation(
         INSERT INTO source_objects(
             id, app_id, source, source_instance, kind, external_id,
             first_seen_run_id, last_seen_run_id
-        ) VALUES (?, 'sample_store', 'jira', ?, 'jira_issue', ?, ?, ?)
+        ) VALUES (?, 'sample_store', ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET last_seen_run_id=excluded.last_seen_run_id
         """,
-        (object_id, source_instance, object_id, run_id, run_id),
+        (object_id, source, source_instance, kind, object_id, run_id, run_id),
     )
     connection.execute(
         """
@@ -111,7 +116,7 @@ def _insert_remote_observation(
             id, source_object_id, sync_run_id, fetched_at, payload_hash, title,
             body_text, data_json, completeness, adapter_version,
             normalization_version, redaction_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?, 'fixture', '2', '1')
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'fixture', '2', '1')
         """,
         (
             observation_id,
@@ -121,6 +126,7 @@ def _insert_remote_observation(
             f"hash:{observation_id}",
             title,
             f"{title} body",
+            json.dumps(data or {}),
             completeness,
         ),
     )
@@ -882,5 +888,668 @@ def test_failed_reference_cannot_contradict_supported_claim_and_v2_control_can(
         assert excerpt["content_type"] == "typed_reference_evidence"
         assert excerpt["supporting_observation_id"] == "obs:failed-revert"
         assert excerpt["authoritative_current"] is True
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("run_source", "run_instance", "object_source", "object_instance"),
+    [
+        ("git", "fixture-repo", "jira", "jira-main"),
+        ("manual", "local-user", "gitlab", "gitlab-main"),
+        ("git", "fixture-repo", "git", "other-repo"),
+    ],
+)
+def test_corrupt_source_run_tuple_cannot_borrow_authority(
+    tmp_path: Path,
+    run_source: str,
+    run_instance: str,
+    object_source: str,
+    object_instance: str,
+) -> None:
+    connection, database_path = _ledger(tmp_path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO sync_runs(
+                id, app_id, source, source_instance, status, started_at, completed_at,
+                adapter_version, scope_json, completeness
+            ) VALUES ('run:borrowed', 'sample_store', ?, ?, 'complete',
+                      '2026-08-27T10:00:00+00:00', '2026-08-27T10:00:00+00:00',
+                      'fixture', '{}', 'complete_for_scope')
+            """,
+            (run_source, run_instance),
+        )
+        connection.execute(
+            """
+            INSERT INTO source_objects(
+                id, app_id, source, source_instance, kind, external_id,
+                first_seen_run_id, last_seen_run_id, availability,
+                availability_reason, availability_observed_at
+            ) VALUES ('obj:borrowed', 'sample_store', ?, ?, 'jira_issue',
+                      'DEMO-999', 'run:borrowed', 'run:borrowed', 'visible',
+                      'observed', '2026-08-27T10:00:00+00:00')
+            """,
+            (object_source, object_instance),
+        )
+        connection.execute(
+            """
+            INSERT INTO observations(
+                id, source_object_id, sync_run_id, fetched_at, payload_hash, title,
+                body_text, data_json, completeness, adapter_version,
+                normalization_version, redaction_version
+            ) VALUES ('obs:borrowed', 'obj:borrowed', 'run:borrowed',
+                      '2026-08-27T10:00:00+00:00', 'hash:borrowed',
+                      'BORROWED AUTHORITY TITLE', 'BORROWED AUTHORITY BODY', '{}',
+                      'complete_for_scope', 'fixture', '2', '1')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_object_availability_events(
+                id, source_object_id, sync_run_id, state, reason, observed_at
+            ) VALUES ('availability:borrowed', 'obj:borrowed', 'run:borrowed',
+                      'visible', 'observed', '2026-08-27T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:borrowed', 'sample_store', 'obj:borrowed',
+                      'fixture', 'BORROWED CANDIDATE TITLE', 'feature',
+                      '2026-08-27T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            "INSERT INTO candidate_members VALUES ('candidate:borrowed', 'obj:borrowed', 'seed', 0)"
+        )
+        connection.commit()
+
+        repository = EvidenceRepository(connection)
+        assert repository.current_observations("sample_store") == []
+        assert search_evidence(connection, "sample_store", "BORROWED") == []
+        for evidence_id in ("obs:borrowed", "availability:borrowed"):
+            with pytest.raises(NotFound):
+                evidence_excerpt(connection, evidence_id, chars=1_200)
+
+        tools = WorkTraceTools(config=_config(tmp_path), database_path=database_path)
+        assert tools.search_evidence(query="BORROWED", app_id="sample_store")["results"] == []
+        assert tools.list_contribution_candidates(app_id="sample_store")["candidates"] == []
+        for evidence_id in ("obs:borrowed", "availability:borrowed"):
+            with pytest.raises(NotFound):
+                tools.get_evidence_excerpt(evidence_id=evidence_id)
+
+        export_path = tmp_path / "borrowed-export.json"
+        assert export_app(connection, "sample_store", export_path) == 0
+        assert "BORROWED" not in export_path.read_text(encoding="utf-8")
+        assert rebuild_candidates("sample_store", repository) == 0
+    finally:
+        connection.close()
+
+
+def test_cross_object_participation_and_reference_support_are_never_authoritative(
+    tmp_path: Path,
+) -> None:
+    connection, database_path = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:origin-a",
+            object_id="obj:origin-a",
+            observation_id="obs:origin-a",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T10:00:00+00:00",
+            title="Origin A unique evidence",
+            source_instance="jira-a",
+        )
+        _insert_remote_observation(
+            connection,
+            run_id="run:origin-b",
+            object_id="obj:origin-b",
+            observation_id="obs:origin-b",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T10:01:00+00:00",
+            title="Origin B unique evidence",
+            source_instance="jira-b",
+        )
+        connection.execute(
+            """
+            INSERT INTO actors(
+                id, source, source_instance, external_actor_id, display_name, is_self
+            ) VALUES ('actor:wrong-source', 'git', 'fixture-repo', 'fixture-self',
+                      'Wrong-source actor', 1),
+                     ('actor:wrong-object', 'jira', 'jira-b', 'fixture-self',
+                      'Wrong-object actor', 1)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO participations(
+                id, source_object_id, observation_id, actor_id, role, details_json
+            ) VALUES ('part:wrong-source', 'obj:origin-a', 'obs:origin-a',
+                      'actor:wrong-source', 'jira_assignee', '{}'),
+                     ('part:wrong-object', 'obj:origin-b', 'obs:origin-a',
+                      'actor:wrong-object', 'jira_assignee', '{}')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO "references"(
+                id, app_id, from_object_id, to_object_id, relationship_type,
+                extraction_method, supporting_observation_id
+            ) VALUES ('ref:wrong-origin', 'sample_store', 'obj:origin-b',
+                      'obj:origin-a', 'jira_subtask_of', 'fixture', 'obs:origin-a')
+            """
+        )
+        connection.commit()
+
+        repository = EvidenceRepository(connection)
+        assert rebuild_candidates("sample_store", repository) == 0
+
+        tools = WorkTraceTools(config=_config(tmp_path), database_path=database_path)
+        assert (
+            tools.search_evidence(
+                query="Origin A unique", app_id="sample_store", actor_id="actor:wrong-object"
+            )["results"]
+            == []
+        )
+        for evidence_id in ("part:wrong-source", "part:wrong-object", "ref:wrong-origin"):
+            with pytest.raises(NotFound):
+                tools.get_evidence_excerpt(evidence_id=evidence_id)
+
+        export_path = tmp_path / "origin-integrity-export.json"
+        export_app(connection, "sample_store", export_path)
+        exported = json.loads(export_path.read_text(encoding="utf-8"))
+        assert exported["participations"] == []
+        assert exported["actors"] == []
+        assert exported["references"] == []
+    finally:
+        connection.close()
+
+
+def test_mixed_authority_candidate_reselects_canonical_seed_across_surfaces(
+    tmp_path: Path,
+) -> None:
+    connection, database_path = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:legacy-seed",
+            object_id="obj:legacy-seed",
+            observation_id="obs:legacy-seed",
+            status="complete",
+            scope={},
+            completed_at="2026-08-26T10:00:00+00:00",
+            title="QUARANTINED LEGACY TITLE",
+        )
+        _insert_remote_observation(
+            connection,
+            run_id="run:current-member",
+            object_id="obj:current-member",
+            observation_id="obs:current-member",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T10:00:00+00:00",
+            title="Current authoritative member",
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:mixed-authority', 'sample_store', 'obj:legacy-seed',
+                      'fixture', 'QUARANTINED LEGACY TITLE', 'hotfix',
+                      '2026-08-27T11:00:00+00:00')
+            """
+        )
+        for object_id, reason in (
+            ("obj:legacy-seed", "seed"),
+            ("obj:current-member", "structural_reference"),
+        ):
+            connection.execute(
+                "INSERT INTO candidate_members VALUES ('candidate:mixed-authority', ?, ?, 0)",
+                (object_id, reason),
+            )
+        connection.commit()
+
+        projected = project_candidate(connection, "candidate:mixed-authority")
+        assert projected.seed_object_id == "obj:current-member"
+        assert projected.title == "Current authoritative member"
+        assert projected.contribution_type == "feature"
+        assert [member["source_object_id"] for member in projected.members] == [
+            "obj:current-member"
+        ]
+        assert projected.unsupported_member_ids == ()
+        assert list_candidates(connection, "sample_store")[0] == projected
+
+        tools = WorkTraceTools(config=_config(tmp_path), database_path=database_path)
+        listed = tools.list_contribution_candidates(app_id="sample_store")["candidates"]
+        assert [item["title"] for item in listed] == ["Current authoritative member"]
+        summary = tools.get_contribution_summary(contribution_id="candidate:mixed-authority")
+        assert summary["contribution"]["title"] == "Current authoritative member"
+        assert [member["object_id"] for member in summary["members"]] == ["obj:current-member"]
+
+        export_path = tmp_path / "mixed-authority-export.json"
+        export_app(connection, "sample_store", export_path)
+        exported_text = export_path.read_text(encoding="utf-8")
+        exported = json.loads(exported_text)
+        assert "QUARANTINED LEGACY TITLE" not in exported_text
+        assert exported["candidate_groups"][0]["seed_object_id"] == "obj:current-member"
+        assert exported["candidate_groups"][0]["suggested_title"] == (
+            "Current authoritative member"
+        )
+        assert [row["source_object_id"] for row in exported["candidate_members"]] == [
+            "obj:current-member"
+        ]
+    finally:
+        connection.close()
+
+
+def test_export_preserves_app_scoped_decision_closure_and_unsupported_history(
+    tmp_path: Path,
+) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        for suffix, instance in (("one", "jira-one"), ("two", "jira-two")):
+            _insert_remote_observation(
+                connection,
+                run_id=f"run:eligible-{suffix}",
+                object_id=f"obj:eligible-{suffix}",
+                observation_id=f"obs:eligible-{suffix}",
+                status="complete",
+                scope={"selection_policy_version": 2},
+                completed_at=f"2026-08-27T10:0{1 if suffix == 'one' else 2}:00+00:00",
+                title=f"Eligible {suffix}",
+                source_instance=instance,
+            )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:eligible-export', 'sample_store', 'obj:eligible-one',
+                      'fixture', 'Eligible one', 'feature',
+                      '2026-08-27T11:00:00+00:00')
+            """
+        )
+        for object_id in ("obj:eligible-one", "obj:eligible-two"):
+            connection.execute(
+                "INSERT INTO candidate_members VALUES "
+                "('candidate:eligible-export', ?, 'fixture', 0)",
+                (object_id,),
+            )
+
+        _insert_remote_observation(
+            connection,
+            run_id="run:legacy-history",
+            object_id="obj:legacy-history",
+            observation_id="obs:legacy-history",
+            status="complete",
+            scope={},
+            completed_at="2026-08-26T09:00:00+00:00",
+            title="QUARANTINED PROVIDER HISTORY",
+            source_instance="jira-legacy-history",
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:legacy-history', 'sample_store', 'obj:legacy-history',
+                      'fixture', 'QUARANTINED PROVIDER HISTORY', 'feature',
+                      '2026-08-26T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            "INSERT INTO candidate_members VALUES "
+            "('candidate:legacy-history', 'obj:legacy-history', 'seed', 0)"
+        )
+
+        connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
+        connection.execute(
+            """
+            INSERT INTO sync_runs(
+                id, app_id, source, source_instance, status, started_at, completed_at,
+                adapter_version, scope_json, completeness
+            ) VALUES ('run:other', 'other_app', 'manual', 'local-user', 'complete',
+                      '2026-08-27T10:00:00+00:00', '2026-08-27T10:00:00+00:00',
+                      'fixture', '{}', 'complete_for_scope')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_objects(
+                id, app_id, source, source_instance, kind, external_id,
+                first_seen_run_id, last_seen_run_id
+            ) VALUES ('obj:other', 'other_app', 'manual', 'local-user',
+                      'manual_evidence', 'other', 'run:other', 'run:other')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:other', 'other_app', 'obj:other', 'fixture',
+                      'PRIVATE OTHER APP TITLE', 'unknown',
+                      '2026-08-27T10:00:00+00:00')
+            """
+        )
+        connection.commit()
+
+        decision_ids: list[str] = []
+        decision_ids.append(
+            append_decision(
+                connection,
+                "confirm_candidate",
+                "candidate:eligible-export",
+                {
+                    "contribution_id": "contribution:eligible-export",
+                    "app_id": "sample_store",
+                    "title": "Human eligible title",
+                    "members": ["obj:eligible-one", "obj:eligible-two"],
+                },
+            )
+        )
+        decision_ids.append(
+            append_decision(
+                connection,
+                "attest_claim",
+                "contribution:eligible-export",
+                {"claim": "result", "statement": "Human verified result"},
+            )
+        )
+        decision_ids.append(
+            append_decision(
+                connection,
+                "rename_contribution",
+                "contribution:eligible-export",
+                {"title": "Renamed eligible contribution"},
+            )
+        )
+        removed = append_decision(
+            connection,
+            "remove_member",
+            "contribution:eligible-export",
+            {"source_object_id": "obj:eligible-two"},
+        )
+        decision_ids.append(removed)
+        decision_ids.append(undo_decision(connection, removed))
+
+        legacy_confirm = append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:legacy-history",
+            {
+                "contribution_id": "contribution:legacy-history",
+                "app_id": "sample_store",
+                "title": "Human-confirmed historical contribution",
+                "members": ["obj:legacy-history"],
+            },
+        )
+        legacy_attest = append_decision(
+            connection,
+            "attest_claim",
+            "contribution:legacy-history",
+            {"claim": "context", "statement": "Human historical context"},
+        )
+        decision_ids.extend((legacy_confirm, legacy_attest))
+
+        other_confirm = append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:other",
+            {
+                "contribution_id": "contribution:other",
+                "app_id": "other_app",
+                "title": "PRIVATE OTHER APP TITLE",
+                "members": ["obj:other"],
+            },
+        )
+        other_attest = append_decision(
+            connection,
+            "attest_claim",
+            "contribution:other",
+            {"claim": "private", "statement": "PRIVATE OTHER APP ATTESTATION"},
+        )
+
+        # Simulate a deterministic rebuild changing the raw candidate after confirmation.
+        # The immutable human confirmation snapshot must remain the projected history.
+        connection.execute(
+            "DELETE FROM candidate_members "
+            "WHERE candidate_id='candidate:eligible-export' "
+            "AND source_object_id='obj:eligible-two'"
+        )
+        connection.commit()
+
+        export_path = tmp_path / "decision-closure-export.json"
+        export_app(connection, "sample_store", export_path)
+        exported_text = export_path.read_text(encoding="utf-8")
+        exported = json.loads(exported_text)
+
+        assert {row["id"] for row in exported["human_decisions"]} == set(decision_ids)
+        assert other_confirm not in exported_text
+        assert other_attest not in exported_text
+        assert "PRIVATE OTHER APP" not in exported_text
+        assert [row["id"] for row in exported["candidate_groups"]] == ["candidate:eligible-export"]
+        assert {row["source_object_id"] for row in exported["candidate_members"]} == {
+            "obj:eligible-one",
+            "obj:eligible-two",
+        }
+        assert "QUARANTINED PROVIDER HISTORY" not in exported_text
+        assert exported["unsupported_contribution_history"] == [
+            {
+                "app_id": "sample_store",
+                "candidate_id": "candidate:legacy-history",
+                "contribution_id": "contribution:legacy-history",
+                "current_evidence_available": False,
+                "decision_ids": [legacy_confirm, legacy_attest],
+                "status": "confirmed_history_unsupported",
+                "title": "Human-confirmed historical contribution",
+                "unsupported_member_ids": ["obj:legacy-history"],
+            }
+        ]
+    finally:
+        connection.close()
+
+
+def test_contradiction_citations_are_semantic_eligible_and_excerpt_resolvable(
+    tmp_path: Path,
+) -> None:
+    connection, database_path = _ledger(tmp_path)
+    config = _config(tmp_path)
+    repository = EvidenceRepository(connection)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:closed-mr",
+            object_id="obj:closed-mr",
+            observation_id="obs:closed-mr",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T10:00:00+00:00",
+            title="Closed without merge",
+            source="gitlab",
+            source_instance="gitlab-closed",
+            kind="gitlab_mr",
+            data={"state": "closed", "merged_at": None},
+        )
+        connection.execute(
+            """
+            INSERT INTO source_object_availability_events(
+                id, source_object_id, sync_run_id, state, reason, observed_at
+            ) VALUES ('availability:closed-visible', 'obj:closed-mr', 'run:closed-mr',
+                      'visible', 'observed', '2026-08-27T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            """
+            UPDATE source_objects SET availability='visible', availability_reason='observed',
+                availability_observed_at='2026-08-27T10:00:00+00:00'
+            WHERE id='obj:closed-mr'
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:closed-mr', 'sample_store', 'obj:closed-mr',
+                      'fixture', 'Closed without merge', 'feature',
+                      '2026-08-27T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            "INSERT INTO candidate_members VALUES "
+            "('candidate:closed-mr', 'obj:closed-mr', 'seed', 0)"
+        )
+
+        _insert_remote_observation(
+            connection,
+            run_id="run:unavailable-base",
+            object_id="obj:unavailable-mr",
+            observation_id="obs:unavailable-base",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T09:00:00+00:00",
+            title="Unavailable merge request",
+            source="gitlab",
+            source_instance="gitlab-unavailable",
+            kind="gitlab_mr",
+            data={"state": "opened"},
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:unavailable-mr', 'sample_store', 'obj:unavailable-mr',
+                      'fixture', 'Unavailable merge request', 'feature',
+                      '2026-08-27T09:00:00+00:00')
+            """
+        )
+        connection.execute(
+            "INSERT INTO candidate_members VALUES "
+            "('candidate:unavailable-mr', 'obj:unavailable-mr', 'seed', 0)"
+        )
+        connection.commit()
+
+        append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:unavailable-mr",
+            {
+                "contribution_id": "contribution:unavailable-mr",
+                "app_id": "sample_store",
+                "title": "Human unavailable MR history",
+                "members": ["obj:unavailable-mr"],
+            },
+        )
+        unavailable_run = repository.start_sync_run(
+            "sample_store",
+            "gitlab",
+            "gitlab-unavailable",
+            {"selection_policy_version": 2},
+        )
+        unavailable_id = repository.record_object_unavailable(
+            unavailable_run,
+            source="gitlab",
+            source_instance="gitlab-unavailable",
+            kind="gitlab_mr",
+            external_id="obj:unavailable-mr",
+        )
+        repository.finish_sync_run(unavailable_run, "complete", "complete_for_scope")
+
+        builder = PacketBuilder(connection, config)
+        closed = builder.contribution_summary("candidate:closed-mr")["contradictions"]
+        assert closed == [
+            {
+                "kind": "closed_without_merge",
+                "statement": "GitLab recorded a closed merge request, not a merged one.",
+                "evidence_ids": ["obs:closed-mr"],
+            }
+        ]
+        unavailable = builder.contribution_summary("contribution:unavailable-mr")["contradictions"]
+        assert unavailable[0]["evidence_ids"] == [unavailable_id]
+
+        tools = WorkTraceTools(config=config, database_path=database_path)
+        closed_excerpt = tools.get_evidence_excerpt(evidence_id="obs:closed-mr")
+        assert closed_excerpt["evidence_id"] == "obs:closed-mr"
+        unavailable_excerpt = tools.get_evidence_excerpt(evidence_id=unavailable_id)
+        assert unavailable_excerpt["content_type"] == "availability_evidence"
+        assert unavailable_excerpt["state"] == "unavailable"
+        assert unavailable_excerpt["reason"] == "not_found"
+        assert unavailable_excerpt["authoritative_current"] is True
+    finally:
+        connection.close()
+
+
+def test_cli_candidate_limit_is_applied_after_orphan_suppression(tmp_path: Path) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:valid-tail",
+            object_id="obj:valid-tail",
+            observation_id="obs:valid-tail",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T08:00:00+00:00",
+            title="Valid tail candidate",
+            source_instance="jira-valid-tail",
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:valid-tail', 'sample_store', 'obj:valid-tail',
+                      'fixture', 'Valid tail candidate', 'feature',
+                      '2026-08-27T08:00:00+00:00')
+            """
+        )
+        connection.execute(
+            "INSERT INTO candidate_members VALUES "
+            "('candidate:valid-tail', 'obj:valid-tail', 'seed', 0)"
+        )
+        for index in range(25):
+            _insert_remote_observation(
+                connection,
+                run_id=f"run:orphan-{index:02d}",
+                object_id=f"obj:orphan-{index:02d}",
+                observation_id=f"obs:orphan-{index:02d}",
+                status="complete",
+                scope={},
+                completed_at=f"2026-08-27T09:{index:02d}:00+00:00",
+                title=f"Orphan {index:02d}",
+                source_instance=f"jira-orphan-{index:02d}",
+            )
+            connection.execute(
+                """
+                INSERT INTO candidate_groups(
+                    id, app_id, seed_object_id, generator_version, suggested_title,
+                    suggested_type, generated_at
+                ) VALUES (?, 'sample_store', ?, 'fixture', ?, 'feature', ?)
+                """,
+                (
+                    f"candidate:orphan-{index:02d}",
+                    f"obj:orphan-{index:02d}",
+                    f"Orphan {index:02d}",
+                    f"2026-08-27T09:{index:02d}:00+00:00",
+                ),
+            )
+            connection.execute(
+                "INSERT INTO candidate_members VALUES (?, ?, 'seed', 0)",
+                (f"candidate:orphan-{index:02d}", f"obj:orphan-{index:02d}"),
+            )
+        connection.commit()
+
+        assert [candidate.id for candidate in list_candidates(connection, "sample_store")] == [
+            "candidate:valid-tail"
+        ]
     finally:
         connection.close()

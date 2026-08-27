@@ -176,6 +176,11 @@ class EvidenceRepository:
                 FROM source_object_availability_events event
                 JOIN ranked_authoritative_runs eligible_run
                   ON eligible_run.id=event.sync_run_id
+                JOIN source_objects authority_object
+                  ON authority_object.id=event.source_object_id
+                 AND authority_object.app_id=eligible_run.app_id
+                 AND authority_object.source=eligible_run.source
+                 AND authority_object.source_instance=eligible_run.source_instance
                 JOIN affected_objects affected
                   ON affected.source_object_id=event.source_object_id
             ), current_events AS (
@@ -224,18 +229,41 @@ class EvidenceRepository:
         unavailable_objects: Iterable[AvailabilityObservation] = (),
     ) -> list[str]:
         observation_ids: list[str] = []
+        page_objects = tuple(objects)
+        page_unavailable = tuple(unavailable_objects)
         try:
             with self.connection:
                 run = self.connection.execute(
-                    "SELECT app_id, status FROM sync_runs WHERE id=?", (run_id,)
+                    "SELECT app_id, source, source_instance, status FROM sync_runs WHERE id=?",
+                    (run_id,),
                 ).fetchone()
                 if run is None or str(run["status"]) != "running":
                     raise DatabaseError("page requires a running sync run")
-                for item in objects:
+                for item in page_objects:
                     if item.app_id != str(run["app_id"]):
                         raise DatabaseError("source page escaped its configured application scope")
+                    if (
+                        item.identity.source != str(run["source"])
+                        or item.identity.source_instance != str(run["source_instance"])
+                        or any(
+                            actor.source != str(run["source"])
+                            or actor.source_instance != str(run["source_instance"])
+                            for actor in item.actors
+                        )
+                    ):
+                        raise DatabaseError(
+                            "source page escaped its configured sync-run source scope"
+                        )
+                for unavailable in page_unavailable:
+                    if unavailable.source != str(
+                        run["source"]
+                    ) or unavailable.source_instance != str(run["source_instance"]):
+                        raise DatabaseError(
+                            "source page escaped its configured sync-run source scope"
+                        )
+                for item in page_objects:
                     observation_ids.append(self._store_object(run_id, item))
-                for unavailable in unavailable_objects:
+                for unavailable in page_unavailable:
                     self._record_object_unavailable(run_id, unavailable)
                 if progress is not None:
                     self.update_run_progress(run_id, progress)
@@ -550,7 +578,7 @@ class EvidenceRepository:
             str(run["source"]) != unavailable.source
             or str(run["source_instance"]) != unavailable.source_instance
         ):
-            raise DatabaseError("availability event escaped its source scope")
+            raise DatabaseError("availability event escaped its sync-run source scope")
         validation_redactor = self.redactor or Redactor(b"worktrace-validation-only")
         external_id = validation_redactor.protect_identifier(
             unavailable.external_id,

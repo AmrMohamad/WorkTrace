@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from worktrace.adapters.base import (
     NormalizedPage,
     NormalizedRecord,
@@ -290,5 +292,68 @@ def test_selection_events_mark_run_and_affected_observation_selection_biased(
             (result.run_id,),
         ).fetchone()
         assert observation["completeness"] == "selection_biased"
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("record_source", "record_instance"),
+    [("jira", "jira-main"), ("git", "other-repository")],
+)
+def test_record_identity_cannot_escape_import_run_source_scope(
+    tmp_path: Path,
+    record_source: str,
+    record_instance: str,
+) -> None:
+    connection, repository = _repository(tmp_path)
+    try:
+        mismatched = build_record(
+            source_kind=record_source,
+            source_instance=record_instance,
+            object_type="issue" if record_source == "jira" else "commit",
+            external_id="DEMO-999" if record_source == "jira" else "b" * 40,
+            app_id="sample_store",
+            observed_at="2026-01-11T12:00:00Z",
+            source_updated_at="2026-01-10T10:00:00Z",
+            payload={"title": "Borrowed source authority"},
+            redactor=Redactor(email_key=b"fixture-only-key"),
+        )
+        page = NormalizedPage(
+            source_kind="git",
+            source_instance="fixture-repository",
+            resource_type="commits",
+            cursor=None,
+            next_cursor=None,
+            is_last=True,
+            records=(mismatched,),
+        )
+
+        result = import_snapshot(
+            _app(),
+            StaticAdapter((page,)),
+            repository,
+            source="git",
+            source_instance="fixture-repository",
+            date_from=date(2026, 1, 1),
+            date_to=date(2026, 1, 31),
+        )
+
+        assert result.status == "partial"
+        assert result.pages == 0
+        assert result.records == 0
+        assert result.error == "adapter record escaped its configured source scope"
+        assert connection.execute("SELECT COUNT(*) FROM source_objects").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM source_object_availability_events").fetchone()[
+                0
+            ]
+            == 0
+        )
+        run = connection.execute(
+            "SELECT status, completeness, progress_json FROM sync_runs WHERE id=?",
+            (result.run_id,),
+        ).fetchone()
+        assert tuple(run) == ("failed", "partial", "{}")
     finally:
         connection.close()

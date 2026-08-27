@@ -24,6 +24,7 @@ from worktrace.config import (
     jira_credentials,
     load_config,
 )
+from worktrace.db.authority import authoritative_current_participation_ctes
 from worktrace.db.connection import connect
 from worktrace.db.migrations import backup_database, migrate
 from worktrace.db.queries import search_evidence, source_status
@@ -179,8 +180,9 @@ def _relevant_git_commit_shas(
         str(row["source_object_id"])
         for row in repository.connection.execute(
             f"""
+            WITH {authoritative_current_participation_ctes()}
             SELECT DISTINCT p.source_object_id
-            FROM participations p
+            FROM authoritative_current_participations p
             JOIN actors a ON a.id=p.actor_id
             JOIN source_objects so ON so.id=p.source_object_id
             WHERE so.app_id=? AND so.source='git' AND so.kind='git_commit'

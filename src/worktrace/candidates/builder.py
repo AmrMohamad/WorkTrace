@@ -5,7 +5,10 @@ import sqlite3
 from collections import deque
 from datetime import UTC, datetime
 
-from worktrace.db.authority import supporting_observation_is_authoritative
+from worktrace.db.authority import (
+    authoritative_current_participation_ctes,
+    authoritative_current_reference_ctes,
+)
 from worktrace.db.repository import EvidenceRepository, stable_id
 from worktrace.participation import (
     ParticipationCategory,
@@ -42,12 +45,12 @@ SEED_PRIORITY = {"jira_issue": 0, "gitlab_mr": 1, "git_commit": 2, "manual_evide
 def _self_roles(
     connection: sqlite3.Connection,
     app_id: str,
-    current_observation_ids: frozenset[str],
 ) -> dict[str, set[str]]:
     rows = connection.execute(
-        """
+        f"""
+        WITH {authoritative_current_participation_ctes()}
         SELECT p.source_object_id, p.observation_id, p.role, so.source, so.kind
-        FROM participations p
+        FROM authoritative_current_participations p
         JOIN actors a ON a.id=p.actor_id
         JOIN source_objects so ON so.id=p.source_object_id
         WHERE so.app_id=? AND a.is_self=1
@@ -56,17 +59,13 @@ def _self_roles(
     )
     result: dict[str, set[str]] = {}
     for row in rows:
-        if not supporting_observation_is_authoritative(
-            row["observation_id"], current_observation_ids
-        ):
-            continue
         result.setdefault(str(row["source_object_id"]), set()).add(
             canonical_role(str(row["source"]), str(row["kind"]), str(row["role"]))
         )
     return result
 
 
-def _suggest_type(kind: str, title: str) -> str:
+def suggest_contribution_type(kind: str, title: str) -> str:
     lowered = title.lower()
     if "bug" in lowered or "fix" in lowered or "crash" in lowered:
         return "bug_fix"
@@ -101,17 +100,16 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
     connection = repository.connection
     current = repository.current_observations(app_id)
     objects = {str(row["source_object_id"]): row for row in current}
-    current_observation_ids = frozenset(str(row["id"]) for row in current)
-    references = [
-        row
-        for row in connection.execute(
-            'SELECT * FROM "references" WHERE app_id=? ORDER BY id',
+    references = list(
+        connection.execute(
+            f"""
+            WITH {authoritative_current_reference_ctes()}
+            SELECT * FROM authoritative_current_references
+            WHERE app_id=? ORDER BY id
+            """,
             (app_id,),
         )
-        if supporting_observation_is_authoritative(
-            row["supporting_observation_id"], current_observation_ids
-        )
-    ]
+    )
     mr_with_changed_paths: set[str] = set()
     for relation in references:
         if str(relation["relationship_type"]) != "gitlab_mr_changed_paths":
@@ -132,7 +130,7 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
             and _has_complete_changed_paths(objects[left])
         ):
             mr_with_changed_paths.add(right)
-    roles = _self_roles(connection, app_id, current_observation_ids)
+    roles = _self_roles(connection, app_id)
     linked_ids = {
         object_id
         for row in references
@@ -250,7 +248,7 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
                     seed,
                     GENERATOR_VERSION,
                     title,
-                    _suggest_type(str(row["kind"]), title),
+                    suggest_contribution_type(str(row["kind"]), title),
                     "needs_manual_narrowing" if overflow else "candidate",
                     generated,
                 ),

@@ -11,15 +11,16 @@ from worktrace.candidates.projector import CandidateView, project_candidate
 from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.constants import DEFAULT_EXCERPT_CHARS, STALE_AFTER_DAYS
 from worktrace.db.authority import (
+    authoritative_availability_event_ctes,
+    authoritative_current_availability_ctes,
     authoritative_current_observation_ctes,
-    authoritative_current_observation_ids,
-    authoritative_current_run_ctes,
+    authoritative_current_participation_ctes,
+    authoritative_current_reference_ctes,
     completeness_is_full_scope,
     parse_scope,
     run_authority_limitation,
     run_is_authoritative,
     selection_policy_version,
-    supporting_observation_is_authoritative,
 )
 from worktrace.domain.enums import ClaimStatus, ObservationType
 from worktrace.errors import NotFound, ScopeViolation
@@ -287,18 +288,15 @@ class PacketBuilder:
     def _record_for_object(self, object_id: str, context_only: bool) -> EvidenceRecord | None:
         row = self.connection.execute(
             f"""
-            WITH {authoritative_current_observation_ctes()}
+            WITH {authoritative_current_observation_ctes()},
+                 {authoritative_availability_event_ctes()}
             SELECT current.*, so.app_id, so.source, so.source_instance, so.kind, so.external_id,
                 so.availability, so.availability_reason, so.availability_observed_at,
                 (
                     SELECT event.id
-                    FROM source_object_availability_events event
-                    JOIN ranked_authoritative_runs eligible_run
-                      ON eligible_run.id=event.sync_run_id
+                    FROM authoritative_current_availability_events event
                     WHERE event.source_object_id=so.id
-                      AND event.state=so.availability
-                      AND event.observed_at=so.availability_observed_at
-                    ORDER BY event.observed_at DESC, event.id DESC LIMIT 1
+                    LIMIT 1
                 ) AS availability_evidence_id
             FROM authoritative_current_observations current
             JOIN source_objects so ON so.id=current.source_object_id
@@ -457,25 +455,21 @@ class PacketBuilder:
         member_ids = sorted(contribution.member_ids | contribution.context_ids)
         contradictions: list[dict[str, object]] = []
         if member_ids:
-            current_observation_ids = authoritative_current_observation_ids(
-                self.connection, contribution.app_id
-            )
             placeholders = ",".join("?" for _ in member_ids)
             rows = self.connection.execute(
                 f"""
+                WITH {authoritative_current_reference_ctes()}
                 SELECT id, relationship_type, supporting_observation_id
-                FROM "references"
-                WHERE from_object_id IN ({placeholders}) AND to_object_id IN ({placeholders})
+                FROM authoritative_current_references
+                WHERE app_id=?
+                    AND from_object_id IN ({placeholders})
+                    AND to_object_id IN ({placeholders})
                     AND lower(relationship_type) LIKE '%revert%'
                 ORDER BY id
                 """,
-                [*member_ids, *member_ids],
+                [contribution.app_id, *member_ids, *member_ids],
             )
             for row in rows:
-                if not supporting_observation_is_authoritative(
-                    row["supporting_observation_id"], current_observation_ids
-                ):
-                    continue
                 evidence = [str(row["id"])]
                 if row["supporting_observation_id"]:
                     evidence.append(str(row["supporting_observation_id"]))
@@ -497,7 +491,7 @@ class PacketBuilder:
                     {
                         "kind": "closed_without_merge",
                         "statement": "GitLab recorded a closed merge request, not a merged one.",
-                        "evidence_ids": [record.availability_evidence_id or record.evidence_id],
+                        "evidence_ids": [record.evidence_id],
                     }
                 )
             if record.availability != "visible":
@@ -520,25 +514,11 @@ class PacketBuilder:
             placeholders = ",".join("?" for _ in unavailable_member_ids)
             unavailable_rows = self.connection.execute(
                 f"""
-                WITH {authoritative_current_run_ctes()},
-                ranked_availability AS (
-                    SELECT event.*,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY event.source_object_id
-                            ORDER BY eligible_run.completed_at DESC,
-                                     event.observed_at DESC, event.id DESC
-                        ) AS position
-                    FROM source_object_availability_events event
-                    JOIN ranked_authoritative_runs eligible_run
-                      ON eligible_run.id=event.sync_run_id
-                    WHERE event.source_object_id IN ({placeholders})
-                )
+                WITH {authoritative_current_availability_ctes()}
                 SELECT event.id, event.source_object_id, event.reason, event.observed_at
-                FROM ranked_availability event
-                JOIN source_objects object ON object.id=event.source_object_id
-                WHERE event.position=1 AND event.state='unavailable'
-                  AND object.availability='unavailable'
-                  AND object.availability_observed_at=event.observed_at
+                FROM authoritative_current_availability_events event
+                WHERE event.source_object_id IN ({placeholders})
+                  AND event.state='unavailable'
                 ORDER BY event.source_object_id
                 """,
                 unavailable_member_ids,
@@ -1353,7 +1333,7 @@ class PacketBuilder:
             parameters.extend(source_types)
         if actor_id:
             clauses.append(
-                "EXISTS (SELECT 1 FROM participations p "
+                "EXISTS (SELECT 1 FROM authoritative_current_participations p "
                 "WHERE p.observation_id=latest.id AND p.actor_id=?)"
             )
             parameters.append(actor_id)
@@ -1371,7 +1351,7 @@ class PacketBuilder:
         rows = list(
             self.connection.execute(
                 f"""
-                WITH {authoritative_current_observation_ctes()}
+                WITH {authoritative_current_participation_ctes()}
                 SELECT latest.*, so.source, so.source_instance, so.kind, so.external_id
                 FROM authoritative_current_observations latest
                 JOIN source_objects so ON so.id=latest.source_object_id
@@ -1451,11 +1431,12 @@ class PacketBuilder:
             }
         participation = self.connection.execute(
             f"""
-            WITH {authoritative_current_observation_ctes()}
+            WITH {authoritative_current_participation_ctes()}
             SELECT p.*, a.display_name, a.is_self, so.app_id, so.source, so.kind,
                    so.external_id, sr.status AS run_status,
                    sr.completeness AS run_completeness
-            FROM participations p JOIN actors a ON a.id=p.actor_id
+            FROM authoritative_current_participations p
+            JOIN actors a ON a.id=p.actor_id
             JOIN source_objects so ON so.id=p.source_object_id
             JOIN authoritative_current_observations o ON o.id=p.observation_id
             JOIN sync_runs sr ON sr.id=o.sync_run_id
@@ -1480,6 +1461,40 @@ class PacketBuilder:
                 "effective_to": participation["effective_to"],
                 "run_status": str(participation["run_status"]),
                 "run_completeness": str(participation["run_completeness"]),
+                "authoritative_current": True,
+                "source_status": self.source_status(app_id),
+            }
+        availability = self.connection.execute(
+            f"""
+            WITH {authoritative_current_availability_ctes()}
+            SELECT event.*, object.app_id, object.source, object.source_instance,
+                   object.kind, object.external_id, run.status AS run_status,
+                   run.completeness AS run_completeness
+            FROM authoritative_current_availability_events event
+            JOIN source_objects object ON object.id=event.source_object_id
+            JOIN sync_runs run ON run.id=event.sync_run_id
+            WHERE event.id=?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        if availability is not None:
+            app_id = str(availability["app_id"])
+            self._app(app_id)
+            return {
+                "evidence_id": evidence_id,
+                "object_id": str(availability["source_object_id"]),
+                "app_id": app_id,
+                "content_type": "availability_evidence",
+                "source": str(availability["source"]),
+                "source_instance": str(availability["source_instance"]),
+                "kind": str(availability["kind"]),
+                "external_id": str(availability["external_id"]),
+                "state": str(availability["state"]),
+                "reason": str(availability["reason"]),
+                "observed_at": str(availability["observed_at"]),
+                "as_of": str(availability["observed_at"]),
+                "run_status": str(availability["run_status"]),
+                "run_completeness": str(availability["run_completeness"]),
                 "authoritative_current": True,
                 "source_status": self.source_status(app_id),
             }
@@ -1524,16 +1539,15 @@ class PacketBuilder:
                 "source_status": self.source_status(app_id),
             }
         reference = self.connection.execute(
-            'SELECT * FROM "references" WHERE id=?', (evidence_id,)
+            f"""
+            WITH {authoritative_current_reference_ctes()}
+            SELECT * FROM authoritative_current_references WHERE id=?
+            """,
+            (evidence_id,),
         ).fetchone()
         if reference is not None:
             app_id = str(reference["app_id"])
             self._app(app_id)
-            current_observation_ids = authoritative_current_observation_ids(self.connection, app_id)
-            if not supporting_observation_is_authoritative(
-                reference["supporting_observation_id"], current_observation_ids
-            ):
-                raise NotFound(f"evidence not found: {evidence_id}")
             return {
                 "evidence_id": evidence_id,
                 "app_id": app_id,

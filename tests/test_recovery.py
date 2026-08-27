@@ -153,3 +153,61 @@ def test_failed_page_transaction_does_not_leave_partial_rows(tmp_path: Path) -> 
         assert connection.execute("SELECT COUNT(*) FROM source_objects").fetchone()[0] == 0
     finally:
         connection.close()
+
+
+def test_source_mismatched_page_rolls_back_every_derived_row(tmp_path: Path) -> None:
+    database_path = tmp_path / "worktrace.sqlite3"
+    connection = connect(database_path)
+    try:
+        migrate(connection, database_path)
+        connection.execute(
+            "INSERT INTO apps(id, name, market, business_type) VALUES (?, ?, '', '')",
+            ("sample_store", "Sample Store"),
+        )
+        connection.commit()
+        repository = EvidenceRepository(connection)
+        run_id = repository.start_sync_run(
+            "sample_store", "git", "fixture-repository", {"mode": "fixture"}
+        )
+
+        mismatched = _object(title="Borrowed remote authority")
+        mismatched = NormalizedObject(
+            identity=SourceIdentity(
+                source="jira",
+                source_instance="jira-main",
+                kind="jira_issue",
+                external_id="DEMO-999",
+            ),
+            app_id=mismatched.app_id,
+            title=mismatched.title,
+            body_text=mismatched.body_text,
+            source_updated_at=mismatched.source_updated_at,
+            actors=mismatched.actors,
+            participations=mismatched.participations,
+            pending_references=mismatched.pending_references,
+            data=mismatched.data,
+            completeness=mismatched.completeness,
+        )
+
+        with pytest.raises(DatabaseError, match="sync-run source scope"):
+            repository.store_page(
+                run_id,
+                [_object(title="Valid before mismatch"), mismatched],
+                {"pages": 1, "records": 2},
+            )
+
+        for table in (
+            "source_objects",
+            "observations",
+            "actors",
+            "participations",
+            "references",
+            "source_object_availability_events",
+        ):
+            assert connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0] == 0
+        run = connection.execute(
+            "SELECT status, progress_json FROM sync_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert tuple(run) == ("running", "{}")
+    finally:
+        connection.close()
