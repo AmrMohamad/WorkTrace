@@ -1,0 +1,32 @@
+{
+  "startAt": 0,
+  "maxResults": 3,
+  "total": 3,
+  "isLast": true,
+  "values": [
+    {
+      "id": "12001",
+      "author": {"accountId": "actor-manager", "displayName": "Fixture Manager"},
+      "created": "2026-01-05T08:45:00.000+0000",
+      "items": [
+        {"field": "assignee", "fieldtype": "jira", "from": null, "fromString": null, "to": "actor-self", "toString": "Fixture Engineer"}
+      ]
+    },
+    {
+      "id": "12002",
+      "author": {"accountId": "actor-manager", "displayName": "Fixture Manager"},
+      "created": "2026-01-12T12:00:00.000+0000",
+      "items": [
+        {"field": "assignee", "fieldtype": "jira", "from": "actor-self", "fromString": "Fixture Engineer", "to": "actor-other", "toString": "Fixture Collaborator"}
+      ]
+    },
+    {
+      "id": "12003",
+      "author": {"accountId": "actor-other", "displayName": "Fixture Collaborator"},
+      "created": "2026-01-14T16:20:00.000+0000",
+      "items": [
+        {"field": "status", "fieldtype": "jira", "from": "2", "fromString": "In Progress", "to": "3", "toString": "Done"}
+      ]
+    }
+  ]
+}

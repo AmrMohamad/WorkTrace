@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime
+
+from worktrace.adapters.base import NormalizedRecord, SnapshotAdapter
+from worktrace.config import AppConfig
+from worktrace.db.repository import EvidenceRepository
+from worktrace.domain.enums import Completeness
+from worktrace.domain.models import (
+    ActorObservation,
+    AvailabilityObservation,
+    JsonValue,
+    NormalizedObject,
+    ParticipationObservation,
+    PendingReference,
+    SourceIdentity,
+)
+from worktrace.errors import SourceError
+from worktrace.participation import canonical_role
+
+
+@dataclass(frozen=True)
+class ImportResult:
+    session_id: str
+    run_id: str
+    status: str
+    pages: int
+    records: int
+    error: str | None = None
+
+
+def _timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _role(source: str, object_type: str, value: str) -> str:
+    return canonical_role(source, _kind(source, object_type), value)
+
+
+def _kind(source: str, object_type: str) -> str:
+    aliases = {
+        ("git", "commit"): "git_commit",
+        ("git", "ref"): "git_tag",
+        ("jira", "issue"): "jira_issue",
+        ("gitlab", "merge_request"): "gitlab_mr",
+        ("gitlab", "deployment"): "git_deployment",
+        ("gitlab", "release"): "gitlab_release",
+        ("gitlab", "discussion"): "gitlab_discussion",
+    }
+    return aliases.get((source, object_type), f"{source}_{object_type}")
+
+
+def record_to_object(
+    record: NormalizedRecord,
+    self_actor_ids: set[str],
+    self_display_names: set[str] | None = None,
+) -> NormalizedObject:
+    identity = record.identity
+    payload = dict(record.payload)
+    payload["_untrusted_text_fields"] = list(record.untrusted_text_fields)
+    normalized_kind = _kind(identity.source_kind, identity.object_type)
+    if identity.source_kind == "git" and identity.object_type == "ref":
+        normalized_kind = "git_tag" if payload.get("ref_kind") == "tag" else "git_branch"
+    title = next(
+        (
+            str(payload[key])
+            for key in ("title", "summary", "subject", "name", "ref_name")
+            if isinstance(payload.get(key), str)
+        ),
+        None,
+    )
+    body = next(
+        (
+            str(payload[key])
+            for key in ("description", "body", "comment", "notes")
+            if isinstance(payload.get(key), str)
+        ),
+        None,
+    )
+    actors: dict[str, ActorObservation] = {}
+    participations: list[ParticipationObservation] = []
+    for item in record.participations:
+        actor = item.actor
+        actors.setdefault(
+            actor.source_actor_id,
+            ActorObservation(
+                source=identity.source_kind,
+                source_instance=identity.source_instance,
+                external_actor_id=actor.source_actor_id,
+                display_name=actor.display_name or actor.username or "Unknown source actor",
+                email_hash=actor.email_hash,
+                is_self=(
+                    actor.source_actor_id in self_actor_ids
+                    or bool(
+                        actor.display_name
+                        and actor.display_name.casefold() in (self_display_names or set())
+                    )
+                ),
+            ),
+        )
+        participations.append(
+            ParticipationObservation(
+                actor_external_id=actor.source_actor_id,
+                role=_role(identity.source_kind, identity.object_type, item.role.value),
+                effective_from=_timestamp(item.effective_from),
+                effective_to=_timestamp(item.effective_to),
+            )
+        )
+    references = tuple(
+        PendingReference(
+            target_source=reference.target_source_kind or identity.source_kind,
+            target_kind=_kind(
+                reference.target_source_kind or identity.source_kind,
+                reference.target_object_type or "unknown",
+            ),
+            target_external_id=reference.target_external_id,
+            relationship_type={
+                "jira_key_mention": "mentions_jira_key",
+                "git_ref_target": "tag_points_to_commit",
+                "git_parent": "git_parent_of",
+            }.get(reference.reference_type, reference.reference_type),
+            extraction_method=reference.strength.value,
+            exact_value=reference.target_external_id,
+        )
+        for reference in record.references
+    )
+    return NormalizedObject(
+        identity=SourceIdentity(
+            source=identity.source_kind,
+            source_instance=identity.source_instance,
+            kind=normalized_kind,
+            external_id=identity.external_id,
+            canonical_url=(
+                str(payload["web_url"]) if isinstance(payload.get("web_url"), str) else None
+            ),
+        ),
+        app_id=identity.app_id,
+        title=title,
+        body_text=body,
+        source_updated_at=_timestamp(record.observation.source_updated_at),
+        actors=tuple(actors.values()),
+        participations=tuple(participations),
+        pending_references=references,
+        data=payload,
+        completeness=Completeness.COMPLETE,
+    )
+
+
+def import_snapshot(
+    app: AppConfig,
+    adapter: SnapshotAdapter,
+    repository: EvidenceRepository,
+    *,
+    source: str,
+    source_instance: str,
+    date_from: date,
+    date_to: date,
+    self_actor_ids: set[str] | None = None,
+    self_display_names: set[str] | None = None,
+    import_session_id: str | None = None,
+    finish_session: bool = True,
+    scope_details: dict[str, JsonValue] | None = None,
+) -> ImportResult:
+    """Persist a full snapshot one page per transaction.
+
+    A run only becomes current after every adapter page completes. Failed runs
+    remain inspectable while the preceding complete run stays queryable.
+    """
+    if date_from > date_to:
+        raise ValueError("date_from must not be after date_to")
+    session_id = import_session_id or repository.create_import_session(app, date_from, date_to)
+    scope: dict[str, JsonValue] = {
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "selection_policy_version": 2,
+    }
+    if scope_details:
+        scope.update(scope_details)
+    run_id = repository.start_sync_run(
+        app.id,
+        source,
+        source_instance,
+        scope,
+        session_id,
+    )
+    pages = 0
+    records = 0
+    try:
+        for page in adapter.iter_pages():
+            if page.source_kind != source or page.source_instance != source_instance:
+                raise SourceError("adapter page escaped its configured source scope")
+            normalized = [
+                record_to_object(
+                    record,
+                    self_actor_ids or set(),
+                    self_display_names,
+                )
+                for record in page.records
+            ]
+            repository.store_page(
+                run_id,
+                normalized,
+                {
+                    "pages": pages + 1,
+                    "records": records + len(normalized),
+                    "resource_type": page.resource_type,
+                    "cursor": page.next_cursor,
+                },
+                unavailable_objects=(
+                    AvailabilityObservation(
+                        source=page.source_kind,
+                        source_instance=page.source_instance,
+                        kind=descriptor.kind,
+                        external_id=descriptor.external_id,
+                        reason=descriptor.reason,
+                    )
+                    for descriptor in page.unavailable_objects
+                ),
+            )
+            pages += 1
+            records += len(normalized)
+    except Exception as exc:
+        message = str(exc)[:500] or type(exc).__name__
+        repository.finish_sync_run(run_id, "failed", Completeness.PARTIAL.value, message)
+        if finish_session:
+            repository.finish_import_session(
+                session_id,
+                "partial",
+                {"source": source, "pages": pages, "records": records, "error": message},
+            )
+        return ImportResult(session_id, run_id, "partial", pages, records, message)
+    repository.finish_sync_run(run_id, "complete", Completeness.COMPLETE.value)
+    if finish_session:
+        repository.finish_import_session(
+            session_id,
+            "complete",
+            {"source": source, "pages": pages, "records": records},
+        )
+    return ImportResult(session_id, run_id, "complete", pages, records)

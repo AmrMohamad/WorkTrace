@@ -1,0 +1,41 @@
+schema_version = 1
+
+[data]
+directory = "~/Library/Application Support/WorkTrace"
+
+[employment]
+from = "2024-01-01"
+to = "2026-08-26"
+
+[identity]
+display_name = "Your Name"
+git_author_emails = ["you@example.invalid"]
+git_author_names = ["Your Name"]
+jira_account_id = "verified-jira-account-id"
+gitlab_user_id = 12345
+gitlab_username = "verified-gitlab-username"
+
+[[apps]]
+id = "sample_store_b2c"
+name = "Sample Store"
+market = "Global"
+business_type = "B2C commerce"
+jira_project_keys = ["DEMO"]
+gitlab_project_ids = [1234]
+repo_paths = ["/absolute/path/to/authorized/local/repository"]
+jira_key_patterns = ["DEMO-[0-9]+"]
+production_environments = ["production", "prod"]
+release_tag_patterns = ["v*", "[0-9]*"]
+ignored_paths = ["Pods/", "Carthage/", ".build/", "DerivedData/", "vendor/"]
+
+[[apps.module_rules]]
+pattern = "*/Checkout/*"
+module = "Checkout"
+
+[[apps.module_rules]]
+pattern = "*/Cart/*"
+module = "Cart"
+
+# Secrets belong only in the process environment:
+# WORKTRACE_JIRA_BASE_URL, WORKTRACE_JIRA_EMAIL, WORKTRACE_JIRA_API_TOKEN
+# WORKTRACE_GITLAB_BASE_URL, WORKTRACE_GITLAB_TOKEN
