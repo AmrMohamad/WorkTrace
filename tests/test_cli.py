@@ -94,7 +94,7 @@ def test_cli_help_init_status_search_export_and_confirmed_purge(
     assert exported.exit_code == 0, exported.stdout
     assert json.loads(exported.stdout)["objects"] == 0
     payload = json.loads(destination.read_text(encoding="utf-8"))
-    assert payload["schema"] == "worktrace-export-v2"
+    assert payload["schema"] == "worktrace-export-v3"
     assert payload["app_id"] == "sample_store"
 
     refused = runner.invoke(app, ["purge", "--config", str(config)])

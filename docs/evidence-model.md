@@ -79,6 +79,12 @@ Candidate groups are bounded, deterministic, rebuildable suggestions. Their stab
 
 Candidate rebuilds may delete and recreate derived references and suggestions. Confirmed contributions and membership changes are projected from append-only human decisions. The decision stream records action, target, payload, local actor label, timestamp, and an optional undo target. Undo is a compensating `undo_decision` event.
 
+## Private export v3
+
+`worktrace-export-v3` exports authoritative-current ledger rows plus a claim-safe projection of candidate and decision history. `candidate_groups.seed_object_id` is populated only when the immutable identity seed is present in the exported current object set. When display metadata is deterministically reselected from another eligible member, `metadata_source_object_id` names that current object and `unsupported_seed_object_id` preserves the non-citable identity seed as an explicit unsupported stable ID.
+
+`human_decisions` contains the complete in-app append-only closure for exported candidates, contributions, source objects, and their undo chains. Creation snapshots (`confirm_candidate`, `merge_contributions`, and `split_contribution`) remain exportable after deterministic candidate rebuilds delete their derived row. `unsupported_contribution_history` carries only human-supplied title/state, stable unsupported member IDs, and decision IDs; it never hydrates quarantined provider metadata or evidence. A creation payload is in scope only when its surviving candidate or resolvable snapshot members establish exactly the requested app; its declared `app_id` cannot override that ownership.
+
 ## Evidence dimensions
 
 WorkTrace does not collapse evidence quality into a numeric confidence score.

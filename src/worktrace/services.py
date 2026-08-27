@@ -6,7 +6,12 @@ import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from worktrace.candidates.decisions import active_decisions
+from worktrace.candidates.decisions import (
+    CREATION_ACTIONS,
+    active_decisions,
+    creation_decision_scope_app,
+    snapshot_member_ids,
+)
 from worktrace.candidates.projector import CandidateView, project_candidate
 from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.db.authority import (
@@ -68,6 +73,44 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
     def placeholders(values: list[str]) -> str:
         return ",".join("?" for _ in values) or "NULL"
 
+    all_decisions = [
+        dict(row)
+        for row in connection.execute("SELECT * FROM human_decisions ORDER BY created_at, id")
+    ]
+    decision_payloads: dict[str, dict[str, object]] = {}
+    for decision in all_decisions:
+        try:
+            raw_payload = json.loads(str(decision["payload_json"]))
+        except json.JSONDecodeError:
+            raw_payload = {}
+        decision_payloads[str(decision["id"])] = (
+            raw_payload if isinstance(raw_payload, dict) else {}
+        )
+
+    valid_creation_decisions = [
+        decision
+        for decision in all_decisions
+        if str(decision["action"]) in CREATION_ACTIONS
+        and creation_decision_scope_app(
+            connection,
+            str(decision["target_id"]),
+            decision_payloads[str(decision["id"])],
+        )
+        == app_id
+        and isinstance(decision_payloads[str(decision["id"])].get("contribution_id"), str)
+        and decision_payloads[str(decision["id"])]["contribution_id"]
+    ]
+    valid_creation_ids = {str(decision["id"]) for decision in valid_creation_decisions}
+    history_candidate_ids = {str(decision["target_id"]) for decision in valid_creation_decisions}
+    contribution_ids = {
+        str(decision_payloads[str(decision["id"])]["contribution_id"])
+        for decision in valid_creation_decisions
+    }
+    scoped_source_object_ids = {
+        str(row[0])
+        for row in connection.execute("SELECT id FROM source_objects WHERE app_id=?", (app_id,))
+    }
+
     candidate_rows = list(
         connection.execute(
             "SELECT * FROM candidate_groups WHERE app_id=? ORDER BY generated_at, id",
@@ -81,7 +124,7 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
             projected = project_candidate(connection, str(candidate_row["id"]))
         except NotFound:
             continue
-        if projected.seed_object_id is None:
+        if projected.metadata_source_object_id is None:
             if projected.status == "confirmed":
                 unsupported_candidates.append((candidate_row, projected))
             continue
@@ -91,14 +134,31 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
     decision_roots = {
         *candidate_ids,
         *(projected.id for _, projected in unsupported_candidates),
+        *history_candidate_ids,
         *object_ids,
     }
-    all_decisions = [
-        dict(row)
-        for row in connection.execute("SELECT * FROM human_decisions ORDER BY created_at, id")
-    ]
     included_decision_ids: set[str] = set()
-    contribution_ids: set[str] = set()
+
+    def decision_is_scoped(decision: dict[str, object]) -> bool:
+        decision_id = str(decision["id"])
+        action = str(decision["action"])
+        payload_data = decision_payloads[decision_id]
+        if action in CREATION_ACTIONS:
+            return decision_id in valid_creation_ids
+        if action in {"add_member", "remove_member", "mark_context_only"}:
+            source_object_id = payload_data.get("source_object_id")
+            return (
+                isinstance(source_object_id, str) and source_object_id in scoped_source_object_ids
+            )
+        if action == "merge":
+            return (
+                creation_decision_scope_app(connection, str(decision["target_id"]), payload_data)
+                == app_id
+            )
+        if action == "split":
+            return snapshot_member_ids(payload_data) <= scoped_source_object_ids
+        return True
+
     changed = True
     while changed:
         changed = False
@@ -109,48 +169,29 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
             undo_target_id = (
                 str(decision["undo_target_id"]) if decision.get("undo_target_id") else None
             )
+            if str(decision["action"]) in {"undo", "undo_decision"}:
+                if (
+                    target_id in scoped_targets
+                    and undo_target_id in included_decision_ids
+                    and decision_id not in included_decision_ids
+                ):
+                    included_decision_ids.add(decision_id)
+                    changed = True
+                continue
             if (
                 target_id not in scoped_targets
                 and decision_id not in included_decision_ids
                 and undo_target_id not in included_decision_ids
             ):
                 continue
+            if not decision_is_scoped(decision):
+                continue
             if decision_id not in included_decision_ids:
                 included_decision_ids.add(decision_id)
                 changed = True
-            if str(decision["action"]) in {
-                "confirm_candidate",
-                "merge_contributions",
-                "split_contribution",
-            }:
-                try:
-                    raw_payload = json.loads(str(decision["payload_json"]))
-                except json.JSONDecodeError:
-                    raw_payload = {}
-                payload_data = raw_payload if isinstance(raw_payload, dict) else {}
-                contribution_id = payload_data.get("contribution_id")
-                if (
-                    isinstance(contribution_id, str)
-                    and contribution_id
-                    and contribution_id not in contribution_ids
-                ):
-                    contribution_ids.add(contribution_id)
-                    changed = True
-        for decision in all_decisions:
-            decision_id = str(decision["id"])
-            undo_target_id = (
-                str(decision["undo_target_id"]) if decision.get("undo_target_id") else None
-            )
-            if (
-                decision_id in included_decision_ids
-                and undo_target_id
-                and undo_target_id not in included_decision_ids
-            ):
-                included_decision_ids.add(undo_target_id)
-                changed = True
 
     payload: dict[str, object] = {
-        "schema": "worktrace-export-v2",
+        "schema": "worktrace-export-v3",
         "app_id": app_id,
         "exported_at": datetime.now(UTC).isoformat(),
         "warning": "Source text is untrusted; review this private export before sharing.",
@@ -243,7 +284,13 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         {
             "id": projected.id,
             "app_id": projected.app_id,
-            "seed_object_id": projected.seed_object_id,
+            "seed_object_id": (
+                projected.seed_object_id if projected.seed_object_id in object_ids else None
+            ),
+            "metadata_source_object_id": projected.metadata_source_object_id,
+            "unsupported_seed_object_id": (
+                projected.seed_object_id if projected.seed_object_id not in object_ids else None
+            ),
             "generator_version": str(row["generator_version"]),
             "suggested_title": projected.title,
             "suggested_type": projected.contribution_type,
@@ -269,36 +316,66 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
     ]
 
     unsupported_history: list[dict[str, object]] = []
-    for _, projected in unsupported_candidates:
+    projected_by_id = {projected.id: projected for _, projected in unsupported_candidates}
+    current_candidate_ids = {projected.id for _, projected in projected_candidates}
+    creations_by_candidate: dict[str, list[dict[str, object]]] = {}
+    for decision in valid_creation_decisions:
+        creations_by_candidate.setdefault(str(decision["target_id"]), []).append(decision)
+    for candidate_id in sorted(creations_by_candidate):
+        if candidate_id in current_candidate_ids:
+            continue
+        creations = creations_by_candidate[candidate_id]
+        active_creation_ids = {
+            decision.id
+            for decision in active_decisions(connection, candidate_id)
+            if decision.action in CREATION_ACTIONS
+            and creation_decision_scope_app(connection, candidate_id, decision.payload) == app_id
+        }
         creation = next(
             (
                 decision
-                for decision in reversed(active_decisions(connection, projected.id))
-                if decision.action
-                in {"confirm_candidate", "merge_contributions", "split_contribution"}
-                and isinstance(decision.payload.get("contribution_id"), str)
+                for decision in reversed(creations)
+                if str(decision["id"]) in active_creation_ids
             ),
-            None,
+            creations[-1],
         )
-        if creation is None:
-            continue
-        contribution_id = str(creation.payload["contribution_id"])
+        creation_id = str(creation["id"])
+        creation_payload = decision_payloads[creation_id]
+        contribution_id = str(creation_payload["contribution_id"])
         history_decision_ids = [
             str(decision["id"])
             for decision in all_decisions
             if str(decision["id"]) in included_decision_ids
-            and str(decision["target_id"]) in {projected.id, contribution_id}
+            and str(decision["target_id"]) in {candidate_id, contribution_id}
         ]
+        unsupported_projected = projected_by_id.get(candidate_id)
+        unsupported_member_ids = sorted(
+            (
+                set(unsupported_projected.unsupported_member_ids)
+                if unsupported_projected is not None
+                else snapshot_member_ids(creation_payload) & scoped_source_object_ids
+            )
+            - set(object_ids)
+        )
+        raw_title = creation_payload.get("title")
         unsupported_history.append(
             {
                 "app_id": app_id,
-                "candidate_id": projected.id,
+                "candidate_id": candidate_id,
                 "contribution_id": contribution_id,
                 "current_evidence_available": False,
                 "decision_ids": history_decision_ids,
-                "status": "confirmed_history_unsupported",
-                "title": projected.title,
-                "unsupported_member_ids": list(projected.unsupported_member_ids),
+                "status": (
+                    "confirmed_history_unsupported"
+                    if creation_id in active_creation_ids
+                    else "confirmed_history_undone"
+                ),
+                "title": (
+                    str(raw_title)
+                    if isinstance(raw_title, str) and raw_title
+                    else "Confirmed contribution history (current evidence unavailable)"
+                ),
+                "unsupported_member_ids": unsupported_member_ids,
             }
         )
     payload["unsupported_contribution_history"] = unsupported_history

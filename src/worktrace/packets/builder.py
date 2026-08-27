@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from typing import cast
 
+from worktrace.candidates.decisions import creation_decision_scope_app
 from worktrace.candidates.projector import CandidateView, project_candidate
 from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.constants import DEFAULT_EXCERPT_CHARS, STALE_AFTER_DAYS
@@ -213,6 +214,9 @@ class PacketBuilder:
                 and action in {"confirm_candidate", "merge_contributions", "split_contribution"}
             )
             if creates_identifier:
+                scoped_app = creation_decision_scope_app(self.connection, target_id, payload)
+                if scoped_app is None:
+                    continue
                 base_found = True
                 state.id = identifier
                 if action == "confirm_candidate":
@@ -226,8 +230,7 @@ class PacketBuilder:
                     state.title = str(payload["title"])
                 if isinstance(payload.get("type"), str):
                     state.contribution_type = str(payload["type"])
-                if isinstance(payload.get("app_id"), str):
-                    state.app_id = str(payload["app_id"])
+                state.app_id = scoped_app
 
             applies = target_id == identifier or creates_identifier
             if not applies:
@@ -282,6 +285,20 @@ class PacketBuilder:
                     "contribution members must belong to exactly one configured app"
                 )
             state.app_id = str(rows[0]["app_id"])
+        elif state.app_id and all_members:
+            placeholders = ",".join("?" for _ in all_members)
+            rows = list(
+                self.connection.execute(
+                    f"SELECT id, app_id FROM source_objects WHERE id IN ({placeholders})",
+                    sorted(all_members),
+                )
+            )
+            if len(rows) != len(all_members) or {str(row["app_id"]) for row in rows} != {
+                state.app_id
+            }:
+                raise ScopeViolation(
+                    "contribution members must belong to exactly one configured app"
+                )
         self._app(state.app_id)
         return state
 
@@ -494,7 +511,7 @@ class PacketBuilder:
                         "evidence_ids": [record.evidence_id],
                     }
                 )
-            if record.availability != "visible":
+            if record.availability != "visible" and record.availability_evidence_id:
                 contradictions.append(
                     {
                         "kind": "source_unavailable",
@@ -502,7 +519,7 @@ class PacketBuilder:
                             "A previously observed source object is no longer visible: "
                             f"{record.availability_reason or 'reason unknown'}."
                         ),
-                        "evidence_ids": [record.availability_evidence_id or record.evidence_id],
+                        "evidence_ids": [record.availability_evidence_id],
                         "observed_at": record.availability_observed_at,
                     }
                 )

@@ -5,7 +5,11 @@ import sqlite3
 from dataclasses import dataclass
 
 from worktrace.candidates.builder import SEED_PRIORITY, suggest_contribution_type
-from worktrace.candidates.decisions import active_decisions
+from worktrace.candidates.decisions import (
+    CREATION_ACTIONS,
+    active_decisions,
+    creation_decision_scope_app,
+)
 from worktrace.db.authority import authoritative_current_observations
 from worktrace.errors import NotFound
 
@@ -14,7 +18,8 @@ from worktrace.errors import NotFound
 class CandidateView:
     id: str
     app_id: str
-    seed_object_id: str | None
+    seed_object_id: str
+    metadata_source_object_id: str | None
     title: str
     contribution_type: str
     status: str
@@ -49,7 +54,17 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
     decisions = active_decisions(connection, candidate_id)
     for decision in decisions:
         payload = decision.payload
-        if decision.action in {"confirm", "confirm_candidate"}:
+        is_creation = (
+            decision.action in CREATION_ACTIONS
+            and isinstance(payload.get("contribution_id"), str)
+            and bool(payload["contribution_id"])
+        )
+        if decision.action == "confirm" or is_creation:
+            if (
+                is_creation
+                and creation_decision_scope_app(connection, candidate_id, payload) != app_id
+            ):
+                continue
             status = "confirmed"
             raw_members = payload.get("members")
             raw_context = payload.get("context_members")
@@ -149,13 +164,13 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
     has_authoritative_support = bool(eligible_member_ids)
     if not has_authoritative_support and status != "confirmed":
         raise NotFound(f"candidate has no authoritative current evidence: {candidate_id}")
-    seed_object_id: str | None = None
+    seed_object_id = str(row["seed_object_id"])
+    metadata_source_object_id: str | None = None
     if has_authoritative_support:
-        original_seed = str(row["seed_object_id"])
-        if original_seed in eligible_member_ids:
-            seed_object_id = original_seed
+        if seed_object_id in eligible_member_ids:
+            metadata_source_object_id = seed_object_id
         else:
-            seed_object_id = min(
+            metadata_source_object_id = min(
                 eligible_member_ids,
                 key=lambda object_id: (
                     bool(members[object_id].get("context_only")),
@@ -164,7 +179,7 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
                     object_id,
                 ),
             )
-        seed = current[seed_object_id]
+        seed = current[metadata_source_object_id]
         if not human_title:
             title = str(seed["title"] or seed["external_id"])
         if not human_type:
@@ -192,6 +207,7 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
         id=candidate_id,
         app_id=app_id,
         seed_object_id=seed_object_id,
+        metadata_source_object_id=metadata_source_object_id,
         title=title,
         contribution_type=contribution_type,
         status=status,

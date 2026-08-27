@@ -42,6 +42,71 @@ VALID_ACTIONS = {
     "undo_decision",
 }
 
+CREATION_ACTIONS = frozenset({"confirm_candidate", "merge_contributions", "split_contribution"})
+
+
+def snapshot_member_ids(payload: Mapping[str, object]) -> set[str]:
+    """Return every source-object identifier carried by a decision snapshot."""
+
+    result: set[str] = set()
+    for key in ("members", "context_members", "keep_source_object_ids"):
+        values = payload.get(key)
+        if isinstance(values, list):
+            result.update(str(value) for value in values if isinstance(value, str) and value)
+    return result
+
+
+def creation_decision_scope_app(
+    connection: sqlite3.Connection,
+    target_id: str,
+    payload: Mapping[str, object],
+) -> str | None:
+    """Resolve a creation snapshot to one app without trusting its payload alone."""
+
+    candidate = connection.execute(
+        "SELECT app_id FROM candidate_groups WHERE id=?", (target_id,)
+    ).fetchone()
+    candidate_app = str(candidate[0]) if candidate is not None else None
+    member_ids = sorted(snapshot_member_ids(payload))
+    related_apps: set[str] = set()
+    if member_ids:
+        placeholders = ",".join("?" for _ in member_ids)
+        related_apps.update(
+            str(row[0])
+            for row in connection.execute(
+                f"SELECT DISTINCT app_id FROM source_objects WHERE id IN ({placeholders})",
+                member_ids,
+            )
+        )
+    raw_candidate_ids = payload.get("candidate_ids")
+    candidate_ids = (
+        sorted(str(value) for value in raw_candidate_ids if isinstance(value, str) and value)
+        if isinstance(raw_candidate_ids, list)
+        else []
+    )
+    if candidate_ids:
+        placeholders = ",".join("?" for _ in candidate_ids)
+        related_apps.update(
+            str(row[0])
+            for row in connection.execute(
+                f"SELECT DISTINCT app_id FROM candidate_groups WHERE id IN ({placeholders})",
+                candidate_ids,
+            )
+        )
+    payload_app = payload.get("app_id")
+    declared_app = payload_app if isinstance(payload_app, str) and payload_app else None
+    if candidate_app is not None:
+        expected_app = candidate_app
+    elif len(related_apps) == 1:
+        expected_app = next(iter(related_apps))
+    else:
+        return None
+    if declared_app is not None and declared_app != expected_app:
+        return None
+    if any(app_id != expected_app for app_id in related_apps):
+        return None
+    return expected_app
+
 
 def append_decision(
     connection: sqlite3.Connection,

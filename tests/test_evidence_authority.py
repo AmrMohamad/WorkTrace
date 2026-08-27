@@ -1117,7 +1117,8 @@ def test_mixed_authority_candidate_reselects_canonical_seed_across_surfaces(
         connection.commit()
 
         projected = project_candidate(connection, "candidate:mixed-authority")
-        assert projected.seed_object_id == "obj:current-member"
+        assert projected.seed_object_id == "obj:legacy-seed"
+        assert projected.metadata_source_object_id == "obj:current-member"
         assert projected.title == "Current authoritative member"
         assert projected.contribution_type == "feature"
         assert [member["source_object_id"] for member in projected.members] == [
@@ -1138,7 +1139,11 @@ def test_mixed_authority_candidate_reselects_canonical_seed_across_surfaces(
         exported_text = export_path.read_text(encoding="utf-8")
         exported = json.loads(exported_text)
         assert "QUARANTINED LEGACY TITLE" not in exported_text
-        assert exported["candidate_groups"][0]["seed_object_id"] == "obj:current-member"
+        assert exported["candidate_groups"][0]["seed_object_id"] is None
+        assert exported["candidate_groups"][0]["metadata_source_object_id"] == (
+            "obj:current-member"
+        )
+        assert exported["candidate_groups"][0]["unsupported_seed_object_id"] == ("obj:legacy-seed")
         assert exported["candidate_groups"][0]["suggested_title"] == (
             "Current authoritative member"
         )
@@ -1324,6 +1329,7 @@ def test_export_preserves_app_scoped_decision_closure_and_unsupported_history(
             "WHERE candidate_id='candidate:eligible-export' "
             "AND source_object_id='obj:eligible-two'"
         )
+        connection.execute("DELETE FROM candidate_groups WHERE id='candidate:legacy-history'")
         connection.commit()
 
         export_path = tmp_path / "decision-closure-export.json"
@@ -1353,6 +1359,250 @@ def test_export_preserves_app_scoped_decision_closure_and_unsupported_history(
                 "unsupported_member_ids": ["obj:legacy-history"],
             }
         ]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("creation_action", ["merge_contributions", "split_contribution"])
+def test_export_preserves_rowless_unsupported_creation_history(
+    tmp_path: Path,
+    creation_action: str,
+) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:legacy-creation",
+            object_id="obj:legacy-creation",
+            observation_id="obs:legacy-creation",
+            status="complete",
+            scope={},
+            completed_at="2026-08-26T09:00:00+00:00",
+            title="QUARANTINED CREATION TITLE",
+            source_instance="jira-legacy-creation",
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:legacy-creation', 'sample_store',
+                      'obj:legacy-creation', 'fixture', 'QUARANTINED CREATION TITLE',
+                      'feature', '2026-08-26T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            "INSERT INTO candidate_members VALUES "
+            "('candidate:legacy-creation', 'obj:legacy-creation', 'seed', 0)"
+        )
+        connection.commit()
+        creation_id = append_decision(
+            connection,
+            creation_action,
+            "candidate:legacy-creation",
+            {
+                "contribution_id": f"contribution:{creation_action}",
+                "app_id": "sample_store",
+                "title": f"Human {creation_action} history",
+                "type": "feature",
+                "members": ["obj:legacy-creation"],
+            },
+        )
+        connection.execute("DELETE FROM candidate_groups WHERE id='candidate:legacy-creation'")
+        connection.commit()
+
+        export_path = tmp_path / f"{creation_action}-history.json"
+        export_app(connection, "sample_store", export_path)
+        exported_text = export_path.read_text(encoding="utf-8")
+        exported = json.loads(exported_text)
+
+        assert "QUARANTINED CREATION TITLE" not in exported_text
+        assert [row["id"] for row in exported["human_decisions"]] == [creation_id]
+        assert exported["unsupported_contribution_history"] == [
+            {
+                "app_id": "sample_store",
+                "candidate_id": "candidate:legacy-creation",
+                "contribution_id": f"contribution:{creation_action}",
+                "current_evidence_available": False,
+                "decision_ids": [creation_id],
+                "status": "confirmed_history_unsupported",
+                "title": f"Human {creation_action} history",
+                "unsupported_member_ids": ["obj:legacy-creation"],
+            }
+        ]
+    finally:
+        connection.close()
+
+
+def test_export_preserves_undone_rowless_confirmation_history(tmp_path: Path) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:legacy-undone",
+            object_id="obj:legacy-undone",
+            observation_id="obs:legacy-undone",
+            status="complete",
+            scope={},
+            completed_at="2026-08-26T09:00:00+00:00",
+            title="QUARANTINED UNDONE TITLE",
+            source_instance="jira-legacy-undone",
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:legacy-undone', 'sample_store', 'obj:legacy-undone',
+                      'fixture', 'QUARANTINED UNDONE TITLE', 'feature',
+                      '2026-08-26T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            "INSERT INTO candidate_members VALUES "
+            "('candidate:legacy-undone', 'obj:legacy-undone', 'seed', 0)"
+        )
+        connection.commit()
+        confirmation_id = append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:legacy-undone",
+            {
+                "contribution_id": "contribution:legacy-undone",
+                "app_id": "sample_store",
+                "title": "Human undone history",
+                "members": ["obj:legacy-undone"],
+            },
+        )
+        undo_id = undo_decision(connection, confirmation_id)
+        connection.execute("DELETE FROM candidate_groups WHERE id='candidate:legacy-undone'")
+        connection.commit()
+
+        export_path = tmp_path / "undone-history.json"
+        export_app(connection, "sample_store", export_path)
+        exported_text = export_path.read_text(encoding="utf-8")
+        exported = json.loads(exported_text)
+        assert "QUARANTINED UNDONE TITLE" not in exported_text
+        assert [row["id"] for row in exported["human_decisions"]] == [
+            confirmation_id,
+            undo_id,
+        ]
+        assert exported["unsupported_contribution_history"][0]["status"] == (
+            "confirmed_history_undone"
+        )
+        assert exported["unsupported_contribution_history"][0]["decision_ids"] == [
+            confirmation_id,
+            undo_id,
+        ]
+    finally:
+        connection.close()
+
+
+def test_cross_app_creation_payload_cannot_override_candidate_or_export_scope(
+    tmp_path: Path,
+) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:scoped-candidate",
+            object_id="obj:scoped-candidate",
+            observation_id="obs:scoped-candidate",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T10:00:00+00:00",
+            title="Scoped authoritative title",
+        )
+        connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:scoped', 'sample_store', 'obj:scoped-candidate',
+                      'fixture', 'Scoped authoritative title', 'feature',
+                      '2026-08-27T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            "INSERT INTO candidate_members VALUES "
+            "('candidate:scoped', 'obj:scoped-candidate', 'seed', 0)"
+        )
+        connection.commit()
+        invalid_decision = append_decision(
+            connection,
+            "confirm_candidate",
+            "candidate:scoped",
+            {
+                "contribution_id": "contribution:cross-app",
+                "app_id": "other_app",
+                "title": "PRIVATE OTHER APP TITLE",
+                "members": ["obj:scoped-candidate"],
+            },
+        )
+
+        projected = project_candidate(connection, "candidate:scoped")
+        assert projected.status == "candidate"
+        assert projected.title == "Scoped authoritative title"
+
+        export_path = tmp_path / "cross-app-decision.json"
+        export_app(connection, "sample_store", export_path)
+        exported_text = export_path.read_text(encoding="utf-8")
+        exported = json.loads(exported_text)
+        assert invalid_decision not in exported_text
+        assert "PRIVATE OTHER APP TITLE" not in exported_text
+        assert exported["human_decisions"] == []
+        assert exported["candidate_groups"][0]["status"] == "candidate"
+        assert exported["candidate_groups"][0]["suggested_title"] == ("Scoped authoritative title")
+    finally:
+        connection.close()
+
+
+def test_unproven_availability_never_falls_back_to_observation_citation(
+    tmp_path: Path,
+) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        _insert_remote_observation(
+            connection,
+            run_id="run:unproven-availability",
+            object_id="obj:unproven-availability",
+            observation_id="obs:unproven-availability",
+            status="complete",
+            scope={"selection_policy_version": 2},
+            completed_at="2026-08-27T10:00:00+00:00",
+            title="Unproven unavailable object",
+            data={"state": "opened"},
+        )
+        connection.execute(
+            """
+            UPDATE source_objects
+            SET availability='unavailable', availability_reason='direct_corruption',
+                availability_observed_at='2026-08-27T10:01:00+00:00'
+            WHERE id='obj:unproven-availability'
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_groups(
+                id, app_id, seed_object_id, generator_version, suggested_title,
+                suggested_type, generated_at
+            ) VALUES ('candidate:unproven-availability', 'sample_store',
+                      'obj:unproven-availability', 'fixture',
+                      'Unproven unavailable object', 'feature',
+                      '2026-08-27T10:00:00+00:00')
+            """
+        )
+        connection.execute(
+            "INSERT INTO candidate_members VALUES "
+            "('candidate:unproven-availability', 'obj:unproven-availability', 'seed', 0)"
+        )
+        connection.commit()
+
+        contradictions = PacketBuilder(connection, _config(tmp_path)).contribution_summary(
+            "candidate:unproven-availability"
+        )["contradictions"]
+        assert contradictions == []
     finally:
         connection.close()
 
