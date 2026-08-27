@@ -82,16 +82,18 @@ def _insert_remote_observation(
     source: str = "jira",
     kind: str = "jira_issue",
     data: dict[str, object] | None = None,
+    app_id: str = "sample_store",
 ) -> None:
     connection.execute(
         """
         INSERT INTO sync_runs(
             id, app_id, source, source_instance, status, started_at, completed_at,
             adapter_version, scope_json, completeness
-        ) VALUES (?, 'sample_store', ?, ?, ?, ?, ?, 'fixture', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'fixture', ?, ?)
         """,
         (
             run_id,
+            app_id,
             source,
             source_instance,
             status,
@@ -106,10 +108,10 @@ def _insert_remote_observation(
         INSERT INTO source_objects(
             id, app_id, source, source_instance, kind, external_id,
             first_seen_run_id, last_seen_run_id
-        ) VALUES (?, 'sample_store', ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET last_seen_run_id=excluded.last_seen_run_id
         """,
-        (object_id, source, source_instance, kind, object_id, run_id, run_id),
+        (object_id, app_id, source, source_instance, kind, object_id, run_id, run_id),
     )
     connection.execute(
         """
@@ -1943,6 +1945,246 @@ def test_confirm_merge_split_lineage_projects_one_canonical_contribution(
                 "obj:lineage-a",
                 "obj:lineage-b",
             }
+    finally:
+        connection.close()
+
+
+def test_export_preserves_rowless_secondary_alias_decision_lineage(
+    tmp_path: Path,
+) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        for index, suffix in enumerate(("a", "b", "c", "d"), start=8):
+            _insert_remote_observation(
+                connection,
+                run_id=f"run:export-lineage-{suffix}",
+                object_id=f"obj:export-lineage-{suffix}",
+                observation_id=f"obs:export-lineage-{suffix}",
+                status="complete",
+                scope={"selection_policy_version": 2},
+                completed_at=f"2026-08-27T{index:02d}:00:00+00:00",
+                title=f"Export lineage {suffix.upper()}",
+                source_instance=f"jira-export-lineage-{suffix}",
+            )
+            if suffix != "d":
+                _insert_candidate_fixture(
+                    connection,
+                    f"candidate:export-lineage-{suffix}",
+                    f"obj:export-lineage-{suffix}",
+                    f"Export lineage {suffix.upper()}",
+                )
+        connection.commit()
+
+        merge_id = append_decision(
+            connection,
+            "merge_contributions",
+            "candidate:export-lineage-a",
+            {
+                "contribution_id": "contribution:export-lineage-merged",
+                "candidate_ids": ["candidate:export-lineage-b"],
+                "app_id": "sample_store",
+                "title": "Merged export lineage",
+                "members": ["obj:export-lineage-a", "obj:export-lineage-b"],
+            },
+        )
+        split_id = append_decision(
+            connection,
+            "split_contribution",
+            "candidate:export-lineage-c",
+            {
+                "contribution_id": "contribution:export-lineage-split",
+                "candidate_ids": ["candidate:export-lineage-a"],
+                "app_id": "sample_store",
+                "title": "Split export lineage",
+                "members": [
+                    "obj:export-lineage-a",
+                    "obj:export-lineage-b",
+                    "obj:export-lineage-c",
+                ],
+                "keep_source_object_ids": [
+                    "obj:export-lineage-a",
+                    "obj:export-lineage-b",
+                    "obj:export-lineage-c",
+                ],
+            },
+        )
+        rename_id = append_decision(
+            connection,
+            "rename_contribution",
+            "candidate:export-lineage-b",
+            {"title": "Secondary alias title"},
+        )
+        add_id = append_decision(
+            connection,
+            "add_member",
+            "candidate:export-lineage-b",
+            {"source_object_id": "obj:export-lineage-d"},
+        )
+        remove_id = append_decision(
+            connection,
+            "remove_member",
+            "candidate:export-lineage-b",
+            {"source_object_id": "obj:export-lineage-a"},
+        )
+        undo_id = undo_decision(connection, remove_id)
+
+        # Candidate rows are a rebuildable projection. The secondary alias must remain
+        # authoritative through the immutable app-scoped decision lineage after rebuild.
+        connection.execute("DELETE FROM candidate_groups WHERE id='candidate:export-lineage-b'")
+        connection.commit()
+
+        summary = PacketBuilder(connection, _config(tmp_path)).contribution_summary(
+            "contribution:export-lineage-split"
+        )
+        assert summary["contribution"]["title"] == "Secondary alias title"
+        assert _summary_member_ids(summary) == {
+            "obj:export-lineage-a",
+            "obj:export-lineage-b",
+            "obj:export-lineage-c",
+            "obj:export-lineage-d",
+        }
+
+        export_path = tmp_path / "secondary-alias-lineage.json"
+        export_app(connection, "sample_store", export_path)
+        exported = json.loads(export_path.read_text(encoding="utf-8"))
+        assert {row["id"] for row in exported["human_decisions"]} == {
+            merge_id,
+            split_id,
+            rename_id,
+            add_id,
+            remove_id,
+            undo_id,
+        }
+        assert {row["id"] for row in exported["candidate_groups"]} == {
+            "candidate:export-lineage-a",
+            "candidate:export-lineage-c",
+        }
+        assert all(
+            row["candidate_id"] != "candidate:export-lineage-b"
+            for row in exported["candidate_members"]
+        )
+        assert exported["unsupported_contribution_history"] == []
+    finally:
+        connection.close()
+
+
+def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_closed(
+    tmp_path: Path,
+) -> None:
+    connection, _ = _ledger(tmp_path)
+    try:
+        connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
+        for app_id, suffix, hour in (
+            ("sample_store", "a", 8),
+            ("other_app", "b", 9),
+        ):
+            _insert_remote_observation(
+                connection,
+                run_id=f"run:alias-collision-{suffix}",
+                object_id=f"obj:alias-collision-{suffix}",
+                observation_id=f"obs:alias-collision-{suffix}",
+                status="complete",
+                scope={"selection_policy_version": 2},
+                completed_at=f"2026-08-27T{hour:02d}:00:00+00:00",
+                title=f"Alias collision {suffix.upper()}",
+                source_instance=f"jira-alias-collision-{suffix}",
+                app_id=app_id,
+            )
+            _insert_candidate_fixture(
+                connection,
+                f"candidate:alias-collision-{suffix}",
+                f"obj:alias-collision-{suffix}",
+                f"Alias collision {suffix.upper()}",
+                app_id=app_id,
+            )
+        connection.commit()
+
+        creation_a = append_decision(
+            connection,
+            "merge_contributions",
+            "candidate:alias-collision-a",
+            {
+                "contribution_id": "contribution:alias-collision-a",
+                "candidate_ids": ["candidate:shared-secondary-alias"],
+                "app_id": "sample_store",
+                "title": "App A merge",
+                "members": ["obj:alias-collision-a"],
+            },
+        )
+        creation_b = append_decision(
+            connection,
+            "merge_contributions",
+            "candidate:alias-collision-b",
+            {
+                "contribution_id": "contribution:alias-collision-b",
+                "candidate_ids": ["candidate:shared-secondary-alias"],
+                "app_id": "other_app",
+                "title": "PRIVATE APP B MERGE",
+                "members": ["obj:alias-collision-b"],
+            },
+        )
+        ambiguous = append_decision(
+            connection,
+            "rename_contribution",
+            "candidate:shared-secondary-alias",
+            {"title": "AMBIGUOUS ALIAS PAYLOAD"},
+        )
+        rename_a = append_decision(
+            connection,
+            "rename_contribution",
+            "candidate:shared-secondary-alias",
+            {"app_id": "sample_store", "title": "Scoped app A alias"},
+        )
+        rename_b = append_decision(
+            connection,
+            "rename_contribution",
+            "candidate:shared-secondary-alias",
+            {
+                "app_id": "other_app",
+                "title": "PRIVATE APP B ALIAS",
+                "private_payload": "APP B ONLY",
+            },
+        )
+
+        base_config = _config(tmp_path)
+        other_app = AppConfig(
+            id="other_app",
+            name="Other App",
+            market="YY",
+            business_type="fixture",
+            jira_project_keys=(),
+            gitlab_project_ids=(),
+            repo_paths=(),
+            jira_key_patterns=(),
+            production_environments=(),
+            release_tag_patterns=(),
+            ignored_paths=(),
+        )
+        builder = PacketBuilder(
+            connection,
+            replace(base_config, apps=(*base_config.apps, other_app)),
+        )
+        summary_a = builder.contribution_summary("contribution:alias-collision-a")
+        summary_b = builder.contribution_summary("contribution:alias-collision-b")
+        assert summary_a["contribution"]["title"] == "Scoped app A alias"
+        assert summary_b["contribution"]["title"] == "PRIVATE APP B ALIAS"
+        with pytest.raises(ScopeViolation):
+            builder.contribution_summary("candidate:shared-secondary-alias")
+
+        export_path = tmp_path / "secondary-alias-collision.json"
+        export_app(connection, "sample_store", export_path)
+        exported_text = export_path.read_text(encoding="utf-8")
+        exported = json.loads(exported_text)
+        assert {row["id"] for row in exported["human_decisions"]} == {
+            creation_a,
+            rename_a,
+        }
+        assert creation_b not in exported_text
+        assert ambiguous not in exported_text
+        assert rename_b not in exported_text
+        assert "PRIVATE APP B" not in exported_text
+        assert "APP B ONLY" not in exported_text
+        assert "AMBIGUOUS ALIAS PAYLOAD" not in exported_text
     finally:
         connection.close()
 

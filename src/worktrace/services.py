@@ -9,6 +9,7 @@ from pathlib import Path
 from worktrace.candidates.decisions import (
     CREATION_ACTIONS,
     active_decisions,
+    decision_lineages,
     decision_scope_map,
     snapshot_member_ids,
 )
@@ -103,6 +104,17 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         str(decision_payloads[str(decision["id"])]["contribution_id"])
         for decision in valid_creation_decisions
     }
+    active_lineages = tuple(
+        lineage for lineage in decision_lineages(connection) if lineage.app_id == app_id
+    )
+    active_lineage_candidate_ids = {
+        candidate_id for lineage in active_lineages for candidate_id in lineage.candidate_ids
+    }
+    active_lineage_contribution_ids = {
+        contribution_id
+        for lineage in active_lineages
+        for contribution_id in lineage.contribution_ids
+    }
     scoped_source_object_ids = {
         str(row[0])
         for row in connection.execute("SELECT id FROM source_objects WHERE app_id=?", (app_id,))
@@ -188,6 +200,8 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         *candidate_ids,
         *(projected.id for _, projected in unsupported_candidates),
         *history_candidate_ids,
+        *active_lineage_candidate_ids,
+        *active_lineage_contribution_ids,
         *object_ids,
     }
     included_decision_ids: set[str] = set()
