@@ -1,0 +1,15 @@
+[
+  {
+    "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "short_id": "aaaaaaaa",
+    "title": "DEMO-101 correct checkout validation",
+    "message": "DEMO-101 correct checkout validation\n\nCo-authored-by: Fixture Collaborator <collaborator@example.test>",
+    "author_name": "Fixture Engineer",
+    "author_email": "self@example.test",
+    "authored_date": "2026-01-10T10:00:00.000Z",
+    "committer_name": "Fixture Integrator",
+    "committer_email": "integrator@example.test",
+    "committed_date": "2026-01-10T11:00:00.000Z",
+    "web_url": "https://gitlab.fixture.example/sample/store/-/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+]

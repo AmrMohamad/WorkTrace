@@ -1,0 +1,23 @@
+# Copy this block into a trusted project `.codex/config.toml` or the user's
+# Codex config after replacing the absolute executable path. Do not forward Jira
+# or GitLab credentials: WorkTrace MCP reads only the local SQLite ledger.
+
+[mcp_servers.worktrace]
+command = "/absolute/path/to/WorkTrace/.venv/bin/python"
+args = ["-m", "worktrace.mcp_server.server"]
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+
+enabled_tools = [
+    "list_contribution_candidates",
+    "get_contribution_summary",
+    "build_phase4_packet",
+    "list_evidence_gaps",
+    "search_evidence",
+    "get_evidence_excerpt",
+]
+
+default_tools_approval_mode = "auto"
+
+[mcp_servers.worktrace.tools.get_evidence_excerpt]
+approval_mode = "prompt"

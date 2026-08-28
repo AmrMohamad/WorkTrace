@@ -1,0 +1,1 @@
+"""WorkTrace domain contracts."""

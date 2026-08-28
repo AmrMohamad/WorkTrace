@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "worktrace"
+version = "0.1.0"
+description = "Local provenance-preserving contribution reconstruction"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Amr Mohamad" }]
+dependencies = [
+  "httpx>=0.28,<1",
+  "mcp>=2,<3",
+  "typer>=0.16,<1",
+]
+
+[project.scripts]
+worktrace = "worktrace.cli:entrypoint"
+
+[dependency-groups]
+dev = [
+  "coverage>=7,<8",
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "respx>=0.22,<1",
+  "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/worktrace"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "worktrace/migrations"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "integration: exercises multiple WorkTrace components",
+  "security: exercises trust and redaction boundaries",
+  "recovery: exercises interruption, migration, and rebuild recovery",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+warn_unused_ignores = true
+
+[tool.coverage.run]
+branch = true
+source = ["worktrace"]
+
+[tool.coverage.report]
+fail_under = 81
+show_missing = true

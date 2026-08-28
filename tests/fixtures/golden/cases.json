@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "sanitization": "All source identifiers, scenario labels, and facts are synthetic.",
+  "cases": [
+    {
+      "id": "GOLDEN-001",
+      "historical_case_label": "Sample Store checkout full-name validation bug",
+      "fixture_title": "Checkout validation correction",
+      "app_id": "sample_store",
+      "known_records": {
+        "jira_keys": ["DEMO-101"],
+        "merge_requests": ["101!7"],
+        "commits": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      },
+      "expected": {
+        "candidate_found": true,
+        "expected_participation": ["jira_assignee", "mr_author", "git_author"],
+        "forbidden_claims": ["sole_owner", "released_to_users", "measurably_successful"],
+        "expected_gaps": ["ownership_level", "mobile_user_release", "measurable_result"]
+      }
+    },
+    {
+      "id": "GOLDEN-002",
+      "historical_case_label": "Sample Store main-thread logging hang",
+      "fixture_title": "Main-thread diagnostic correction",
+      "app_id": "sample_store",
+      "known_records": {
+        "jira_keys": ["DEMO-102"],
+        "merge_requests": ["101!8"],
+        "commits": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+      },
+      "expected": {
+        "candidate_found": true,
+        "expected_participation": ["git_committer"],
+        "forbidden_claims": ["implementation_author", "main_owner", "stability_improved"],
+        "expected_gaps": ["implementation_author", "measurable_result"]
+      }
+    },
+    {
+      "id": "GOLDEN-003",
+      "historical_case_label": "Sample Store performance observability",
+      "fixture_title": "Runtime observability integration",
+      "app_id": "sample_store",
+      "known_records": {
+        "jira_keys": ["DEMO-103"],
+        "merge_requests": ["101!9"],
+        "commits": ["cccccccccccccccccccccccccccccccccccccccc"]
+      },
+      "expected": {
+        "candidate_found": true,
+        "expected_participation": ["git_author", "git_coauthor"],
+        "forbidden_claims": ["sole_owner", "crash_rate_reduced"],
+        "expected_gaps": ["production_metric", "current_use"]
+      }
+    },
+    {
+      "id": "GOLDEN-004",
+      "historical_case_label": "Sample Store gift wrapping",
+      "fixture_title": "Optional order customization",
+      "app_id": "sample_store",
+      "known_records": {
+        "jira_keys": ["DEMO-104"],
+        "merge_requests": ["101!10"],
+        "commits": ["dddddddddddddddddddddddddddddddddddddddd"]
+      },
+      "expected": {
+        "candidate_found": true,
+        "expected_participation": ["mr_author"],
+        "forbidden_claims": ["feature_owner", "conversion_increased"],
+        "expected_gaps": ["commit_authorship", "deployment", "measurable_result"]
+      }
+    },
+    {
+      "id": "GOLDEN-005",
+      "historical_case_label": "Sample Store countdown/cart promotion",
+      "fixture_title": "Cart promotion countdown",
+      "app_id": "sample_store",
+      "known_records": {
+        "jira_keys": ["DEMO-105"],
+        "merge_requests": ["101!11"],
+        "commits": ["eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]
+      },
+      "expected": {
+        "candidate_found": true,
+        "expected_participation": ["mr_reviewer"],
+        "forbidden_claims": ["implementation_author", "sales_increased"],
+        "expected_gaps": ["personal_implementation", "measurable_result"]
+      }
+    },
+    {
+      "id": "GOLDEN-006",
+      "historical_case_label": "Sample Courier B2B adaptation",
+      "fixture_title": "Business application adaptation",
+      "app_id": "sample_b2b",
+      "known_records": {
+        "jira_keys": ["DEMO-201"],
+        "merge_requests": ["201!12"],
+        "commits": ["ffffffffffffffffffffffffffffffffffffffff"]
+      },
+      "expected": {
+        "candidate_found": true,
+        "expected_participation": ["jira_assignee", "git_author"],
+        "forbidden_claims": ["sole_owner", "cross_app_ownership"],
+        "expected_gaps": ["ownership_level", "released_to_users"]
+      }
+    },
+    {
+      "id": "GOLDEN-007",
+      "historical_case_label": "Sample Grocery startup crash hotfix",
+      "fixture_title": "Startup crash hotfix",
+      "app_id": "sample_grocery",
+      "known_records": {
+        "jira_keys": ["DEMO-301"],
+        "merge_requests": ["301!13"],
+        "commits": ["1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"]
+      },
+      "expected": {
+        "candidate_found": true,
+        "expected_participation": ["git_author"],
+        "expected_relationships": ["git_reverts_commit"],
+        "forbidden_claims": ["currently_fixed", "crash_rate_reduced"],
+        "expected_gaps": ["final_implementation_state", "production_metric"]
+      }
+    },
+    {
+      "id": "GOLDEN-008",
+      "historical_case_label": "Sample Diagnostics SDK integration",
+      "fixture_title": "Diagnostics SDK integration",
+      "app_id": "sample_b2b_ng",
+      "known_records": {
+        "jira_keys": ["DEMO-401"],
+        "merge_requests": ["401!14"],
+        "commits": ["3333333333333333333333333333333333333333"]
+      },
+      "expected": {
+        "candidate_found": true,
+        "expected_participation": ["git_author", "mr_merger"],
+        "forbidden_claims": ["currently_enabled", "measurably_successful"],
+        "expected_gaps": ["feature_flag_state", "production_metric"]
+      }
+    },
+    {
+      "id": "GOLDEN-009",
+      "historical_case_label": "Sample Grocery account navigation work",
+      "fixture_title": "Account navigation update",
+      "app_id": "sample_grocery",
+      "known_records": {
+        "jira_keys": ["DEMO-302"],
+        "merge_requests": ["301!15"],
+        "commits": ["4444444444444444444444444444444444444444"]
+      },
+      "expected": {
+        "candidate_found": true,
+        "expected_participation": ["jira_assignee", "mr_reviewer"],
+        "forbidden_claims": ["implementation_author", "feature_owner"],
+        "expected_gaps": ["personal_implementation", "ownership_level"]
+      }
+    },
+    {
+      "id": "GOLDEN-010",
+      "historical_case_label": "Sample Property filters",
+      "fixture_title": "Property filter update",
+      "app_id": "sample_property",
+      "known_records": {
+        "jira_keys": ["DEMO-501"],
+        "merge_requests": ["501!16"],
+        "commits": ["5555555555555555555555555555555555555555"]
+      },
+      "expected": {
+        "candidate_found": true,
+        "expected_participation": ["git_author"],
+        "expected_relationships": ["mentions_jira_key"],
+        "forbidden_claims": ["sole_owner", "release_deployed", "conversion_increased"],
+        "expected_gaps": ["ownership_level", "deployment", "measurable_result"]
+      }
+    }
+  ]
+}

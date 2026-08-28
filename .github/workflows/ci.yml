@@ -1,0 +1,79 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.10.6"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Validate pull request metadata
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          title_pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|spike|prototype)\((#[0-9]+|GH-[0-9]+)\)!?:'
+          if [[ ! "$PR_TITLE" =~ $title_pattern ]]; then
+            echo "Pull request title does not follow the ApexYard convention." >&2
+            exit 1
+          fi
+          body=$(jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH")
+          if ! grep -Eq '^## Glossary[[:space:]]*$' <<<"$body"; then
+            echo "Pull request body must include a ## Glossary section." >&2
+            exit 1
+          fi
+
+      - name: Verify lockfile
+        run: uv lock --check
+
+      - name: Synchronize locked environment
+        run: uv sync --locked --all-groups
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy src
+
+      - name: Test with branch coverage
+        run: |
+          uv run coverage run -m pytest
+          uv run coverage report
+
+      - name: Build source and wheel distributions
+        run: uv build
+
+      - name: Smoke test installed wheel
+        run: |
+          uv venv .artifact-smoke --python 3.12
+          uv pip install --python .artifact-smoke/bin/python dist/*.whl
+          .artifact-smoke/bin/worktrace version

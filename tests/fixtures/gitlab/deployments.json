@@ -1,0 +1,15 @@
+[
+  {
+    "id": 7201,
+    "iid": 1,
+    "project_id": 101,
+    "status": "success",
+    "ref": "main",
+    "sha": "6666666666666666666666666666666666666666",
+    "created_at": "2026-01-15T08:00:00.000Z",
+    "updated_at": "2026-01-15T08:05:00.000Z",
+    "user": {"id": 43, "username": "fixture-deployer", "name": "Fixture Deployer"},
+    "environment": {"id": 7301, "name": "production", "slug": "production", "external_url": null},
+    "deployable": {"id": 7401, "status": "success"}
+  }
+]
