@@ -11,7 +11,8 @@ from typer.testing import CliRunner, Result
 from worktrace.adapters.git_local import LocalGitAdapter, LocalGitConfig
 from worktrace.adapters.gitlab import GitLabAdapter, GitLabConfig
 from worktrace.adapters.jira import JiraAdapter, JiraConfig
-from worktrace.cli import _assert_no_scope_contraction, app
+from worktrace.cli import _assert_no_scope_contraction, _window, app
+from worktrace.config import load_config
 from worktrace.db.connection import connect
 from worktrace.db.repository import EvidenceRepository
 from worktrace.errors import ConfigurationError, WorkTraceError
@@ -229,3 +230,14 @@ def test_configured_scope_cannot_contract_past_authoritative_history(tmp_path: P
             )
     finally:
         connection.close()
+
+
+def test_omitted_window_uses_the_complete_configured_employment_range(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    config_path = _config(tmp_path, repository)
+    configuration = load_config(config_path)
+
+    assert _window(configuration, None, None) == (
+        date(2024, 1, 1),
+        date(2026, 8, 26),
+    )
