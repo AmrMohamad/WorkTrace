@@ -23,6 +23,7 @@ from worktrace.domain.models import (
 from worktrace.errors import ScopeViolation
 from worktrace.participation import (
     ParticipationCategory,
+    canonical_role,
     categories_for_evidence,
     is_implementation_evidence,
 )
@@ -411,3 +412,11 @@ def test_mr_author_with_complete_paths_and_other_authored_commit_is_not_implemen
         )
     finally:
         connection.close()
+
+
+def test_annotated_tag_author_is_release_context_not_implementation() -> None:
+    assert canonical_role("git", "git_tag", "git_author") == "git_tag_author"
+    assert categories_for_evidence("git", "git_tag", "author", {"tag_name": "v1.2.3"}) == frozenset(
+        {ParticipationCategory.RELEASE_ASSOCIATED}
+    )
+    assert not is_implementation_evidence("git", "git_tag", "author", {"tag_name": "v1.2.3"})
