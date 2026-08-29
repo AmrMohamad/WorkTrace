@@ -108,7 +108,7 @@ Allowed statuses are `supported`, `partially_supported`, `human_attested`, `cont
 
 | ID | Question | Typical evidence |
 | --- | --- | --- |
-| `action.implementation` | What did the user implement? | User-authored commit/co-author evidence, or explicit implementation attestation, plus changed modules |
+| `action.implemented` | What did the user implement? | User-authored commit/co-author evidence, or explicit implementation attestation, plus changed modules |
 | `action.decisions` | Which technical decisions did the user make? | Authored explanations and discussions |
 | `action.technology` | Which tools or frameworks were involved? | Inspected changed paths/imports and descriptions |
 | `action.reuse` | Was a reusable component produced? | Shared modules and later structural references |

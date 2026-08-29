@@ -45,6 +45,7 @@ Participations attach an actor to a source object, and optionally an observation
 git_author
 git_committer
 git_coauthor
+git_tag_author
 jira_creator
 jira_comment_author
 jira_changelog_author
@@ -64,6 +65,7 @@ gitlab_release_author
 ```
 
 Assignment is an observed relationship, not ownership. A commit with another author and the local user as committer remains `committer_only` evidence for the local user.
+An annotated-tag creator is `git_tag_author`: it supports release association only, never implementation authorship.
 
 ## Typed references
 

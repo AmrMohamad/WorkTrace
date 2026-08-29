@@ -86,6 +86,7 @@ def test_public_contracts_use_the_emitted_v01_vocabulary() -> None:
     packet = (DOCS / "phase4-schema.md").read_text(encoding="utf-8")
 
     canonical_roles = {
+        "git_tag_author",
         "jira_comment_author",
         "jira_changelog_author",
         "mr_author",
@@ -116,6 +117,9 @@ def test_public_contracts_use_the_emitted_v01_vocabulary() -> None:
     }
     assert emitted_release_rungs <= set(packet.split())
     assert obsolete_release_rungs.isdisjoint(packet.split())
+    assert "`git_tag_author`" in evidence
+    assert "`action.implemented`" in packet
+    assert "`action.implementation`" not in packet
 
 
 def test_agdr_records_package_runtime_and_authority_tradeoffs() -> None:

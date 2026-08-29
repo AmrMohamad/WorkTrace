@@ -29,7 +29,7 @@ def _attested_rung(
         "statement": attestation.statement,
         "source_text_is_untrusted": True,
         "supporting_evidence_ids": [attestation.decision_id],
-        "limitations": ["This release state is a local-user attestation."],
+        "limitations": ["This statement is a local-user attestation."],
     }
 
 
@@ -155,20 +155,26 @@ def build_release_ladder(
         limitation="The metric is user-supplied unless a telemetry source is added later.",
     )
 
+    observed_implementation = _observed_rung(
+        implementation,
+        "Repository evidence records implementation authorship participation.",
+        limitation="Implementation participation does not establish feature ownership.",
+    )
+    attested_implementation = _attested_rung(
+        attestations,
+        {
+            "implemented",
+            "implementation",
+            "implementation_authorship",
+            "personal_implementation",
+        },
+    )
+
     return {
-        "implemented": _attested_rung(
-            attestations,
-            {
-                "implemented",
-                "implementation",
-                "implementation_authorship",
-                "personal_implementation",
-            },
-        )
-        or _observed_rung(
-            implementation,
-            "Repository evidence records implementation authorship participation.",
-            limitation="Implementation participation does not establish feature ownership.",
+        "implemented": (
+            observed_implementation
+            if observed_implementation["status"] != ClaimStatus.UNKNOWN.value
+            else attested_implementation or observed_implementation
         ),
         "merged": _observed_rung(
             merged,

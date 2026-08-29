@@ -23,7 +23,9 @@ prove that the submitting actor authored the commits.
    request fails with `unsafe_scope_replacement` before an import session or
    sync run is created.
 2. A newly configured employment range may expand historical coverage but may
-   not contract past an authoritative run's stored date range.
+   not contract past an authoritative run's stored date range. Missing scope
+   dates fall back to the parent import session; a non-manual authoritative
+   range that remains unknown or malformed blocks replacement.
 3. `mr_author` projects to `context`. It remains a self-authored MR candidate
    seed even when paths are missing or truncated.
 4. Only Git or GitLab commit author/co-author evidence, or a local human
@@ -42,6 +44,19 @@ prove that the submitting actor authored the commits.
   cannot support the implementation release rung or `action.implemented`.
 - Correcting prior GitLab self-classification still requires a same-scope
   reimport once verified provider identity handling is available.
+
+## Upgrade action
+
+After upgrading an existing ledger, rebuild candidate suggestions so newly
+eligible self-authored MR seeds are visible without changing immutable source
+records or human decisions:
+
+```bash
+uv run worktrace rebuild candidates <app-id>
+```
+
+Use `uv run worktrace rebuild all <app-id>` when references also need a
+deterministic rebuild.
 
 ## Verification
 

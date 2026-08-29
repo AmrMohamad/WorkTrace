@@ -109,7 +109,14 @@ def _assert_no_scope_contraction(
     """Reject a configuration shrink that would conceal a prior complete run."""
 
     rows = repository.connection.execute(
-        "SELECT source, status, completeness, scope_json FROM sync_runs WHERE app_id=?",
+        """
+        SELECT sr.source, sr.status, sr.completeness, sr.scope_json,
+               session.date_from AS session_date_from,
+               session.date_to AS session_date_to
+        FROM sync_runs sr
+        LEFT JOIN import_sessions session ON session.id=sr.import_session_id
+        WHERE sr.app_id=?
+        """,
         (app_id,),
     )
     for row in rows:
@@ -118,19 +125,26 @@ def _assert_no_scope_contraction(
             str(row["source"]), str(row["status"]), str(row["completeness"]), scope
         ):
             continue
-        prior_from = scope.get("date_from")
-        prior_to = scope.get("date_to")
-        if not isinstance(prior_from, str) or not isinstance(prior_to, str):
+        if str(row["source"]) == "manual":
+            # Manual evidence is additive and never replaces a source snapshot.
             continue
+        scope_from = scope.get("date_from")
+        scope_to = scope.get("date_to")
+        prior_from = row["session_date_from"] if scope_from in (None, "") else scope_from
+        prior_to = row["session_date_to"] if scope_to in (None, "") else scope_to
+        if not isinstance(prior_from, str) or not isinstance(prior_to, str):
+            raise WorkTraceError(
+                "unsafe_scope_replacement: the prior authoritative import range cannot be verified"
+            )
         try:
             prior_window = (
                 _iso_date(prior_from, "stored date_from"),
                 _iso_date(prior_to, "stored date_to"),
             )
-        except WorkTraceError:
-            # Legacy malformed scope is retained as historical evidence; it
-            # cannot safely be used to infer a replacement boundary.
-            continue
+        except WorkTraceError as exc:
+            raise WorkTraceError(
+                "unsafe_scope_replacement: the prior authoritative import range is malformed"
+            ) from exc
         if prior_window[0] < date_from or prior_window[1] > date_to:
             raise WorkTraceError(
                 "unsafe_scope_replacement: configured employment range would hide "

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from worktrace.packets.models import EvidenceRecord
+from dataclasses import replace
+
+from worktrace.packets.models import EvidenceRecord, HumanAttestation
 from worktrace.packets.release import build_release_ladder
 
 
@@ -54,3 +56,39 @@ def test_context_only_records_cannot_advance_release_or_outcome_rungs() -> None:
     assert ladder["release_associated"]["status"] == "unknown"
     assert ladder["deployed"]["status"] == "unknown"
     assert ladder["measurably_successful"]["status"] == "unknown"
+
+
+def test_repository_implementation_evidence_is_not_hidden_by_attestation() -> None:
+    commit = replace(
+        _record(10, "git_commit", {"sha": "a" * 40}, source="git"),
+        context_only=False,
+    )
+
+    ladder = build_release_ladder(
+        [commit],
+        {
+            "self_participations": [
+                {
+                    "object_id": commit.object_id,
+                    "categories": ["implemented"],
+                    "claim_supporting_evidence_ids": [commit.evidence_id],
+                }
+            ]
+        },
+        (HumanAttestation("decision:implemented", "implementation", "I implemented it."),),
+        (),
+        (),
+    )
+
+    assert ladder["implemented"]["status"] == "supported"
+    assert ladder["implemented"]["supporting_evidence_ids"] == [commit.evidence_id]
+
+
+def test_implementation_attestation_is_a_fallback_when_authorship_is_missing() -> None:
+    attestation = HumanAttestation("decision:implemented", "implementation", "I implemented it.")
+
+    ladder = build_release_ladder([], {"self_participations": []}, (attestation,), (), ())
+
+    assert ladder["implemented"]["status"] == "human_attested"
+    assert ladder["implemented"]["supporting_evidence_ids"] == [attestation.decision_id]
+    assert ladder["implemented"]["limitations"] == ["This statement is a local-user attestation."]

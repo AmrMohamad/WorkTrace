@@ -232,6 +232,120 @@ def test_configured_scope_cannot_contract_past_authoritative_history(tmp_path: P
         connection.close()
 
 
+def test_scope_contraction_uses_import_session_dates_when_run_scope_dates_are_missing(
+    tmp_path: Path,
+) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    configuration = load_config(config_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        session_id = evidence.create_import_session(
+            configuration.app("sample_store"), date(2024, 1, 1), date(2026, 8, 26)
+        )
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"selection_reasons": ["legacy import"]},
+            session_id,
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="would hide"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2025, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_unknown_authoritative_non_manual_scope_fails_closed(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        run_id = evidence.start_sync_run(
+            "sample_store", "git", "fixture-repository", {"selection_reasons": ["legacy"]}
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="cannot be verified"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2024, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_malformed_authoritative_scope_dates_fail_closed(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "not-a-date", "date_to": "2026-08-26"},
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="is malformed"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2024, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_manual_evidence_without_snapshot_dates_does_not_block_import(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        run_id = evidence.start_sync_run("sample_store", "manual", "local", {})
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        _assert_no_scope_contraction(
+            evidence,
+            "sample_store",
+            date(2024, 1, 1),
+            date(2026, 8, 26),
+        )
+    finally:
+        connection.close()
+
+
 def test_omitted_window_uses_the_complete_configured_employment_range(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     config_path = _config(tmp_path, repository)
