@@ -100,6 +100,50 @@ def _window(
     return date_from, date_to
 
 
+@dataclass(frozen=True, slots=True)
+class _ImportWindow:
+    date_from: date
+    date_to: date
+
+
+def _stored_boundary_present(value: object) -> bool:
+    return value is not None and value != ""
+
+
+def _parse_stored_window(
+    raw_from: object,
+    raw_to: object,
+    *,
+    source: str,
+) -> _ImportWindow:
+    has_from = _stored_boundary_present(raw_from)
+    has_to = _stored_boundary_present(raw_to)
+    if has_from != has_to:
+        raise WorkTraceError(
+            f"unsafe_scope_replacement: the prior authoritative {source} range is incomplete"
+        )
+    if not has_from:
+        raise WorkTraceError(
+            f"unsafe_scope_replacement: the prior authoritative {source} range cannot be verified"
+        )
+    if not isinstance(raw_from, str) or not isinstance(raw_to, str):
+        raise WorkTraceError(
+            f"unsafe_scope_replacement: the prior authoritative {source} range is malformed"
+        )
+    try:
+        date_from = _iso_date(raw_from, f"{source} date_from")
+        date_to = _iso_date(raw_to, f"{source} date_to")
+    except WorkTraceError as exc:
+        raise WorkTraceError(
+            f"unsafe_scope_replacement: the prior authoritative {source} range is malformed"
+        ) from exc
+    if date_from > date_to:
+        raise WorkTraceError(
+            f"unsafe_scope_replacement: the prior authoritative {source} range is reversed"
+        )
+    return _ImportWindow(date_from, date_to)
+
+
 def _assert_no_scope_contraction(
     repository: EvidenceRepository,
     app_id: str,
@@ -111,6 +155,7 @@ def _assert_no_scope_contraction(
     rows = repository.connection.execute(
         """
         SELECT sr.source, sr.status, sr.completeness, sr.scope_json,
+               session.app_id AS session_app_id,
                session.date_from AS session_date_from,
                session.date_to AS session_date_to
         FROM sync_runs sr
@@ -130,22 +175,43 @@ def _assert_no_scope_contraction(
             continue
         scope_from = scope.get("date_from")
         scope_to = scope.get("date_to")
-        prior_from = row["session_date_from"] if scope_from in (None, "") else scope_from
-        prior_to = row["session_date_to"] if scope_to in (None, "") else scope_to
-        if not isinstance(prior_from, str) or not isinstance(prior_to, str):
+        scope_has_from = _stored_boundary_present(scope_from)
+        scope_has_to = _stored_boundary_present(scope_to)
+        if scope_has_from != scope_has_to:
             raise WorkTraceError(
-                "unsafe_scope_replacement: the prior authoritative import range cannot be verified"
+                "unsafe_scope_replacement: the prior authoritative scope contains "
+                "only one range boundary"
             )
-        try:
-            prior_window = (
-                _iso_date(prior_from, "stored date_from"),
-                _iso_date(prior_to, "stored date_to"),
+        if scope_has_from:
+            prior_window = _parse_stored_window(scope_from, scope_to, source="scope")
+            if row["session_app_id"] is not None:
+                if str(row["session_app_id"]) != app_id:
+                    raise WorkTraceError(
+                        "unsafe_scope_replacement: parent import session belongs "
+                        "to another application"
+                    )
+                session_window = _parse_stored_window(
+                    row["session_date_from"],
+                    row["session_date_to"],
+                    source="parent session",
+                )
+                if session_window != prior_window:
+                    raise WorkTraceError(
+                        "unsafe_scope_replacement: source scope and parent session "
+                        "contain contradictory ranges"
+                    )
+        else:
+            if row["session_app_id"] is None or str(row["session_app_id"]) != app_id:
+                raise WorkTraceError(
+                    "unsafe_scope_replacement: the historical range cannot be verified "
+                    "because no valid same-application parent session exists"
+                )
+            prior_window = _parse_stored_window(
+                row["session_date_from"],
+                row["session_date_to"],
+                source="parent session",
             )
-        except WorkTraceError as exc:
-            raise WorkTraceError(
-                "unsafe_scope_replacement: the prior authoritative import range is malformed"
-            ) from exc
-        if prior_window[0] < date_from or prior_window[1] > date_to:
+        if prior_window.date_from < date_from or prior_window.date_to > date_to:
             raise WorkTraceError(
                 "unsafe_scope_replacement: configured employment range would hide "
                 "a prior authoritative import"

@@ -24,8 +24,10 @@ prove that the submitting actor authored the commits.
    sync run is created.
 2. A newly configured employment range may expand historical coverage but may
    not contract past an authoritative run's stored date range. Missing scope
-   dates fall back to the parent import session; a non-manual authoritative
-   range that remains unknown or malformed blocks replacement.
+   dates fall back to a complete same-application parent import-session range.
+   Scope and session boundaries are validated as atomic pairs and must agree
+   when both exist; incomplete, reversed, contradictory, or otherwise
+   unverifiable non-manual authoritative ranges block replacement.
 3. `mr_author` projects to `context`. It remains a self-authored MR candidate
    seed even when paths are missing or truncated.
 4. Only Git or GitLab commit author/co-author evidence, or a local human

@@ -268,6 +268,184 @@ def test_scope_contraction_uses_import_session_dates_when_run_scope_dates_are_mi
         connection.close()
 
 
+def test_one_missing_scope_boundary_does_not_mix_scope_and_session_ranges(
+    tmp_path: Path,
+) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    configuration = load_config(config_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        session_id = evidence.create_import_session(
+            configuration.app("sample_store"), date(2024, 1, 1), date(2026, 8, 26)
+        )
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "2025-01-01"},
+            session_id,
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="only one range boundary"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2025, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_reversed_authoritative_scope_range_fails_closed(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "2026-08-26", "date_to": "2024-01-01"},
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="scope range is reversed"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2024, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_cross_app_parent_import_session_cannot_supply_scope_dates(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        with connection:
+            connection.execute("INSERT INTO apps(id, name) VALUES ('other_app', 'Other App')")
+            connection.execute(
+                """
+                INSERT INTO import_sessions(
+                    id, app_id, status, started_at, date_from, date_to
+                ) VALUES (?, ?, 'complete', ?, ?, ?)
+                """,
+                (
+                    "import:other-app",
+                    "other_app",
+                    "2026-08-26T00:00:00Z",
+                    "2024-01-01",
+                    "2026-08-26",
+                ),
+            )
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"selection_reasons": ["legacy"]},
+            "import:other-app",
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="same-application parent session"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2024, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_conflicting_scope_and_parent_session_ranges_fail_closed(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    configuration = load_config(config_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        session_id = evidence.create_import_session(
+            configuration.app("sample_store"), date(2024, 1, 1), date(2026, 8, 26)
+        )
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "2025-01-01", "date_to": "2026-08-26"},
+            session_id,
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="contradictory ranges"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2024, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_complete_scope_and_same_app_parent_session_range_succeeds(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    configuration = load_config(config_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        session_id = evidence.create_import_session(
+            configuration.app("sample_store"), date(2024, 1, 1), date(2026, 8, 26)
+        )
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "2024-01-01", "date_to": "2026-08-26"},
+            session_id,
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        _assert_no_scope_contraction(
+            evidence,
+            "sample_store",
+            date(2024, 1, 1),
+            date(2026, 8, 26),
+        )
+    finally:
+        connection.close()
+
+
 def test_unknown_authoritative_non_manual_scope_fails_closed(tmp_path: Path) -> None:
     repository_path = _repository(tmp_path)
     config = _config(tmp_path, repository_path)
