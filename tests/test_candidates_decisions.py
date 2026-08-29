@@ -21,6 +21,11 @@ from worktrace.domain.models import (
     SourceIdentity,
 )
 from worktrace.errors import ScopeViolation
+from worktrace.participation import (
+    ParticipationCategory,
+    categories_for_evidence,
+    is_implementation_evidence,
+)
 from worktrace.services import export_app
 
 
@@ -249,13 +254,14 @@ def test_candidate_overflow_does_not_consume_discarded_tail_seeds(
         connection.close()
 
 
-def test_truncated_gitlab_paths_do_not_promote_mr_author_to_implementation_seed(
+def test_mr_author_with_complete_paths_and_other_authored_commit_is_not_implementation(
     tmp_path: Path,
 ) -> None:
     connection, repository, _, _ = _candidate_state(tmp_path)
     run_id = "run:gitlab:biased-paths"
     mr_id = "obj:gitlab:mr:7"
     paths_id = "obj:gitlab:mr:7:paths"
+    commit_id = "obj:gitlab:mr:7:commit:other"
     try:
         connection.execute(
             """
@@ -270,6 +276,7 @@ def test_truncated_gitlab_paths_do_not_promote_mr_author_to_implementation_seed(
         for object_id, kind, external_id in (
             (mr_id, "gitlab_mr", "101:7"),
             (paths_id, "gitlab_merge_request_changed_paths", "101:7:changed_paths"),
+            (commit_id, "gitlab_merge_request_commit", "a" * 40),
         ):
             connection.execute(
                 """
@@ -305,15 +312,34 @@ def test_truncated_gitlab_paths_do_not_promote_mr_author_to_implementation_seed(
                 run_id,
                 "2026-08-26T12:00:00+00:00",
                 "2026-08-26T12:00:00+00:00",
-                '{"changed_paths":[{"new_path":"src/hidden/module.py"}],'
-                '"overflow":true,"scope_complete":false}',
+                '{"changed_paths":[{"new_path":"src/checkout/payment.py"}],'
+                '"overflow":false,"scope_complete":true}',
             ),
+        )
+        connection.execute(
+            """
+            INSERT INTO observations(
+                id, source_object_id, sync_run_id, source_updated_at, fetched_at,
+                payload_hash, title, data_json, completeness, adapter_version,
+                normalization_version, redaction_version
+            ) VALUES ('obs:gitlab:mr:7:commit:other', ?, ?, ?, ?, 'hash-commit',
+                      'Collaborator commit', '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
+                      'complete', 'fixture', '1', '1')
+            """,
+            (commit_id, run_id, "2026-08-26T12:00:00+00:00", "2026-08-26T12:00:00+00:00"),
         )
         connection.execute(
             """
             INSERT INTO actors(
                 id, source, source_instance, external_actor_id, display_name, is_self
             ) VALUES ('actor:gitlab:self', 'gitlab', '101', '7', 'Fixture Engineer', 1)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO actors(
+                id, source, source_instance, external_actor_id, display_name, is_self
+            ) VALUES ('actor:gitlab:other', 'gitlab', '101', '8', 'Collaborator', 0)
             """
         )
         connection.execute(
@@ -327,6 +353,16 @@ def test_truncated_gitlab_paths_do_not_promote_mr_author_to_implementation_seed(
         )
         connection.execute(
             """
+            INSERT INTO participations(
+                id, source_object_id, observation_id, actor_id, role, effective_from
+            ) VALUES ('participation:gitlab:mr:7:commit:other', ?,
+                      'obs:gitlab:mr:7:commit:other', 'actor:gitlab:other',
+                      'gitlab_commit_author', ?)
+            """,
+            (commit_id, "2026-08-26T12:00:00+00:00"),
+        )
+        connection.execute(
+            """
             INSERT INTO "references"(
                 id, app_id, from_object_id, to_object_id, relationship_type,
                 extraction_method, supporting_observation_id
@@ -335,15 +371,43 @@ def test_truncated_gitlab_paths_do_not_promote_mr_author_to_implementation_seed(
             """,
             (paths_id, mr_id),
         )
+        connection.execute(
+            """
+            INSERT INTO "references"(
+                id, app_id, from_object_id, to_object_id, relationship_type,
+                extraction_method, supporting_observation_id
+            ) VALUES ('ref:gitlab:mr:7:commit:other', 'sample_store', ?, ?,
+                      'gitlab_mr_commit', 'fixture', 'obs:gitlab:mr:7:commit:other')
+            """,
+            (commit_id, mr_id),
+        )
         connection.commit()
 
         rebuild_candidates("sample_store", repository)
 
-        assert (
-            connection.execute(
-                "SELECT 1 FROM candidate_groups WHERE seed_object_id=?", (mr_id,)
-            ).fetchone()
-            is None
+        candidate = connection.execute(
+            "SELECT id FROM candidate_groups WHERE seed_object_id=?", (mr_id,)
+        ).fetchone()
+        assert candidate is not None
+        member_ids = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT source_object_id FROM candidate_members WHERE candidate_id=?",
+                (str(candidate["id"]),),
+            )
+        }
+        assert {mr_id, paths_id, commit_id} <= member_ids
+        assert categories_for_evidence(
+            "gitlab",
+            "gitlab_mr",
+            "mr_author",
+            {"changed_paths": [{"new_path": "Checkout/Payment.swift"}]},
+        ) == frozenset({ParticipationCategory.CONTEXT})
+        assert not is_implementation_evidence(
+            "gitlab",
+            "gitlab_mr",
+            "mr_author",
+            {"changed_paths": [{"new_path": "Checkout/Payment.swift"}]},
         )
     finally:
         connection.close()

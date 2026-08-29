@@ -11,7 +11,9 @@ from typer.testing import CliRunner, Result
 from worktrace.adapters.git_local import LocalGitAdapter, LocalGitConfig
 from worktrace.adapters.gitlab import GitLabAdapter, GitLabConfig
 from worktrace.adapters.jira import JiraAdapter, JiraConfig
-from worktrace.cli import app
+from worktrace.cli import _assert_no_scope_contraction, app
+from worktrace.db.connection import connect
+from worktrace.db.repository import EvidenceRepository
 from worktrace.errors import ConfigurationError, WorkTraceError
 
 
@@ -154,3 +156,76 @@ def test_cli_import_commands_reject_reversed_and_out_of_employment_windows(
     assert result.exit_code != 0
     assert isinstance(result.exception, WorkTraceError)
     assert message in _error_text(result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["import", "git", "sample_store", "{repo}", "2025-01-01", "2025-12-31"],
+        ["import", "all", "sample_store", "2025-01-01", "2025-12-31"],
+    ],
+)
+def test_narrow_import_window_is_rejected_before_creating_session_or_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+) -> None:
+    monkeypatch.delenv("WORKTRACE_DB_PATH", raising=False)
+    repository = _repository(tmp_path)
+    config = _config(tmp_path, repository)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    database_path = tmp_path / "data" / "worktrace.sqlite3"
+    connection = connect(database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM import_sessions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM sync_runs").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+    arguments = [value.format(repo=repository) for value in command] + [
+        "--config",
+        str(config),
+    ]
+    result = runner.invoke(app, arguments)
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, WorkTraceError)
+    assert "unsafe_scope_replacement" in _error_text(result)
+    connection = connect(database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM import_sessions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM sync_runs").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_configured_scope_cannot_contract_past_authoritative_history(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "2024-01-01", "date_to": "2026-08-26"},
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="unsafe_scope_replacement"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2025, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()

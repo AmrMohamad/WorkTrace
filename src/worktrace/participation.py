@@ -74,7 +74,9 @@ _CATEGORIES: dict[str, frozenset[ParticipationCategory]] = {
     "git_author": frozenset({ParticipationCategory.IMPLEMENTED}),
     "git_coauthor": frozenset({ParticipationCategory.IMPLEMENTED}),
     "git_reviewer": frozenset({ParticipationCategory.REVIEWED}),
-    "mr_author": frozenset({ParticipationCategory.IMPLEMENTED}),
+    # Opening or submitting an MR is a factual coordination record.  Changed
+    # paths describe the MR, not who authored the implementation in it.
+    "mr_author": frozenset({ParticipationCategory.CONTEXT}),
     "mr_assignee": frozenset({ParticipationCategory.ASSIGNED}),
     "mr_reviewer": frozenset({ParticipationCategory.REVIEWED}),
     "mr_merger": frozenset({ParticipationCategory.MERGED}),
@@ -110,12 +112,11 @@ def categories_for_evidence(
 ) -> frozenset[ParticipationCategory]:
     """Project a role using the minimum object evidence required by its claim."""
 
-    categories = categories_for(source, kind, role)
-    if canonical_role(source, kind, role) == "mr_author" and not (
-        data.get("changed_paths") or data.get("changes")
-    ):
-        return categories - {ParticipationCategory.IMPLEMENTED}
-    return categories
+    # ``data`` remains part of this API because some role projections may need
+    # object-specific evidence in the future.  MR paths intentionally do not
+    # promote MR authorship into implementation authorship.
+    del data
+    return categories_for(source, kind, role)
 
 
 def supports_category(

@@ -1080,11 +1080,18 @@ class PacketBuilder:
                 ),
             )
         else:
-            answers["action.implemented"] = unknown_answer(
+            answers["action.implemented"] = self._attested_or_unknown(
                 "action.implemented",
                 by_id["action.implemented"],
+                contribution,
+                {
+                    "implemented",
+                    "implementation",
+                    "implementation_authorship",
+                    "personal_implementation",
+                },
                 "Add self-authored implementation evidence with non-ignored changed-path metadata.",
-                contradictions=contradiction_ids,
+                contradiction_ids,
             )
         for question_id, claims, missing in (
             (
@@ -1121,7 +1128,7 @@ class PacketBuilder:
                     isinstance(item.get("categories"), list)
                     and any(
                         category in item["categories"]
-                        for category in ("reviewed", "assigned", "merged")
+                        for category in ("reviewed", "assigned", "merged", "context")
                     )
                 )
                 or item.get("role") == "jira_reporter"
@@ -1132,8 +1139,8 @@ class PacketBuilder:
                 question_id="action.coordination",
                 question=by_id["action.coordination"],
                 answer_draft=(
-                    "Participation evidence records review, assignment, reporting, "
-                    "approval, or merge roles."
+                    "Participation evidence records MR submission, review, assignment, "
+                    "reporting, or merge roles."
                 ),
                 status=ClaimStatus.SUPPORTED,
                 observation_types=(ObservationType.SOURCE_ASSERTED,),

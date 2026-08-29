@@ -43,7 +43,7 @@ Raw source-qualified participation roles are projected centrally into implemente
 |---|---|---|
 | Git commit | `git_author`, `git_coauthor`, `git_committer`, `git_reviewer` | author/coauthor may support implemented; reviewer supports reviewed; committer-only supports neither |
 | Git tag/ref | `git_author` for annotated-tag creator | release association only |
-| GitLab MR | `mr_author`, `mr_assignee`, `mr_reviewer`, `mr_merger` | authored MR with changed paths may support implemented; other roles support only their named relationship |
+| GitLab MR | `mr_author`, `mr_assignee`, `mr_reviewer`, `mr_merger` | MR author records submission/context; changed paths describe scope but never implementation authorship |
 | GitLab MR commit | `gitlab_commit_author`, `gitlab_commit_committer`, `gitlab_commit_coauthor`, `gitlab_commit_reviewer` | author/coauthor may support implemented; committer/reviewer do not |
 | GitLab discussion | `gitlab_discussion_author` | discussion participation only |
 | GitLab deployment/release | `gitlab_deployer`, `gitlab_release_author` | deployed or release-associated only |

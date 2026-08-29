@@ -156,7 +156,16 @@ def build_release_ladder(
     )
 
     return {
-        "implemented": _observed_rung(
+        "implemented": _attested_rung(
+            attestations,
+            {
+                "implemented",
+                "implementation",
+                "implementation_authorship",
+                "personal_implementation",
+            },
+        )
+        or _observed_rung(
             implementation,
             "Repository evidence records implementation authorship participation.",
             limitation="Implementation participation does not establish feature ownership.",

@@ -66,7 +66,7 @@ EXPECTED_CATEGORIES = {
     "git_coauthor": {"implemented"},
     "git_committer": set(),
     "jira_assignee": {"assigned"},
-    "mr_author": {"implemented"},
+    "mr_author": {"context"},
     "mr_reviewer": {"reviewed"},
     "mr_merger": {"merged"},
 }
@@ -1432,7 +1432,7 @@ def test_production_adapters_feed_import_packet_and_mcp_authority(
         coordination_ids = {
             str(item["participation_evidence_id"])
             for item in self_participations
-            if item["role"] in {"jira_assignee", "mr_reviewer", "mr_merger"}
+            if item["role"] in {"jira_assignee", "mr_author", "mr_reviewer", "mr_merger"}
         }
         assert set(coordination["supporting_evidence_ids"]) == coordination_ids
 
