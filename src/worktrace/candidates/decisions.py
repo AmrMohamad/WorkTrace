@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 
 from worktrace.errors import NotFound, ScopeViolation
 from worktrace.normalize.redaction import Redactor
@@ -39,6 +40,7 @@ class _DecisionProjectionContext:
     active_decisions: tuple[Decision, ...]
     decisions_by_target: Mapping[str, tuple[Decision, ...]]
     decision_scopes: Mapping[str, str | None]
+    lineages: tuple[DecisionLineage, ...]
     lineages_by_identifier: Mapping[str, tuple[DecisionLineage, ...]]
 
     def for_target(self, target_id: str) -> tuple[Decision, ...]:
@@ -614,9 +616,14 @@ def _build_decision_projection_context(
             by_identifier.setdefault(identifier, []).append(lineage)
     return _DecisionProjectionContext(
         active_decisions=decisions,
-        decisions_by_target={key: tuple(value) for key, value in by_target.items()},
-        decision_scopes=scopes,
-        lineages_by_identifier={key: tuple(value) for key, value in by_identifier.items()},
+        decisions_by_target=MappingProxyType(
+            {key: tuple(value) for key, value in by_target.items()}
+        ),
+        decision_scopes=MappingProxyType(dict(scopes)),
+        lineages=lineages,
+        lineages_by_identifier=MappingProxyType(
+            {key: tuple(value) for key, value in by_identifier.items()}
+        ),
     )
 
 

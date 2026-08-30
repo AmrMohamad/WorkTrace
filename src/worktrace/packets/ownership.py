@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from worktrace.db.authority import authoritative_current_participation_ctes
 from worktrace.packets.authority import find_attestation
@@ -23,28 +23,44 @@ def build_participation_summary(
     connection: sqlite3.Connection,
     records: Sequence[EvidenceRecord],
     attestations: Sequence[HumanAttestation],
+    *,
+    current_participation_rows: Mapping[str, tuple[sqlite3.Row, ...]] | None = None,
 ) -> dict[str, object]:
     """Return role observations without converting them into ownership labels."""
 
     observation_ids = [record.observation_id for record in records]
     rows: list[sqlite3.Row] = []
     if observation_ids:
-        rows = list(
-            connection.execute(
-                f"""
-                WITH {authoritative_current_participation_ctes()}
-                SELECT p.id, p.source_object_id, p.observation_id, p.role,
-                    p.effective_from, p.effective_to, a.id AS actor_id,
-                    a.display_name, a.is_self, so.source, so.kind, so.external_id
-                FROM authoritative_current_participations p
-                JOIN actors a ON a.id=p.actor_id
-                JOIN source_objects so ON so.id=p.source_object_id
-                WHERE p.observation_id IN ({_placeholders(observation_ids)})
-                ORDER BY p.effective_from, p.id
-                """,
-                observation_ids,
+        if current_participation_rows is not None:
+            rows = [
+                row
+                for observation_id in observation_ids
+                for row in current_participation_rows.get(observation_id, ())
+            ]
+            rows.sort(
+                key=lambda row: (
+                    row["effective_from"] is not None,
+                    str(row["effective_from"] or ""),
+                    str(row["id"]),
+                )
             )
-        )
+        else:
+            rows = list(
+                connection.execute(
+                    f"""
+                    WITH {authoritative_current_participation_ctes()}
+                    SELECT p.id, p.source_object_id, p.observation_id, p.role,
+                        p.effective_from, p.effective_to, a.id AS actor_id,
+                        a.display_name, a.is_self, so.source, so.kind, so.external_id
+                    FROM authoritative_current_participations p
+                    JOIN actors a ON a.id=p.actor_id
+                    JOIN source_objects so ON so.id=p.source_object_id
+                    WHERE p.observation_id IN ({_placeholders(observation_ids)})
+                    ORDER BY p.effective_from, p.id
+                    """,
+                    observation_ids,
+                )
+            )
 
     self_rows = [row for row in rows if bool(row["is_self"])]
     other_rows = [row for row in rows if not bool(row["is_self"])]

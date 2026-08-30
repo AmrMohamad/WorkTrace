@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 
 REMOTE_POLICY_SOURCES = frozenset({"jira", "gitlab"})
 CURRENT_SELECTION_POLICY_VERSION = 2
@@ -256,6 +256,42 @@ def authoritative_current_observation_ids(
     return frozenset(
         str(row["id"]) for row in authoritative_current_observations(connection, app_id)
     )
+
+
+def authoritative_participations_for_current_observations(
+    connection: sqlite3.Connection,
+    app_id: str,
+    current_observation_ids: Collection[str],
+) -> list[sqlite3.Row]:
+    """Project coherent participations against an already canonical current-observation set."""
+
+    if not current_observation_ids:
+        return []
+    current_ids = frozenset(current_observation_ids)
+    rows = connection.execute(
+        """
+        /* worktrace_page_participation_context */
+        SELECT participation.id, participation.source_object_id,
+            participation.observation_id, participation.role,
+            participation.effective_from, participation.effective_to,
+            actor.id AS actor_id, actor.display_name, actor.is_self,
+            object.source, object.kind, object.external_id
+        FROM participations participation
+        JOIN observations observation
+          ON observation.id=participation.observation_id
+         AND observation.source_object_id=participation.source_object_id
+        JOIN source_objects object
+          ON object.id=participation.source_object_id
+         AND object.app_id=?
+        JOIN actors actor
+          ON actor.id=participation.actor_id
+         AND actor.source=object.source
+         AND actor.source_instance=object.source_instance
+        ORDER BY participation.effective_from, participation.id
+        """,
+        (app_id,),
+    )
+    return [row for row in rows if str(row["observation_id"]) in current_ids]
 
 
 def authoritative_current_object_ids(

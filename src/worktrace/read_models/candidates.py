@@ -87,6 +87,13 @@ class _PageDiagnostics:
     scanned_candidate_ids: list[str] = field(default_factory=list)
     projected_candidate_ids: list[str] = field(default_factory=list)
     batch_limits: list[int] = field(default_factory=list)
+    decision_context_builds: int = 0
+    active_decision_count: int = 0
+    decision_scope_count: int = 0
+    decision_lineage_count: int = 0
+    authority_context_builds: int = 0
+    authority_observation_count: int = 0
+    authority_participation_count: int = 0
 
     @property
     def raw_scan_count(self) -> int:
@@ -263,7 +270,7 @@ def _candidate_page(
     config.app(app_id)
     batch_size = page_size * 2
     scan_budget = min(page_size * 4, MAX_SCAN_BUDGET)
-    from worktrace.packets.builder import PacketBuilder
+    from worktrace.packets.builder import PacketBuilder, _build_authority_evidence_context
 
     connection.execute("BEGIN")
     try:
@@ -283,10 +290,25 @@ def _candidate_page(
             items: list[CandidateListItem] = []
             raw_scans = 0
             decision_context = _build_decision_projection_context(connection)
+            authority_context = _build_authority_evidence_context(connection, app_id)
+            if diagnostics is not None:
+                diagnostics.decision_context_builds = 1
+                diagnostics.active_decision_count = len(decision_context.active_decisions)
+                diagnostics.decision_scope_count = len(decision_context.decision_scopes)
+                diagnostics.decision_lineage_count = len(decision_context.lineages)
+                diagnostics.authority_context_builds = 1
+                diagnostics.authority_observation_count = len(
+                    authority_context.current_observations
+                )
+                diagnostics.authority_participation_count = sum(
+                    len(rows)
+                    for rows in authority_context.participation_rows_by_observation.values()
+                )
             builder = PacketBuilder(
                 connection,
                 config,
                 decision_context=decision_context,
+                authority_context=authority_context,
             )
 
             while len(items) < page_size and raw_scans < scan_budget:
