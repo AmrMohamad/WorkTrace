@@ -9,6 +9,31 @@ This document records intentional v0.1 boundaries and validation gaps. It must n
 - CLI invocations perform imports on demand. v0.1 uses full historical snapshots rather than incremental synchronization.
 - Codex history, Slack, email, Firebase/telemetry, Figma, and App Store Connect are not source adapters in v0.1.
 
+## Read-only human TUI boundary
+
+- The approved first TUI is a review surface only. Until its complete vertical-slice issue is
+  merged, WorkTrace remains operated through the existing CLI and MCP interfaces; a technical
+  design does not itself make `worktrace ui` available.
+- The TUI will not import, confirm, ignore, rename, merge, split, edit membership, add evidence or
+  attestations, rebuild, migrate, export, back up, purge, edit configuration, contact providers, or
+  watch the database.
+- Candidate pages are internally consistent for one short read transaction. Another CLI process
+  may change decision projections between pages; explicit refresh restarts pagination rather than
+  claiming a session-wide snapshot.
+- Source health describes the latest source attempt. It does not label a timestamp `Last complete`
+  or claim that a prior authoritative snapshot was retained until a separate query can prove that
+  state.
+- Terminal presentation encoding reduces control-sequence and bidi confusion but cannot determine
+  whether ordinary visible prose is deceptive, proprietary, or inappropriate to share.
+- Removing screenshot and broad clipboard actions reduces accidental disclosure. It cannot stop an
+  authorized local user from taking an operating-system screenshot, selecting terminal text,
+  photographing the screen, logging the terminal, or otherwise capturing displayed information.
+- The Textual interface will support keyboard operation, visible focus, text/symbol states,
+  `NO_COLOR`, and an 80x24 compact layout, but it does not claim full screen-reader accessibility.
+  CLI JSON and MCP remain the structured alternatives.
+- Synthetic headless tests cannot establish behavior across every real terminal emulator,
+  clipboard implementation, font, assistive technology, or operating-system capture facility.
+
 ## Evidence limitations
 
 - Source systems contain assertions and mutable records, not objective truth. Jira comments can describe an impact but do not independently prove its scope.

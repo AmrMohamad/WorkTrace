@@ -4,7 +4,9 @@
 
 WorkTrace processes proprietary engineering history, employee identities, source assertions, and potentially sensitive incident text. It is a private local single-user tool, but “local” is not a complete security control. The design assumes source text is untrusted and source credentials are high-value secrets.
 
-This model covers the CLI, adapters, local Git subprocess boundary, SQLite ledger, backups/exports, and read-only MCP process. It does not authorize organization-wide collection or evaluation.
+This model covers the CLI, adapters, local Git subprocess boundary, SQLite ledger, backups/exports,
+the read-only MCP process, and the approved structurally read-only human TUI. It does not authorize
+organization-wide collection or evaluation.
 
 ## Trust boundaries
 
@@ -19,6 +21,9 @@ normalize -> redact -> persist
     |
     v
 SQLite ledger <---- read-only SQLite URI ---- MCP server ----> Codex
+      ^
+      |
+      +--------- worker-local read-only SQLite URI -------- Textual TUI
 ```
 
 - The CLI is the only mutation boundary.
@@ -26,6 +31,9 @@ SQLite ledger <---- read-only SQLite URI ---- MCP server ----> Codex
 - Configuration establishes the app/project/repository allowlist; it is not inferred from source text.
 - MCP accepts stable IDs and bounded filters, never paths, URLs, commands, or SQL.
 - Codex server instructions guide behavior but do not replace server-side validation.
+- The TUI receives only a read-only workspace. It does not receive providers, credentials, network,
+  writes, imports, decisions, migrations, maintenance, export, backup, purge, or configuration
+  editing.
 
 ## Assets and controls
 
@@ -80,6 +88,46 @@ Controls:
 - candidate rebuilds do not delete decisions; and
 - exports preserve provenance and attestation labels.
 
+### Terminal presentation and accidental disclosure
+
+Threats include ANSI/CSI/OSC/DCS sequences changing terminal state, OSC 52 clipboard transfer,
+bidirectional controls obscuring text order, provider text being interpreted as Rich/Textual
+markup or commands, framework-driven screenshots/logging/input, and bulk evidence entering the
+clipboard.
+
+Controls:
+
+- before Textual import, the UI route removes Jira/GitLab credential variables, the email HMAC-key
+  variable, and the approved Textual environment controls for logging, alternate drivers,
+  automatic input, and screenshots;
+- every TUI database connection is opened in its worker with SQLite URI `mode=ro`, query-only mode,
+  a 500-millisecond busy timeout, and reliable close behavior;
+- one presentation encoder visibly replaces all non-newline C0 controls, ESC, DEL, C1 controls,
+  U+2028/U+2029, lone surrogates, and the approved bidi-control set while bounding replacement
+  expansion;
+- every encoded dynamic value then becomes a literal `Text(encoded.text)` renderable before it
+  reaches table, tree, list, option, label, or other Rich/Textual renderable surfaces; dynamic
+  widget updates, modal titles and bodies, errors, and notifications use that literal renderable,
+  `markup=False`, or an equivalent explicitly literal API;
+- encoded dynamic content is never passed as a bare string to a markup-capable Textual/Rich API;
+- dynamic configuration, ledger, provider, and stored-error strings are never used as widget IDs,
+  CSS selectors, commands, bindings, action names, or command-palette entries;
+- provider excerpts use the same literal-renderable boundary in a scrollable widget and expose no
+  URL action;
+- `WorkTraceApp` and every normal and modal WorkTrace screen set `ALLOW_SELECT = False`; screens
+  remove the inherited `ctrl+c`/`super+c -> screen.copy_text` bindings and override
+  `action_copy_text()` as a no-op, so selected evidence cannot reach `App.copy_to_clipboard`
+  through Textual's inherited path;
+- the command palette is a fixed allowlist that excludes Textual's default Screenshot command; and
+- only the separate explicit action for a validated stable WorkTrace ID may invoke the application
+  clipboard action.
+
+These are accidental-disclosure controls, not a security boundary against the authorized local
+user. WorkTrace cannot prevent operating-system screenshots, terminal selection, photography,
+terminal logging, or inspection of data intentionally displayed to that user. Here, terminal
+selection means terminal-emulator behavior outside Textual's disabled application selection/copy
+path.
+
 ## Threat scenarios
 
 ### Prompt injection in source text
@@ -98,6 +146,29 @@ Required behavior:
 - never concatenate it into MCP server instructions;
 - never treat it as a command, URL to follow, scope change, or approval; and
 - expose no MCP filesystem, network, import, or write capability that could satisfy it.
+
+The TUI applies the same data-only rule. It terminal-encodes the excerpt, renders it with markup
+disabled, and never derives actions, commands, links, widget identities, or clipboard payloads from
+the source text.
+
+### TUI capability escalation
+
+The TUI must not become read-only merely because write controls are hidden. Its composition root
+constructs only `ReadOnlyWorkspace`; every database operation uses a worker-local query-only
+connection. Tests replace provider credential accessors, provider/client constructors, socket
+connection creation, file writes, and clipboard calls with failing sentinels and exercise the full
+journey. A real SQL write attempt through the TUI connection must fail.
+
+The TUI does not call MCP or execute WorkTrace CLI commands. This avoids turning protocol output or
+CLI JSON into an internal capability and leaves MCP's six-tool allowlist and response limits
+unchanged.
+
+### Database version and contention
+
+The TUI reads `PRAGMA user_version` before review. An older ledger exits with CLI migration
+instructions; a newer ledger exits as incompatible. The TUI never migrates. A 500-millisecond busy
+timeout bounds contention, after which the UI presents a sanitized retry/return state. Connections
+are created and closed within the worker that uses them and are never retained while idle.
 
 ### Command injection through Git metadata
 
@@ -149,8 +220,28 @@ Parser failures must never log the raw pre-redacted input. Redaction is versione
 
 ## Security verification corpus
 
-Tests must cover prompt injection as inert data, shell metacharacters in refs, arbitrary-path rejection, unconfigured app/source rejection, token/log redaction, email/phone redaction, no complete diff storage/output, excerpt and search bounds, read-only MCP behavior, and partial-source propagation.
+Tests must cover prompt injection as inert data, shell metacharacters in refs, arbitrary-path
+rejection, unconfigured app/source rejection, token/log redaction, email/phone redaction, no
+complete diff storage/output, excerpt and search bounds, read-only MCP behavior, and partial-source
+propagation.
+
+The TUI corpus additionally covers CSI, OSC 8/52, DCS, ST/BEL termination, C0/C1, carriage return,
+backspace, DEL, U+2028/U+2029, bidi controls, lone surrogates, Rich/action markup, dynamic command
+injection, prompt-injection text, and output-expansion bounds. Tests also prove environment
+scrubbing occurs before Textual import, the fixed command palette has no screenshot action, only
+validated stable IDs reach the clipboard, no screenshot/log/export file appears, every connection
+rejects writes, and TUI journeys do not reach credentials, providers, sockets, or file writes.
+Candidate rows and representative tree/list cells, modal titles and bodies, source errors, and
+notifications additionally prove Rich/action markup remains visible literal text, creates no
+markup-derived spans or links, and registers or triggers no actions, commands, or bindings.
+Behavioral tests also attempt mouse selection over evidence and dispatch both `ctrl+c` and
+`super+c`; the clipboard remains unchanged and `copy_to_clipboard` is not called. The explicit
+validated-ID action remains covered and copies the exact stable ID once.
 
 ## Residual risk
 
-Best-effort redaction cannot recognize every proprietary fact or personal identifier. A local machine compromise can expose local data. Human attestations can be mistaken. Jira/GitLab permissions and source assertions can be incomplete. These are product limitations to display, not reasons to weaken the controls above.
+Best-effort redaction cannot recognize every proprietary fact or personal identifier. A local
+machine compromise can expose local data. Human attestations can be mistaken. Jira/GitLab
+permissions and source assertions can be incomplete. A full-screen terminal cannot prevent its
+authorized user or terminal environment from capturing visible data. These are product limitations
+to display, not reasons to weaken the controls above.
