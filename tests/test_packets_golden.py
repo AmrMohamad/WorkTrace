@@ -17,6 +17,39 @@ from worktrace.db.queries import source_status as query_source_status
 from worktrace.mcp_server.tools import WorkTraceTools
 from worktrace.packets.builder import PacketBuilder
 
+EXPECTED_PHASE4_IDS = (
+    "identity.what",
+    "identity.app_flow",
+    "identity.when",
+    "identity.origin",
+    "identity.ownership",
+    "problem.what",
+    "problem.before",
+    "problem.severity",
+    "problem.affected",
+    "problem.blocked",
+    "problem.constraints",
+    "problem.ambiguity",
+    "action.implemented",
+    "action.decisions",
+    "action.technology",
+    "action.reuse",
+    "action.architecture",
+    "action.coordination",
+    "action.quality",
+    "action.review",
+    "result.change",
+    "result.measurement",
+    "result.scope",
+    "result.errors_time",
+    "result.business",
+    "result.release",
+    "result.current_use",
+    "result.reuse",
+    "result.feedback",
+    "result.defensibility",
+)
+
 
 def _config(tmp_path: Path) -> WorkTraceConfig:
     app = AppConfig(
@@ -341,7 +374,24 @@ def test_phase4_packet_preserves_claim_authority_and_independent_release_rungs(
         connection.close()
 
     questions = _all_questions(packet)
+    assert packet["schema_version"] == 2
+    assert tuple(packet) == (
+        "schema_version",
+        "contribution",
+        "as_of",
+        "source_status",
+        "evidence_summary",
+        "sections",
+        "participation",
+        "release_ladder",
+        "contradictions",
+        "defensibility",
+        "limitations",
+    )
     assert questions
+    assert tuple(question["question_id"] for question in questions) == EXPECTED_PHASE4_IDS
+    assert len({question["question_id"] for question in questions}) == 30
+    assert "legacy_question_id_aliases" not in packet
     assert all(
         question["supporting_evidence_ids"]
         for question in questions
@@ -400,14 +450,39 @@ def test_packet_reports_partial_stale_contradictory_and_module_rule_state(
     assert source_status["jira"]["complete"] is False
     assert source_status["jira"]["instances"][0]["status"] == "failed"
     assert any(item["kind"] == "recorded_revert" for item in summary["contradictions"])
-    result_changed = next(
+    result_change = next(
         question
         for question in packet["sections"]["result"]
-        if question["question_id"] == "result.changed"
+        if question["question_id"] == "result.change"
     )
-    assert result_changed["status"] == "contradicted"
-    assert result_changed["contradicting_evidence_ids"]
-    assert "result.changed" not in packet["defensibility"]["well_supported_question_ids"]
+    assert result_change["status"] == "contradicted"
+    assert result_change["contradicting_evidence_ids"]
+    assert "result.change" not in packet["defensibility"]["well_supported_question_ids"]
+
+
+def test_review_participation_supports_review_but_not_coordination(tmp_path: Path) -> None:
+    connection, _, config, candidate_id = _packet_state(tmp_path)
+    connection.execute("DELETE FROM participations WHERE id='participation:author'")
+    connection.execute(
+        """
+        INSERT INTO participations(
+            id, source_object_id, observation_id, actor_id, role, effective_from
+        ) VALUES ('participation:reviewer', 'obj:commit', 'obs:commit', 'actor:self',
+                  'reviewer', '2026-08-25T23:59:59+00:00')
+        """
+    )
+    connection.commit()
+    try:
+        packet = PacketBuilder(connection, config).build_packet(candidate_id)
+    finally:
+        connection.close()
+
+    questions = {item["question_id"]: item for item in _all_questions(packet)}
+    assert questions["action.review"]["status"] == "supported"
+    assert questions["action.review"]["supporting_evidence_ids"] == ["participation:reviewer"]
+    assert questions["action.coordination"]["status"] == "unknown"
+    assert questions["action.coordination"]["answer_draft"] is None
+    assert questions["action.coordination"]["supporting_evidence_ids"] == []
 
 
 def test_selection_biased_changed_paths_do_not_support_scope_claims(tmp_path: Path) -> None:

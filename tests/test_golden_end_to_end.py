@@ -510,7 +510,7 @@ def test_documented_golden_case_runs_source_to_packet_and_bounded_mcp(
             if question["answer_draft"] is not None
         )
         assert _question(packet, "identity.ownership")["answer_draft"] is None
-        assert _question(packet, "result.measured")["answer_draft"] is None
+        assert _question(packet, "result.measurement")["answer_draft"] is None
         assert _question(packet, "result.business")["answer_draft"] is None
         drafts = "\n".join(
             str(question["answer_draft"]).casefold()
@@ -1432,9 +1432,16 @@ def test_production_adapters_feed_import_packet_and_mcp_authority(
         coordination_ids = {
             str(item["participation_evidence_id"])
             for item in self_participations
-            if item["role"] in {"jira_assignee", "mr_author", "mr_reviewer", "mr_merger"}
+            if item["role"] in {"jira_assignee", "mr_author", "mr_merger"}
         }
         assert set(coordination["supporting_evidence_ids"]) == coordination_ids
+        review = _question(packet, "action.review")
+        assert review["status"] == "supported"
+        assert set(review["supporting_evidence_ids"]) == {
+            str(item["participation_evidence_id"])
+            for item in self_participations
+            if item["role"] == "mr_reviewer"
+        }
 
         release_rung = packet["release_ladder"]["release_associated"]
         assert release_rung["status"] == "unknown"
@@ -1457,8 +1464,12 @@ def test_production_adapters_feed_import_packet_and_mcp_authority(
 
     tools = WorkTraceTools(config=config, database_path=database_path)
     mcp_packet = tools.build_phase4_packet(contribution_id=candidate_id)
+    assert mcp_packet["schema_version"] == 2
+    assert mcp_packet["response_truncated"] is True
+    assert len(_material_questions(mcp_packet)) == 30
     assert _question(mcp_packet, "action.implemented")["status"] == "supported"
     assert _question(mcp_packet, "action.coordination")["status"] == "supported"
+    assert _question(mcp_packet, "action.review")["status"] == "supported"
     assert mcp_packet["release_ladder"]["release_associated"]["status"] == "unknown"
     assert mcp_packet["source_text_is_untrusted"] is True
     assert len(json.dumps(mcp_packet, sort_keys=True, separators=(",", ":"))) <= 20_000

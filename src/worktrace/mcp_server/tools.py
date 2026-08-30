@@ -22,6 +22,10 @@ from worktrace.mcp_server.schemas import (
 )
 from worktrace.mcp_server.schemas import source_types as validate_source_types
 from worktrace.packets.builder import PacketBuilder
+from worktrace.packets.schema import PHASE4_QUESTIONS
+
+_PHASE4_SECTION_NAMES = frozenset(question.section for question in PHASE4_QUESTIONS)
+_PHASE4_QUESTION_IDENTITY_KEYS = frozenset({"question_id", "question"})
 
 
 class WorkTraceTools:
@@ -52,10 +56,22 @@ class WorkTraceTools:
             connection.close()
 
     @staticmethod
-    def _bounded_response(result: dict[str, object]) -> dict[str, object]:
+    def _bounded_response(
+        result: dict[str, object],
+        *,
+        preserve_phase4_questions: bool = False,
+    ) -> dict[str, object]:
         result["source_text_trust"] = "untrusted"
         result["source_text_is_untrusted"] = True
-        return enforce_total_limit(result)
+        return enforce_total_limit(
+            result,
+            protected_list_keys=(
+                _PHASE4_SECTION_NAMES if preserve_phase4_questions else frozenset()
+            ),
+            protected_string_keys=(
+                _PHASE4_QUESTION_IDENTITY_KEYS if preserve_phase4_questions else frozenset()
+            ),
+        )
 
     @classmethod
     def _cursor_response(cls, result: dict[str, object]) -> dict[str, object]:
@@ -93,7 +109,7 @@ class WorkTraceTools:
         identifier = stable_id(contribution_id, "contribution_id")
         with self._builder() as builder:
             result = builder.build_packet(identifier)
-        return self._bounded_response(result)
+        return self._bounded_response(result, preserve_phase4_questions=True)
 
     def list_evidence_gaps(self, *, contribution_id: str) -> dict[str, object]:
         identifier = stable_id(contribution_id, "contribution_id")

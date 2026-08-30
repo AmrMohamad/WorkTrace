@@ -49,46 +49,7 @@ from worktrace.packets.models import (
 )
 from worktrace.packets.ownership import build_participation_summary
 from worktrace.packets.release import build_release_ladder
-
-PHASE4_QUESTIONS: dict[str, tuple[tuple[str, str], ...]] = {
-    "contribution_identity": (
-        ("identity.what", "What was the contribution?"),
-        ("identity.app_flow", "Which application and flow did it affect?"),
-        ("identity.when", "When did the work occur?"),
-        ("identity.origin", "Was it assigned, proposed, or inherited?"),
-        ("identity.ownership", "Was the engineer the sole, main, or a contributing owner?"),
-    ),
-    "problem_context": (
-        ("problem.what", "What problem existed?"),
-        ("problem.before", "What happened before the change?"),
-        ("problem.severity", "How serious was the problem?"),
-        ("problem.affected", "Who or which flow was affected?"),
-        ("problem.blocked", "What did the problem block?"),
-        ("problem.constraints", "What constraints shaped the work?"),
-        ("problem.requirement_clarity", "Was the requirement unclear or changing?"),
-    ),
-    "action": (
-        ("action.implemented", "What did the engineer implement?"),
-        ("action.decisions", "Which technical decisions were made?"),
-        ("action.tools", "Which tools or frameworks were involved?"),
-        ("action.reuse", "Was a reusable component produced?"),
-        ("action.architecture", "How did architecture or data flow change?"),
-        ("action.coordination", "What coordination or review occurred?"),
-        ("action.quality", "Were tests, documentation, or monitoring added?"),
-    ),
-    "result": (
-        ("result.changed", "What changed as a result?"),
-        ("result.measured", "Is there a measurable before-and-after result?"),
-        ("result.scope", "What scope was affected?"),
-        ("result.efficiency", "Were errors or time reduced?"),
-        ("result.business", "Was conversion, stability, or another outcome improved?"),
-        ("result.released", "What release state is supported?"),
-        ("result.current_use", "Is the contribution still used or enabled?"),
-        ("result.reused", "Was the work reused later?"),
-        ("result.feedback", "Is there client or stakeholder feedback?"),
-        ("result.interview_defensible", "Which parts are defensible in an interview?"),
-    ),
-}
+from worktrace.packets.schema import PHASE4_QUESTIONS, PHASE4_SCHEMA_VERSION
 
 _TITLE_DECISION_ACTIONS = CREATION_ACTIONS | {
     "confirm",
@@ -894,9 +855,7 @@ class PacketBuilder:
         summary: dict[str, object],
     ) -> dict[str, list[dict[str, object]]]:
         by_id = {
-            question_id: question
-            for questions in PHASE4_QUESTIONS.values()
-            for question_id, question in questions
+            specification.question_id: specification.text for specification in PHASE4_QUESTIONS
         }
         raw_contradictions = summary.get("contradictions", [])
         contradictions = raw_contradictions if isinstance(raw_contradictions, list) else []
@@ -1015,7 +974,7 @@ class PacketBuilder:
             ("problem.blocked", {"blocked_flow", "blocked"}, "Confirm what was actually blocked."),
             ("problem.constraints", {"constraints"}, "Document verified constraints."),
             (
-                "problem.requirement_clarity",
+                "problem.ambiguity",
                 {"requirement_clarity", "changing_requirements"},
                 "Document requirement changes or ambiguity.",
             ),
@@ -1099,7 +1058,11 @@ class PacketBuilder:
                 {"technical_decision", "decisions"},
                 "Document a specific decision and its evidence.",
             ),
-            ("action.tools", {"tools", "frameworks"}, "Confirm tools or frameworks used."),
+            (
+                "action.technology",
+                {"tools", "frameworks"},
+                "Confirm tools or frameworks used.",
+            ),
             ("action.reuse", {"reusable_component", "reuse"}, "Add reuse evidence."),
             (
                 "action.architecture",
@@ -1128,7 +1091,7 @@ class PacketBuilder:
                     isinstance(item.get("categories"), list)
                     and any(
                         category in item["categories"]
-                        for category in ("reviewed", "assigned", "merged", "context")
+                        for category in ("assigned", "merged", "context")
                     )
                 )
                 or item.get("role") == "jira_reporter"
@@ -1139,8 +1102,8 @@ class PacketBuilder:
                 question_id="action.coordination",
                 question=by_id["action.coordination"],
                 answer_draft=(
-                    "Participation evidence records MR submission, review, assignment, "
-                    "reporting, or merge roles."
+                    "Participation evidence records MR submission, assignment, reporting, "
+                    "or merge roles."
                 ),
                 status=ClaimStatus.SUPPORTED,
                 observation_types=(ObservationType.SOURCE_ASSERTED,),
@@ -1151,15 +1114,43 @@ class PacketBuilder:
             answers["action.coordination"] = unknown_answer(
                 "action.coordination",
                 by_id["action.coordination"],
-                "Add coordination or review evidence.",
+                "Add coordination evidence.",
+            )
+        review_ids = tuple(
+            sorted(
+                str(item["participation_evidence_id"])
+                for item in self_participations
+                if isinstance(item.get("categories"), list) and "reviewed" in item["categories"]
+            )
+        )
+        if review_ids:
+            answers["action.review"] = QuestionAnswer(
+                question_id="action.review",
+                question=by_id["action.review"],
+                answer_draft=(
+                    "Participation evidence records a reviewer role for the configured identity."
+                ),
+                status=ClaimStatus.SUPPORTED,
+                observation_types=(ObservationType.SOURCE_ASSERTED,),
+                supporting_evidence_ids=review_ids,
+                limitations=(
+                    "A reviewer role does not establish review quality or implementation "
+                    "ownership.",
+                ),
+            )
+        else:
+            answers["action.review"] = unknown_answer(
+                "action.review",
+                by_id["action.review"],
+                "Add reviewer participation evidence.",
             )
 
         ladder = summary.get("release_ladder", {})
         merged_rung = ladder.get("merged", {}) if isinstance(ladder, dict) else {}
         if isinstance(merged_rung, dict) and merged_rung.get("status") != "unknown":
-            answers["result.changed"] = QuestionAnswer(
-                question_id="result.changed",
-                question=by_id["result.changed"],
+            answers["result.change"] = QuestionAnswer(
+                question_id="result.change",
+                question=by_id["result.change"],
                 answer_draft=str(merged_rung.get("statement")),
                 status=(ClaimStatus.CONTRADICTED if contradiction_ids else ClaimStatus.SUPPORTED),
                 observation_types=(ObservationType.SOURCE_ASSERTED,),
@@ -1170,17 +1161,17 @@ class PacketBuilder:
                 limitations=tuple(str(value) for value in merged_rung.get("limitations", [])),
             )
         else:
-            answers["result.changed"] = unknown_answer(
-                "result.changed",
-                by_id["result.changed"],
+            answers["result.change"] = unknown_answer(
+                "result.change",
+                by_id["result.change"],
                 "Add merged or otherwise accepted outcome evidence.",
                 contradictions=contradiction_ids,
             )
         measured_rung = ladder.get("measurably_successful", {}) if isinstance(ladder, dict) else {}
         if isinstance(measured_rung, dict) and measured_rung.get("status") != "unknown":
-            answers["result.measured"] = QuestionAnswer(
-                question_id="result.measured",
-                question=by_id["result.measured"],
+            answers["result.measurement"] = QuestionAnswer(
+                question_id="result.measurement",
+                question=by_id["result.measurement"],
                 answer_draft=str(measured_rung.get("statement")),
                 status=ClaimStatus(str(measured_rung.get("status"))),
                 observation_types=(ObservationType.HUMAN_ATTESTED,),
@@ -1190,9 +1181,9 @@ class PacketBuilder:
                 limitations=tuple(str(value) for value in measured_rung.get("limitations", [])),
             )
         else:
-            answers["result.measured"] = unknown_answer(
-                "result.measured",
-                by_id["result.measured"],
+            answers["result.measurement"] = unknown_answer(
+                "result.measurement",
+                by_id["result.measurement"],
                 "Add a sourced before-and-after metric.",
             )
         if modules and module_records:
@@ -1210,7 +1201,7 @@ class PacketBuilder:
             )
         for question_id, claims, missing in (
             (
-                "result.efficiency",
+                "result.errors_time",
                 {"efficiency", "error_reduction", "time_reduction"},
                 "Add a sourced error or time comparison.",
             ),
@@ -1219,7 +1210,7 @@ class PacketBuilder:
                 {"business_outcome", "conversion", "stability"},
                 "Add a sourced business or stability result.",
             ),
-            ("result.reused", {"reused_later", "reuse"}, "Add a later-reference or reuse record."),
+            ("result.reuse", {"reused_later", "reuse"}, "Add a later-reference or reuse record."),
         ):
             answers[question_id] = self._attested_or_unknown(
                 question_id, by_id[question_id], contribution, claims, missing
@@ -1233,9 +1224,9 @@ class PacketBuilder:
             )
         ]
         if release_evidence:
-            answers["result.released"] = QuestionAnswer(
-                question_id="result.released",
-                question=by_id["result.released"],
+            answers["result.release"] = QuestionAnswer(
+                question_id="result.release",
+                question=by_id["result.release"],
                 answer_draft=(
                     "Evidence reaches the deployment-observed rung; later user-release "
                     "states remain separate."
@@ -1246,9 +1237,9 @@ class PacketBuilder:
                 limitations=("Deployment does not prove release to mobile users.",),
             )
         else:
-            answers["result.released"] = unknown_answer(
-                "result.released",
-                by_id["result.released"],
+            answers["result.release"] = unknown_answer(
+                "result.release",
+                by_id["result.release"],
                 "Add explicit deployment or user-release evidence.",
             )
         current_attestation = find_attestation(
@@ -1286,16 +1277,18 @@ class PacketBuilder:
                 by_id["result.feedback"],
                 "Add a named feedback source or attestation.",
             )
-        answers["result.interview_defensible"] = unknown_answer(
-            "result.interview_defensible",
-            by_id["result.interview_defensible"],
+        answers["result.defensibility"] = unknown_answer(
+            "result.defensibility",
+            by_id["result.defensibility"],
             "Use the defensibility breakdown; WorkTrace does not collapse it to a boolean.",
         )
 
-        return {
-            section: [answers[question_id].as_dict() for question_id, _ in questions]
-            for section, questions in PHASE4_QUESTIONS.items()
-        }
+        sections: dict[str, list[dict[str, object]]] = {}
+        for specification in PHASE4_QUESTIONS:
+            sections.setdefault(specification.section, []).append(
+                answers[specification.question_id].as_dict()
+            )
+        return sections
 
     def build_packet(self, identifier: str) -> dict[str, object]:
         contribution = self._resolve_contribution(identifier)
@@ -1308,6 +1301,7 @@ class PacketBuilder:
             for question in questions
         ]
         packet: dict[str, object] = {
+            "schema_version": PHASE4_SCHEMA_VERSION,
             "contribution": summary["contribution"],
             "as_of": summary["as_of"],
             "source_status": summary["source_status"],
