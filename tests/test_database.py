@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
 
 from worktrace.db.connection import connect, connect_read_only
 from worktrace.db.migrations import migrate, user_version
+from worktrace.db.readiness import DatabaseReadinessStatus, database_readiness
 
 
 def test_init_and_migrations_are_idempotent(tmp_path: Path) -> None:
@@ -57,5 +59,98 @@ def test_read_only_connection_rejects_mutation(tmp_path: Path) -> None:
             read_only.execute(
                 "INSERT INTO apps(id, name, market, business_type) VALUES ('x', 'X', '', '')"
             )
+    finally:
+        read_only.close()
+
+
+def test_read_only_connection_accepts_an_exact_short_busy_timeout(tmp_path: Path) -> None:
+    database_path = tmp_path / "worktrace.sqlite3"
+    writer = connect(database_path)
+    try:
+        migrate(writer, database_path)
+    finally:
+        writer.close()
+
+    read_only = connect_read_only(database_path, busy_timeout_ms=500)
+    try:
+        assert read_only.execute("PRAGMA query_only").fetchone()[0] == 1
+        assert read_only.execute("PRAGMA busy_timeout").fetchone()[0] == 500
+        assert read_only.execute("PRAGMA database_list").fetchone()[2] == str(
+            database_path.resolve()
+        )
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            read_only.execute(
+                "INSERT INTO apps(id, name, market, business_type) "
+                "VALUES ('blocked', 'Blocked', '', '')"
+            )
+    finally:
+        read_only.close()
+
+
+def test_read_only_lock_contention_obeys_the_short_timeout(tmp_path: Path) -> None:
+    database_path = tmp_path / "worktrace.sqlite3"
+    writer = connect(database_path)
+    migrate(writer, database_path)
+    writer.autocommit = True
+    writer.execute("BEGIN EXCLUSIVE")
+    try:
+        read_only = connect_read_only(database_path, busy_timeout_ms=500)
+        started = time.monotonic()
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                read_only.execute("SELECT * FROM apps").fetchall()
+        finally:
+            read_only.close()
+        assert 0.4 <= time.monotonic() - started < 1.5
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+
+
+def test_database_readiness_is_read_only_and_distinguishes_schema_drift(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "worktrace.sqlite3"
+    writer = connect(database_path)
+    try:
+        migrate(writer, database_path)
+    finally:
+        writer.close()
+
+    read_only = connect_read_only(database_path)
+    try:
+        ready = database_readiness(read_only)
+        assert ready.status is DatabaseReadinessStatus.READY
+        assert ready.current_version == ready.supported_version == 3
+    finally:
+        read_only.close()
+
+    writer = connect(database_path)
+    try:
+        writer.execute("PRAGMA user_version = 2")
+        writer.commit()
+    finally:
+        writer.close()
+    read_only = connect_read_only(database_path)
+    try:
+        older = database_readiness(read_only)
+        assert older.status is DatabaseReadinessStatus.UPGRADE_REQUIRED
+        assert older.current_version == 2
+        assert user_version(read_only) == 2
+    finally:
+        read_only.close()
+
+    writer = connect(database_path)
+    try:
+        writer.execute("PRAGMA user_version = 99")
+        writer.commit()
+    finally:
+        writer.close()
+    read_only = connect_read_only(database_path)
+    try:
+        newer = database_readiness(read_only)
+        assert newer.status is DatabaseReadinessStatus.UNSUPPORTED_NEWER
+        assert newer.current_version == 99
+        assert user_version(read_only) == 99
     finally:
         read_only.close()

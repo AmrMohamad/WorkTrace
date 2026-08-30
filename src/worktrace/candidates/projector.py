@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from worktrace.candidates.builder import SEED_PRIORITY, suggest_contribution_type
 from worktrace.candidates.decisions import (
     CREATION_ACTIONS,
+    _DecisionProjectionContext,
     active_decisions,
     creation_decision_scope_app,
 )
@@ -28,7 +29,12 @@ class CandidateView:
     decisions: tuple[dict[str, object], ...]
 
 
-def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> CandidateView:
+def project_candidate(
+    connection: sqlite3.Connection,
+    candidate_id: str,
+    *,
+    decision_context: _DecisionProjectionContext | None = None,
+) -> CandidateView:
     row = connection.execute(
         "SELECT * FROM candidate_groups WHERE id=?", (candidate_id,)
     ).fetchone()
@@ -51,7 +57,7 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
     status = str(row["status"])
     human_title = False
     human_type = False
-    decisions = active_decisions(connection, candidate_id)
+    decisions = active_decisions(connection, candidate_id, context=decision_context)
     for decision in decisions:
         payload = decision.payload
         is_creation = (
@@ -62,7 +68,12 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
         if decision.action == "confirm" or is_creation:
             if (
                 is_creation
-                and creation_decision_scope_app(connection, candidate_id, payload) != app_id
+                and (
+                    decision_context.decision_scopes.get(decision.id)
+                    if decision_context is not None
+                    else creation_decision_scope_app(connection, candidate_id, payload)
+                )
+                != app_id
             ):
                 continue
             status = "confirmed"

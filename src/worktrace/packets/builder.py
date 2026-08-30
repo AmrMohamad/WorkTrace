@@ -9,6 +9,7 @@ from typing import cast
 
 from worktrace.candidates.decisions import (
     CREATION_ACTIONS,
+    _DecisionProjectionContext,
     compensating_decision_ids,
     decision_lineages,
     decision_scope_map,
@@ -120,16 +121,27 @@ def _single_member(payload: dict[str, object]) -> str | None:
 class PacketBuilder:
     """Read model over the SQLite ledger; this class never mutates state."""
 
-    def __init__(self, connection: sqlite3.Connection, config: WorkTraceConfig) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        config: WorkTraceConfig,
+        *,
+        decision_context: _DecisionProjectionContext | None = None,
+    ) -> None:
         self.connection = connection
         self.config = config
+        self._decision_projection = decision_context
 
     def _app(self, app_id: str) -> AppConfig:
         return self.config.app(app_id)
 
     def _candidate(self, candidate_id: str) -> ContributionView | None:
         try:
-            projected = project_candidate(self.connection, candidate_id)
+            projected = project_candidate(
+                self.connection,
+                candidate_id,
+                decision_context=self._decision_projection,
+            )
         except NotFound:
             return None
         if projected.status == "ignored":
@@ -156,13 +168,26 @@ class PacketBuilder:
         )
 
     def _resolve_contribution(self, identifier: str) -> ContributionView:
-        lineage = resolve_decision_lineage(self.connection, identifier)
+        lineage = (
+            self._decision_projection.resolve_lineage(identifier)
+            if self._decision_projection is not None
+            else resolve_decision_lineage(self.connection, identifier)
+        )
         if lineage is None:
             candidate = self._candidate(identifier)
             if candidate is None:
                 raise NotFound(f"contribution not found: {identifier}")
-            scopes = decision_scope_map(self.connection, active_only=True)
-            for decision in decision_stream(self.connection, active_only=True):
+            scopes = (
+                self._decision_projection.decision_scopes
+                if self._decision_projection is not None
+                else decision_scope_map(self.connection, active_only=True)
+            )
+            decisions = (
+                self._decision_projection.for_target(identifier)
+                if self._decision_projection is not None
+                else decision_stream(self.connection, active_only=True)
+            )
+            for decision in decisions:
                 if decision.target_id != identifier or scopes.get(decision.id) != candidate.app_id:
                     continue
                 candidate.decision_evidence_ids.add(decision.id)
@@ -1341,6 +1366,64 @@ class PacketBuilder:
     def evidence_gaps(self, identifier: str) -> dict[str, object]:
         return build_gap_report(self.build_packet(identifier))
 
+    def candidate_list_item(self, app_id: str, candidate_id: str) -> dict[str, object]:
+        """Project one candidate with the canonical list-row evidence semantics."""
+
+        self._app(app_id)
+        projected: CandidateView = project_candidate(
+            self.connection,
+            candidate_id,
+            decision_context=self._decision_projection,
+        )
+        if projected.app_id != app_id:
+            raise ScopeViolation("candidate belongs to another application")
+        candidate = self._resolve_contribution(candidate_id)
+        if projected.status == "ignored":
+            raise NotFound(f"candidate was ignored by a human decision: {candidate_id}")
+        records = self._records(candidate)
+        if not records:
+            raise NotFound(f"candidate has no current evidence records: {candidate_id}")
+        period_from, period_to = self._date_range(records)
+        coverage = sorted({record.source for record in records})
+        raw_roles = build_participation_summary(self.connection, records, []).get(
+            "self_participations", []
+        )
+        roles = raw_roles if isinstance(raw_roles, list) else []
+        indicators = sorted(
+            {str(item.get("role")) for item in roles if isinstance(item, dict) and item.get("role")}
+        )
+        lineage = (
+            self._decision_projection.resolve_lineage(candidate_id, app_id=app_id)
+            if self._decision_projection is not None
+            else resolve_decision_lineage(
+                self.connection,
+                candidate_id,
+                app_id=app_id,
+            )
+        )
+        confirmed = None
+        if lineage is not None:
+            confirmed = next(
+                (
+                    str(decision.payload["contribution_id"])
+                    for decision in reversed(lineage.decisions)
+                    if decision.action in CREATION_ACTIONS
+                    and isinstance(decision.payload.get("contribution_id"), str)
+                ),
+                None,
+            )
+        return {
+            "candidate_id": candidate_id,
+            "confirmed_contribution_id": confirmed,
+            **self._title_provenance(candidate, records).as_fields(),
+            "period_from": period_from,
+            "period_to": period_to,
+            "suggested_type": candidate.contribution_type,
+            "status": projected.status,
+            "source_coverage": coverage,
+            "participation_indicators": indicators,
+        }
+
     def list_candidates(
         self,
         app_id: str,
@@ -1363,61 +1446,18 @@ class PacketBuilder:
         visible_items: list[dict[str, object]] = []
         for row in rows:
             try:
-                projected: CandidateView = project_candidate(self.connection, str(row["id"]))
-                candidate = self._resolve_contribution(str(row["id"]))
+                item = self.candidate_list_item(app_id, str(row["id"]))
             except NotFound:
                 continue
-            if projected.status == "ignored":
-                continue
-            records = self._records(candidate)
-            if not records:
-                continue
-            period_from, period_to = self._date_range(records)
-            period_from_date = _calendar_date(period_from)
-            period_to_date = _calendar_date(period_to)
+            period_from_date = _calendar_date(cast(str | None, item["period_from"]))
+            period_to_date = _calendar_date(cast(str | None, item["period_to"]))
             if date_from and period_to_date and period_to_date < date_from:
                 continue
             if date_to and period_from_date and period_from_date > date_to:
                 continue
-            coverage = sorted({record.source for record in records})
-            raw_roles = build_participation_summary(self.connection, records, []).get(
-                "self_participations", []
-            )
-            roles = raw_roles if isinstance(raw_roles, list) else []
-            indicators = sorted(
-                {
-                    str(item.get("role"))
-                    for item in roles
-                    if isinstance(item, dict) and item.get("role")
-                }
-            )
-            lineage = resolve_decision_lineage(
-                self.connection,
-                str(row["id"]),
-                app_id=app_id,
-            )
-            confirmed = None
-            if lineage is not None:
-                confirmed = next(
-                    (
-                        str(decision.payload["contribution_id"])
-                        for decision in reversed(lineage.decisions)
-                        if decision.action in CREATION_ACTIONS
-                        and isinstance(decision.payload.get("contribution_id"), str)
-                    ),
-                    None,
-                )
             visible_items.append(
                 {
-                    "candidate_id": str(row["id"]),
-                    "confirmed_contribution_id": confirmed,
-                    **self._title_provenance(candidate, records).as_fields(),
-                    "period_from": period_from,
-                    "period_to": period_to,
-                    "suggested_type": candidate.contribution_type,
-                    "status": projected.status,
-                    "source_coverage": coverage,
-                    "participation_indicators": indicators,
+                    **item,
                     "warnings": [
                         "Candidate grouping is deterministic derived state, not contribution truth."
                     ],
