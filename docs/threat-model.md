@@ -114,12 +114,19 @@ Controls:
   CSS selectors, commands, bindings, action names, or command-palette entries;
 - provider excerpts use the same literal-renderable boundary in a scrollable widget and expose no
   URL action;
+- `WorkTraceApp` and every normal and modal WorkTrace screen set `ALLOW_SELECT = False`; screens
+  remove the inherited `ctrl+c`/`super+c -> screen.copy_text` bindings and override
+  `action_copy_text()` as a no-op, so selected evidence cannot reach `App.copy_to_clipboard`
+  through Textual's inherited path;
 - the command palette is a fixed allowlist that excludes Textual's default Screenshot command; and
-- only a validated stable WorkTrace ID may invoke the application clipboard action.
+- only the separate explicit action for a validated stable WorkTrace ID may invoke the application
+  clipboard action.
 
 These are accidental-disclosure controls, not a security boundary against the authorized local
 user. WorkTrace cannot prevent operating-system screenshots, terminal selection, photography,
-terminal logging, or inspection of data intentionally displayed to that user.
+terminal logging, or inspection of data intentionally displayed to that user. Here, terminal
+selection means terminal-emulator behavior outside Textual's disabled application selection/copy
+path.
 
 ## Threat scenarios
 
@@ -227,6 +234,9 @@ rejects writes, and TUI journeys do not reach credentials, providers, sockets, o
 Candidate rows and representative tree/list cells, modal titles and bodies, source errors, and
 notifications additionally prove Rich/action markup remains visible literal text, creates no
 markup-derived spans or links, and registers or triggers no actions, commands, or bindings.
+Behavioral tests also attempt mouse selection over evidence and dispatch both `ctrl+c` and
+`super+c`; the clipboard remains unchanged and `copy_to_clipboard` is not called. The explicit
+validated-ID action remains covered and copies the exact stable ID once.
 
 ## Residual risk
 

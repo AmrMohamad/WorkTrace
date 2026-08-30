@@ -333,8 +333,9 @@ fixed source-controlled text; the dynamic detail must be shown in a separate lit
 Passing encoded dynamic content as a bare `str` to any markup-capable Textual/Rich API is
 forbidden. Dynamic text is also never used to construct widget IDs, CSS selectors, bindings,
 action names, command names, or command-palette entries. Provider excerpts use a scrollable
-`Static(literal_dynamic_text(value), markup=False)`, never Markdown, Rich markup, or a selectable
-`TextArea`.
+`Static(literal_dynamic_text(value), markup=False)` as their literal renderer, never Markdown or
+Rich markup. `Static` is not assumed to be non-selectable; selection and inherited copy behavior
+are disabled by the screen policy below.
 
 The UI displays an encoded presentation value but retains the original DTO value separately. A
 clipboard action validates and copies the original stable ID exactly; it never copies the encoded
@@ -342,16 +343,26 @@ label or any adjacent dynamic text.
 
 ### Clipboard, URLs, and screenshots
 
+`WorkTraceApp` sets `ALLOW_SELECT = False`. Every normal and modal WorkTrace screen also inherits
+one selection policy that sets `ALLOW_SELECT = False`, removes the inherited
+`ctrl+c`/`super+c -> screen.copy_text` bindings, and overrides `action_copy_text()` as a no-op. The
+root screen, application selector, candidate browser, contribution screen, evidence modal, help,
+and error surfaces all use this policy. The no-op action is defense in depth if an inherited or
+future binding still dispatches `screen.copy_text`; no selected text may reach
+`App.copy_to_clipboard`.
+
 Only a value that passes the WorkTrace stable-ID validator may reach `copy_to_clipboard`. The UI
 offers no application action to copy evidence bodies, packets, errors, titles, or provider URLs.
-Provider URLs are neither clickable nor opened.
+Provider URLs are neither clickable nor opened. The explicit stable-ID action is separate from
+`screen.copy_text`, validates the original DTO value, and copies that exact ID.
 
 The command palette is an exact static allowlist and does not call Textual's default system-command
 provider. It contains only Quit, keyboard help, Switch application, Refresh, and Return to
 candidates when contextually valid. There is no screenshot command.
 
 These controls reduce accidental disclosure. They do not prevent operating-system screenshots,
-terminal selection, photography, terminal logging, or other actions by the authorized local user.
+terminal-emulator selection outside Textual's application actions, photography, terminal logging,
+or other actions by the authorized local user.
 
 ## TUI behavior
 
@@ -506,6 +517,12 @@ in an incomplete shell PR.
   commands, or bindings.
 - Tests fail if encoded dynamic content is passed as a bare `str` to a markup-capable cell or
   widget update instead of the literal-renderable helper or an explicit literal API.
+- `WorkTraceApp` and every normal and modal screen report `ALLOW_SELECT = False`; screens have no
+  effective `ctrl+c`/`super+c -> screen.copy_text` binding and retain a no-op
+  `action_copy_text()`.
+- A `Pilot` mouse-selection attempt over an evidence excerpt followed by `ctrl+c` and `super+c`
+  leaves the clipboard unchanged and never calls `copy_to_clipboard`; the explicit validated-ID
+  action still invokes it once with the exact stable ID.
 
 ### Interaction and packaging
 

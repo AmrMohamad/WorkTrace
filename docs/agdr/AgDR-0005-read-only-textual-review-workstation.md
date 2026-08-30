@@ -64,8 +64,11 @@ approved terminal workflow while preserving CLI and MCP authority boundaries.
    the same boundary in a scrollable literal `Static`. Dynamic text never supplies widget
    identities, CSS selectors, commands, bindings, actions, or palette items.
 10. The command palette is a fixed allowlist without Textual's default screenshot command. Only a
-    validated WorkTrace stable ID may reach the application clipboard action. Provider URLs are
-    non-clickable.
+    validated WorkTrace stable ID may reach the application clipboard action. `WorkTraceApp` and
+    every normal and modal WorkTrace screen set `ALLOW_SELECT = False`; screens remove the inherited
+    `ctrl+c`/`super+c -> screen.copy_text` bindings and override `action_copy_text()` as a no-op,
+    so selected text cannot reach `App.copy_to_clipboard`. The explicit stable-ID action remains a
+    separate validated path. Provider URLs are non-clickable.
 11. Every database operation runs in a Textual thread worker. Immutable DTOs return by thread-safe
     messages; widgets update only on the UI thread; monotonic request IDs discard stale results.
 12. The journey is keyboard complete at 80x24 and may add non-exclusive side-by-side context at
@@ -82,8 +85,8 @@ approved terminal workflow while preserving CLI and MCP authority boundaries.
 - Terminal encoding is deliberately separate from persisted normalization and redaction, so search
   and evidence identities remain stable.
 - Removing application screenshot/body-copy actions reduces accidental disclosure but cannot stop
-  an authorized local user from using operating-system capture, terminal selection, photography,
-  or terminal logging.
+  an authorized local user from using operating-system capture, terminal-emulator selection
+  outside Textual's application actions, photography, or terminal logging.
 - Textual's redraw model is not represented as fully screen-reader accessible. CLI JSON and MCP
   remain the structured alternatives.
 - Imports, decisions, attestations, configuration editing, maintenance, persistent preferences,
@@ -109,7 +112,11 @@ recovery, and cancellation; it must not silently broaden this record.
   notification surfaces prove Rich/action markup remains visible literal text, produces no
   markup-derived spans or links, and creates no actions, commands, or bindings.
 - Textual tests prove the keyboard journey at 80x24 and 120x40, stale-worker rejection, fixed
-  commands, stable-ID-only clipboard, and fresh-process `NO_COLOR` behavior.
+  commands, stable-ID-only clipboard, and fresh-process `NO_COLOR` behavior. `WorkTraceApp` and
+  every screen/modal disable automatic selection, and screens neutralize inherited
+  `screen.copy_text`; mouse selection plus `ctrl+c`/`super+c` over evidence leaves the clipboard
+  unchanged and never invokes `copy_to_clipboard`, while the validated-ID action copies the exact
+  ID once.
 - An isolated wheel smoke proves the dependency, entry point, and TCSS resource are installed.
 - Existing CLI and six-tool MCP regression suites remain green.
 
