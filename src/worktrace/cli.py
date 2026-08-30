@@ -24,7 +24,11 @@ from worktrace.config import (
     jira_credentials,
     load_config,
 )
-from worktrace.db.authority import authoritative_current_participation_ctes
+from worktrace.db.authority import (
+    authoritative_current_participation_ctes,
+    parse_scope,
+    run_is_authoritative,
+)
 from worktrace.db.connection import connect
 from worktrace.db.migrations import backup_database, migrate
 from worktrace.db.queries import search_evidence, source_status
@@ -53,6 +57,7 @@ app.add_typer(evidence_app, name="evidence")
 app.add_typer(rebuild_app, name="rebuild")
 
 ConfigOption = Annotated[Path | None, typer.Option("--config", exists=True, dir_okay=False)]
+DateArgument = Annotated[str | None, typer.Argument()]
 
 
 def _emit(value: object) -> None:
@@ -66,14 +71,151 @@ def _iso_date(value: str, label: str) -> date:
         raise WorkTraceError(f"{label} must be an ISO date (YYYY-MM-DD)") from exc
 
 
-def _window(configuration: WorkTraceConfig, start: str, end: str) -> tuple[date, date]:
+def _window(
+    configuration: WorkTraceConfig, start: str | None, end: str | None
+) -> tuple[date, date]:
+    """Admit only a complete configured employment snapshot.
+
+    A sync run is the replacement unit for an authoritative source instance.
+    Allowing a later narrow interval would make earlier evidence invisible even
+    though it remains stored, so v0.1 deliberately has no partial-window mode.
+    """
+
+    if start is None and end is None:
+        return configuration.employment_from, configuration.employment_to
+    if start is None or end is None:
+        raise WorkTraceError("date_from and date_to must be provided together")
     date_from = _iso_date(start, "date_from")
     date_to = _iso_date(end, "date_to")
     if date_from > date_to:
         raise WorkTraceError("date_from must not be after date_to")
     if date_from < configuration.employment_from or date_to > configuration.employment_to:
         raise WorkTraceError("import window is outside the configured employment scope")
+    expected = (configuration.employment_from, configuration.employment_to)
+    if (date_from, date_to) != expected:
+        raise WorkTraceError(
+            "unsafe_scope_replacement: WorkTrace v0.1 imports must use the full "
+            "configured employment range"
+        )
     return date_from, date_to
+
+
+@dataclass(frozen=True, slots=True)
+class _ImportWindow:
+    date_from: date
+    date_to: date
+
+
+def _stored_boundary_present(value: object) -> bool:
+    return value is not None and value != ""
+
+
+def _parse_stored_window(
+    raw_from: object,
+    raw_to: object,
+    *,
+    source: str,
+) -> _ImportWindow:
+    has_from = _stored_boundary_present(raw_from)
+    has_to = _stored_boundary_present(raw_to)
+    if has_from != has_to:
+        raise WorkTraceError(
+            f"unsafe_scope_replacement: the prior authoritative {source} range is incomplete"
+        )
+    if not has_from:
+        raise WorkTraceError(
+            f"unsafe_scope_replacement: the prior authoritative {source} range cannot be verified"
+        )
+    if not isinstance(raw_from, str) or not isinstance(raw_to, str):
+        raise WorkTraceError(
+            f"unsafe_scope_replacement: the prior authoritative {source} range is malformed"
+        )
+    try:
+        date_from = _iso_date(raw_from, f"{source} date_from")
+        date_to = _iso_date(raw_to, f"{source} date_to")
+    except WorkTraceError as exc:
+        raise WorkTraceError(
+            f"unsafe_scope_replacement: the prior authoritative {source} range is malformed"
+        ) from exc
+    if date_from > date_to:
+        raise WorkTraceError(
+            f"unsafe_scope_replacement: the prior authoritative {source} range is reversed"
+        )
+    return _ImportWindow(date_from, date_to)
+
+
+def _assert_no_scope_contraction(
+    repository: EvidenceRepository,
+    app_id: str,
+    date_from: date,
+    date_to: date,
+) -> None:
+    """Reject a configuration shrink that would conceal a prior complete run."""
+
+    rows = repository.connection.execute(
+        """
+        SELECT sr.source, sr.status, sr.completeness, sr.scope_json,
+               session.app_id AS session_app_id,
+               session.date_from AS session_date_from,
+               session.date_to AS session_date_to
+        FROM sync_runs sr
+        LEFT JOIN import_sessions session ON session.id=sr.import_session_id
+        WHERE sr.app_id=?
+        """,
+        (app_id,),
+    )
+    for row in rows:
+        scope = parse_scope(row["scope_json"])
+        if not run_is_authoritative(
+            str(row["source"]), str(row["status"]), str(row["completeness"]), scope
+        ):
+            continue
+        if str(row["source"]) == "manual":
+            # Manual evidence is additive and never replaces a source snapshot.
+            continue
+        scope_from = scope.get("date_from")
+        scope_to = scope.get("date_to")
+        scope_has_from = _stored_boundary_present(scope_from)
+        scope_has_to = _stored_boundary_present(scope_to)
+        if scope_has_from != scope_has_to:
+            raise WorkTraceError(
+                "unsafe_scope_replacement: the prior authoritative scope contains "
+                "only one range boundary"
+            )
+        if scope_has_from:
+            prior_window = _parse_stored_window(scope_from, scope_to, source="scope")
+            if row["session_app_id"] is not None:
+                if str(row["session_app_id"]) != app_id:
+                    raise WorkTraceError(
+                        "unsafe_scope_replacement: parent import session belongs "
+                        "to another application"
+                    )
+                session_window = _parse_stored_window(
+                    row["session_date_from"],
+                    row["session_date_to"],
+                    source="parent session",
+                )
+                if session_window != prior_window:
+                    raise WorkTraceError(
+                        "unsafe_scope_replacement: source scope and parent session "
+                        "contain contradictory ranges"
+                    )
+        else:
+            if row["session_app_id"] is None or str(row["session_app_id"]) != app_id:
+                raise WorkTraceError(
+                    "unsafe_scope_replacement: the historical range cannot be verified "
+                    "because no valid same-application parent session exists"
+                )
+            prior_window = _parse_stored_window(
+                row["session_date_from"],
+                row["session_date_to"],
+                source="parent session",
+            )
+        if prior_window.date_from < date_from or prior_window.date_to > date_to:
+            raise WorkTraceError(
+                "unsafe_scope_replacement: configured employment range would hide "
+                "a prior authoritative import"
+            )
 
 
 def _source_instance(app_id: str, source: str, identifier: object) -> str:
@@ -287,14 +429,15 @@ def _import_summary(
 def import_git(
     app_id: str,
     repo: Path,
-    date_from: str,
-    date_to: str,
+    date_from: DateArgument = None,
+    date_to: DateArgument = None,
     config: ConfigOption = None,
 ) -> None:
     configuration, connection, repository = _open(config)
     try:
         start, end = _window(configuration, date_from, date_to)
         configured_app = configuration.app(app_id)
+        _assert_no_scope_contraction(repository, app_id, start, end)
         scoped_repo = configured_app.assert_repo_scope(repo)
         source_instance = _source_instance(app_id, "git", scoped_repo)
         key = email_hmac_key(configuration.data_directory, create=False)
@@ -339,14 +482,15 @@ def import_git(
 @import_app.command("jira")
 def import_jira(
     app_id: str,
-    date_from: str,
-    date_to: str,
+    date_from: DateArgument = None,
+    date_to: DateArgument = None,
     config: ConfigOption = None,
 ) -> None:
     configuration, connection, repository = _open(config)
     try:
         start, end = _window(configuration, date_from, date_to)
         configured_app = configuration.app(app_id)
+        _assert_no_scope_contraction(repository, app_id, start, end)
         credentials = jira_credentials()
         if credentials is None:
             raise WorkTraceError("Jira credentials are not configured")
@@ -417,14 +561,15 @@ def import_jira(
 def import_gitlab(
     app_id: str,
     project_id: int,
-    date_from: str,
-    date_to: str,
+    date_from: DateArgument = None,
+    date_to: DateArgument = None,
     config: ConfigOption = None,
 ) -> None:
     configuration, connection, repository = _open(config)
     try:
         start, end = _window(configuration, date_from, date_to)
         configured_app = configuration.app(app_id)
+        _assert_no_scope_contraction(repository, app_id, start, end)
         if not configured_app.allows_gitlab_project(project_id):
             raise WorkTraceError("GitLab project is not configured for this app")
         credentials = gitlab_credentials()
@@ -505,14 +650,15 @@ def import_gitlab(
 @import_app.command("all")
 def import_all(
     app_id: str,
-    date_from: str,
-    date_to: str,
+    date_from: DateArgument = None,
+    date_to: DateArgument = None,
     config: ConfigOption = None,
 ) -> None:
     """Import every configured source and report partial sources explicitly."""
     configuration, connection, repository = _open(config)
     start, end = _window(configuration, date_from, date_to)
     configured_app = configuration.app(app_id)
+    _assert_no_scope_contraction(repository, app_id, start, end)
     session_id = repository.create_import_session(configured_app, start, end)
     results: list[dict[str, object]] = []
     try:

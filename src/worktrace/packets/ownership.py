@@ -3,10 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 
-from worktrace.db.authority import (
-    authoritative_current_participation_ctes,
-    authoritative_current_reference_ctes,
-)
+from worktrace.db.authority import authoritative_current_participation_ctes
 from worktrace.packets.authority import find_attestation
 from worktrace.packets.models import EvidenceRecord, HumanAttestation
 from worktrace.participation import (
@@ -51,39 +48,7 @@ def build_participation_summary(
 
     self_rows = [row for row in rows if bool(row["is_self"])]
     other_rows = [row for row in rows if not bool(row["is_self"])]
-    record_by_object = {record.object_id: record for record in records}
     data_by_object = {record.object_id: record.data for record in records}
-    mr_path_support: dict[str, set[str]] = {}
-    object_ids = sorted(record_by_object)
-    if object_ids:
-        for relation in connection.execute(
-            f"""
-            WITH {authoritative_current_reference_ctes()}
-            SELECT from_object_id, to_object_id, supporting_observation_id
-            FROM authoritative_current_references
-            WHERE relationship_type='gitlab_mr_changed_paths'
-              AND from_object_id IN ({_placeholders(object_ids)})
-              AND to_object_id IN ({_placeholders(object_ids)})
-            """,
-            [*object_ids, *object_ids],
-        ):
-            left = record_by_object[str(relation["from_object_id"])]
-            right = record_by_object[str(relation["to_object_id"])]
-            mr, paths = (right, left) if "changed_path" in left.kind else (left, right)
-            if (
-                "changed_path" in paths.kind
-                and paths.completeness in {"complete", "complete_for_scope"}
-                and paths.data.get("overflow") is not True
-                and paths.data.get("scope_complete") is not False
-                and paths.data.get("changed_paths")
-            ):
-                mr_path_support.setdefault(mr.object_id, set()).add(paths.evidence_id)
-
-    classified_data: dict[str, dict[str, object]] = {}
-    for object_id, data in data_by_object.items():
-        classified_data[object_id] = dict(data)
-        if mr_path_support.get(object_id):
-            classified_data[object_id]["changed_paths"] = True
     self_by_object: dict[str, set[str]] = {}
     for row in self_rows:
         self_by_object.setdefault(str(row["source_object_id"]), set()).add(
@@ -108,21 +73,17 @@ def build_participation_summary(
                     ParticipationCategory.MERGED,
                     ParticipationCategory.DEPLOYED,
                     ParticipationCategory.RELEASE_ASSOCIATED,
+                    ParticipationCategory.CONTEXT,
                 )
                 if category
                 in categories_for_evidence(
                     str(row["source"]),
                     str(row["kind"]),
                     str(row["role"]),
-                    classified_data.get(str(row["source_object_id"]), {}),
+                    data_by_object.get(str(row["source_object_id"]), {}),
                 )
             ),
-            "claim_supporting_evidence_ids": sorted(
-                {
-                    str(row["observation_id"]),
-                    *mr_path_support.get(str(row["source_object_id"]), set()),
-                }
-            ),
+            "claim_supporting_evidence_ids": [str(row["observation_id"])],
             "effective_from": row["effective_from"],
             "effective_to": row["effective_to"],
         }
@@ -151,7 +112,7 @@ def build_participation_summary(
             str(row["source"]),
             str(row["kind"]),
             str(row["role"]),
-            classified_data.get(str(row["source_object_id"]), {}),
+            data_by_object.get(str(row["source_object_id"]), {}),
         )
     ]
 

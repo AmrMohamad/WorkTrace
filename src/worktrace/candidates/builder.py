@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections import deque
 from datetime import UTC, datetime
@@ -17,7 +16,7 @@ from worktrace.participation import (
     supports_category,
 )
 
-GENERATOR_VERSION = "2"
+GENERATOR_VERSION = "3"
 MAX_DEPTH = 3
 MAX_MEMBERS = 200
 MAX_CONTEXT = 50
@@ -82,20 +81,6 @@ def suggest_contribution_type(kind: str, title: str) -> str:
     return "unknown"
 
 
-def _has_complete_changed_paths(row: sqlite3.Row) -> bool:
-    if str(row["completeness"]) not in {"complete", "complete_for_scope"}:
-        return False
-    raw_data = json.loads(str(row["data_json"]))
-    data = raw_data if isinstance(raw_data, dict) else {}
-    paths = data.get("changed_paths")
-    return (
-        isinstance(paths, list)
-        and bool(paths)
-        and data.get("overflow") is not True
-        and data.get("scope_complete") is not False
-    )
-
-
 def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
     connection = repository.connection
     current = repository.current_observations(app_id)
@@ -110,26 +95,6 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
             (app_id,),
         )
     )
-    mr_with_changed_paths: set[str] = set()
-    for relation in references:
-        if str(relation["relationship_type"]) != "gitlab_mr_changed_paths":
-            continue
-        left = str(relation["from_object_id"])
-        right = str(relation["to_object_id"])
-        left_kind = str(objects[left]["kind"]) if left in objects else ""
-        right_kind = str(objects[right]["kind"]) if right in objects else ""
-        if (
-            left_kind == "gitlab_mr"
-            and "changed_path" in right_kind
-            and _has_complete_changed_paths(objects[right])
-        ):
-            mr_with_changed_paths.add(left)
-        elif (
-            right_kind == "gitlab_mr"
-            and "changed_path" in left_kind
-            and _has_complete_changed_paths(objects[left])
-        ):
-            mr_with_changed_paths.add(right)
     roles = _self_roles(connection, app_id)
     linked_ids = {
         object_id
@@ -139,22 +104,20 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
     seeds = []
     for object_id, row in objects.items():
         kind = str(row["kind"])
-        raw_data = json.loads(str(row["data_json"]))
-        data = raw_data if isinstance(raw_data, dict) else {}
-        if object_id in mr_with_changed_paths:
-            data = {**data, "changed_paths": True}
         self_roles = roles.get(object_id, set())
         qualifies = (
             (kind == "jira_issue" and (self_roles or object_id in linked_ids))
             or (
                 kind == "gitlab_mr"
-                and any(
-                    category in categories_for_evidence("gitlab", kind, role, data)
-                    for role in self_roles
-                    for category in (
-                        ParticipationCategory.IMPLEMENTED,
-                        ParticipationCategory.REVIEWED,
-                        ParticipationCategory.ASSIGNED,
+                and (
+                    "mr_author" in self_roles
+                    or any(
+                        category in categories_for_evidence("gitlab", kind, role, {})
+                        for role in self_roles
+                        for category in (
+                            ParticipationCategory.REVIEWED,
+                            ParticipationCategory.ASSIGNED,
+                        )
                     )
                 )
             )

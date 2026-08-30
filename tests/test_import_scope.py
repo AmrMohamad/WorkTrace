@@ -11,7 +11,10 @@ from typer.testing import CliRunner, Result
 from worktrace.adapters.git_local import LocalGitAdapter, LocalGitConfig
 from worktrace.adapters.gitlab import GitLabAdapter, GitLabConfig
 from worktrace.adapters.jira import JiraAdapter, JiraConfig
-from worktrace.cli import app
+from worktrace.cli import _assert_no_scope_contraction, _window, app
+from worktrace.config import load_config
+from worktrace.db.connection import connect
+from worktrace.db.repository import EvidenceRepository
 from worktrace.errors import ConfigurationError, WorkTraceError
 
 
@@ -154,3 +157,379 @@ def test_cli_import_commands_reject_reversed_and_out_of_employment_windows(
     assert result.exit_code != 0
     assert isinstance(result.exception, WorkTraceError)
     assert message in _error_text(result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["import", "git", "sample_store", "{repo}", "2025-01-01", "2025-12-31"],
+        ["import", "all", "sample_store", "2025-01-01", "2025-12-31"],
+    ],
+)
+def test_narrow_import_window_is_rejected_before_creating_session_or_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+) -> None:
+    monkeypatch.delenv("WORKTRACE_DB_PATH", raising=False)
+    repository = _repository(tmp_path)
+    config = _config(tmp_path, repository)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    database_path = tmp_path / "data" / "worktrace.sqlite3"
+    connection = connect(database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM import_sessions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM sync_runs").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+    arguments = [value.format(repo=repository) for value in command] + [
+        "--config",
+        str(config),
+    ]
+    result = runner.invoke(app, arguments)
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, WorkTraceError)
+    assert "unsafe_scope_replacement" in _error_text(result)
+    connection = connect(database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM import_sessions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM sync_runs").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_configured_scope_cannot_contract_past_authoritative_history(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "2024-01-01", "date_to": "2026-08-26"},
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="unsafe_scope_replacement"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2025, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_scope_contraction_uses_import_session_dates_when_run_scope_dates_are_missing(
+    tmp_path: Path,
+) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    configuration = load_config(config_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        session_id = evidence.create_import_session(
+            configuration.app("sample_store"), date(2024, 1, 1), date(2026, 8, 26)
+        )
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"selection_reasons": ["legacy import"]},
+            session_id,
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="would hide"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2025, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_one_missing_scope_boundary_does_not_mix_scope_and_session_ranges(
+    tmp_path: Path,
+) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    configuration = load_config(config_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        session_id = evidence.create_import_session(
+            configuration.app("sample_store"), date(2024, 1, 1), date(2026, 8, 26)
+        )
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "2025-01-01"},
+            session_id,
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="only one range boundary"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2025, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_reversed_authoritative_scope_range_fails_closed(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "2026-08-26", "date_to": "2024-01-01"},
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="scope range is reversed"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2024, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_cross_app_parent_import_session_cannot_supply_scope_dates(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        with connection:
+            connection.execute("INSERT INTO apps(id, name) VALUES ('other_app', 'Other App')")
+            connection.execute(
+                """
+                INSERT INTO import_sessions(
+                    id, app_id, status, started_at, date_from, date_to
+                ) VALUES (?, ?, 'complete', ?, ?, ?)
+                """,
+                (
+                    "import:other-app",
+                    "other_app",
+                    "2026-08-26T00:00:00Z",
+                    "2024-01-01",
+                    "2026-08-26",
+                ),
+            )
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"selection_reasons": ["legacy"]},
+            "import:other-app",
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="same-application parent session"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2024, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_conflicting_scope_and_parent_session_ranges_fail_closed(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    configuration = load_config(config_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        session_id = evidence.create_import_session(
+            configuration.app("sample_store"), date(2024, 1, 1), date(2026, 8, 26)
+        )
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "2025-01-01", "date_to": "2026-08-26"},
+            session_id,
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="contradictory ranges"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2024, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_complete_scope_and_same_app_parent_session_range_succeeds(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config_path = _config(tmp_path, repository_path)
+    configuration = load_config(config_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config_path)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        session_id = evidence.create_import_session(
+            configuration.app("sample_store"), date(2024, 1, 1), date(2026, 8, 26)
+        )
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "2024-01-01", "date_to": "2026-08-26"},
+            session_id,
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        _assert_no_scope_contraction(
+            evidence,
+            "sample_store",
+            date(2024, 1, 1),
+            date(2026, 8, 26),
+        )
+    finally:
+        connection.close()
+
+
+def test_unknown_authoritative_non_manual_scope_fails_closed(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        run_id = evidence.start_sync_run(
+            "sample_store", "git", "fixture-repository", {"selection_reasons": ["legacy"]}
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="cannot be verified"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2024, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_malformed_authoritative_scope_dates_fail_closed(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        run_id = evidence.start_sync_run(
+            "sample_store",
+            "git",
+            "fixture-repository",
+            {"date_from": "not-a-date", "date_to": "2026-08-26"},
+        )
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        with pytest.raises(WorkTraceError, match="is malformed"):
+            _assert_no_scope_contraction(
+                evidence,
+                "sample_store",
+                date(2024, 1, 1),
+                date(2026, 8, 26),
+            )
+    finally:
+        connection.close()
+
+
+def test_manual_evidence_without_snapshot_dates_does_not_block_import(tmp_path: Path) -> None:
+    repository_path = _repository(tmp_path)
+    config = _config(tmp_path, repository_path)
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--config", str(config)])
+    assert initialized.exit_code == 0, _error_text(initialized)
+
+    connection = connect(tmp_path / "data" / "worktrace.sqlite3")
+    try:
+        evidence = EvidenceRepository(connection)
+        run_id = evidence.start_sync_run("sample_store", "manual", "local", {})
+        evidence.finish_sync_run(run_id, "complete", "complete_for_scope")
+
+        _assert_no_scope_contraction(
+            evidence,
+            "sample_store",
+            date(2024, 1, 1),
+            date(2026, 8, 26),
+        )
+    finally:
+        connection.close()
+
+
+def test_omitted_window_uses_the_complete_configured_employment_range(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    config_path = _config(tmp_path, repository)
+    configuration = load_config(config_path)
+
+    assert _window(configuration, None, None) == (
+        date(2024, 1, 1),
+        date(2026, 8, 26),
+    )
