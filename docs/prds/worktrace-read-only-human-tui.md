@@ -32,7 +32,7 @@ A successful session means the engineer can select one contribution and understa
 
 ### Goals
 
-1. Complete one end-to-end contribution review using only the keyboard in an 80x24 terminal.
+1. Complete one end-to-end contribution review using only the keyboard in an 80x24 compact layout and a 120x40 full layout.
 2. Keep every material answer traceable to stable evidence identifiers while preserving unknown, partial, human-attested, contradicted, stale, and unavailable states.
 3. Explain source health and failures honestly, with a concrete next action and no implied data preservation that the current read model cannot prove.
 4. Preserve the existing CLI and MCP contracts while adding no human write capability in the first release.
@@ -61,6 +61,7 @@ No usage telemetry is collected. Success is measured during acceptance testing w
 | Question completeness | Every question returned by the canonical packet appears exactly once | Read-model-to-UI parity test |
 | Bounded browsing | One candidate page never projects beyond its configured scan budget | Query diagnostics in tests |
 | Small-terminal usability | The complete journey works at 80x24 | Headless terminal-size acceptance test |
+| Full-layout usability | Candidate context and contribution details use the available space at 120x40 | Headless terminal-size acceptance test |
 | Read-only integrity | No database, managed data-directory, provider, or network state changes during UI journeys | Capability and before/after integrity tests |
 
 ## User Stories
@@ -134,6 +135,7 @@ No usage telemetry is collected. Success is measured during acceptance testing w
 - [ ] Every action is keyboard accessible; mouse input is optional.
 - [ ] Focus is visible and no meaning depends on color alone.
 - [ ] `NO_COLOR` remains understandable in a fresh process.
+- [ ] At 120x40, the candidate browser may show a selected-row preview beside the table and contribution evidence may show selection and detail together without hiding any required action.
 
 ## Edge Cases
 
@@ -183,6 +185,7 @@ No usage telemetry is collected. Success is measured during acceptance testing w
 | Terminal safety | Dynamic text is rendered literally after presentation encoding | No raw dangerous control survives; no dynamic command or widget identity |
 | Disclosure | Application capture actions are narrowly scoped | Stable IDs only; no screenshot, body, packet, error, title, or URL copy action |
 | Accessibility | Keyboard, focus, symbols, labels, monochrome, and compact layout are required | Verified at 80x24 and with `NO_COLOR`; no full screen-reader claim |
+| Responsive layout | Compact and full layouts preserve the same review semantics | Complete drill-down at 80x24; additional side-by-side context at 120x40 |
 | Compatibility | Existing automation and agent surfaces remain stable | Existing CLI/MCP smoke and regression tests pass |
 | Packaging | Installed distributions contain the complete UI | Textual dependency locked; TCSS resource present in wheel |
 
@@ -207,6 +210,8 @@ worktrace ui
 2. **Candidate Browser** — includes source-attempt status, page navigation, candidate authority notice, and bounded rows.
 3. **Contribution Review** — five tabs covering the complete review model.
 4. **Evidence Excerpt** — modal, bounded, literal, non-clickable, and labeled untrusted.
+
+At 80x24, the workflow uses a single primary pane and drill-down navigation. At 120x40, the candidate browser may add a selected-row preview and contribution evidence may use side-by-side selection and detail. The larger layout adds context, not capabilities; no required information or action is exclusive to it.
 
 No dashboard-only shell is part of this release. The first executable UI must ship the complete journey.
 
