@@ -87,6 +87,46 @@ def test_read_only_connection_accepts_an_exact_short_busy_timeout(tmp_path: Path
         read_only.close()
 
 
+@pytest.mark.parametrize(
+    "filename",
+    (
+        "ledger ?mode=rw&x=.sqlite3",
+        "ledger#fragment.sqlite3",
+        "ledger with spaces.sqlite3",
+    ),
+)
+def test_read_only_connection_encodes_uri_metacharacters_and_keeps_os_read_only(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    database_path = tmp_path / filename
+    writer = connect(database_path)
+    try:
+        migrate(writer, database_path)
+    finally:
+        writer.close()
+    entries_before = {path.name for path in tmp_path.iterdir()}
+
+    read_only = connect_read_only(database_path, busy_timeout_ms=500)
+    try:
+        assert read_only.execute("PRAGMA database_list").fetchone()[2] == str(
+            database_path.resolve()
+        )
+        assert read_only.execute("PRAGMA query_only").fetchone()[0] == 1
+
+        read_only.execute("PRAGMA query_only = OFF")
+        assert read_only.execute("PRAGMA query_only").fetchone()[0] == 0
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            read_only.execute(
+                "INSERT INTO apps(id, name, market, business_type) "
+                "VALUES ('blocked', 'Blocked', '', '')"
+            )
+    finally:
+        read_only.close()
+
+    assert {path.name for path in tmp_path.iterdir()} == entries_before
+
+
 def test_read_only_lock_contention_obeys_the_short_timeout(tmp_path: Path) -> None:
     database_path = tmp_path / "worktrace.sqlite3"
     writer = connect(database_path)

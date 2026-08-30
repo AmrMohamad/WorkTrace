@@ -29,7 +29,7 @@ def connect_read_only(
     *,
     busy_timeout_ms: int = 10_000,
 ) -> sqlite3.Connection:
-    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    uri = f"{path.resolve().as_uri()}?mode=ro"
     connection = _configure(
         sqlite3.connect(
             uri,
