@@ -73,6 +73,29 @@ The authorized v0.1 boundary is:
 
 The following are out of scope: a cloud backend, web UI, daemon, ORM, embeddings, vector database, embedded LLM, automatic Git fetch, arbitrary filesystem or SQL access through MCP, automatic ownership or impact classification, productivity scoring, and multi-user use.
 
+## Approved read-only human interface extension
+
+The first approved human interface is a keyboard-first Textual workstation launched explicitly as
+`worktrace ui`. It is a contribution-review surface for CV preparation, interviews, portfolio
+writing, and personal career inventory. It is not an employee-evaluation, promotion, ranking,
+seniority, or productivity surface.
+
+This interface does not change the mutation boundary. The CLI continues to own every write, and
+MCP continues to expose exactly six bounded read-only tools. The TUI constructs only a narrow
+read-only workspace over short-lived SQLite URI `mode=ro` connections with
+`PRAGMA query_only = ON`. It receives no provider, credential, network, importer, decision,
+migration, maintenance, export, backup, purge, or configuration-editing capability.
+
+The TUI reuses the packet builder as the canonical claim projection and adds a separate
+generation-bound candidate query for human paging. It does not invoke CLI subprocesses, parse CLI
+JSON, or call MCP internally. MCP's existing schemas, limits, and opaque `offset:` cursor remain
+unchanged.
+
+The initial executable workflow is limited to application selection, honest latest-attempt source
+status, bounded candidate browsing, contribution review, all canonical Phase 4 questions and gaps,
+and a bounded literal evidence excerpt. Any future TUI write, import, configuration, or maintenance
+operation requires a successor authority decision.
+
 ## Data and authorization boundary
 
 - Import only configured repositories and configured Jira/GitLab projects the user is authorized to access.
@@ -96,3 +119,9 @@ A WorkTrace output is defensible only when:
 - contradictions are returned with support;
 - `as_of`, completeness, staleness, and source availability are included; and
 - release and outcome language stops at the highest independently supported rung.
+
+The terminal interface adds a presentation-only safety boundary. Stored and provider-derived text
+is visibly encoded before display and never interpreted as application markup or commands. Only a
+validated stable WorkTrace ID may be copied through an application action. Screenshot and
+clipboard restrictions reduce accidental disclosure; they do not prevent the authorized local
+user from using operating-system screenshots, terminal selection, photography, or terminal logs.

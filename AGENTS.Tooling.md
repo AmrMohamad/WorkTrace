@@ -11,3 +11,14 @@ Load for Python, CLI, SQLite, adapters, subprocesses, configuration, imports, pa
 - Configuration explicitly maps apps to repositories, Jira keys, and GitLab project IDs. Reject duplicate or out-of-scope mappings.
 - Tests use temporary Git repositories and sanitized HTTP fixtures. Cover repeated execution, failure paths, recovery, redaction, path/scope boundaries, CLI exit behavior, and deterministic rebuilds.
 - No build/test result proves live Jira/GitLab access or proprietary repository parity unless that exact integration ran.
+
+## Read-only human TUI
+
+- The first `worktrace ui` release is structurally read-only. Construct only `ReadOnlyWorkspace`; do not expose provider clients, HTTP/network access, importers, decisions, migrations, maintenance, configuration editing, exports, backups, purge, or a write-capable SQLite connection.
+- Do not call WorkTrace CLI commands as subprocesses, parse CLI JSON as an internal API, or call MCP from the TUI. Keep all six MCP tools, their response limits, and their opaque `offset:` cursors unchanged.
+- Create every TUI SQLite connection inside its Textual worker with URI `mode=ro`, `PRAGMA query_only=ON`, and a 500 ms busy timeout. Close it in `finally`; never retain a connection while the user is idle or move it across threads.
+- Use the TUI-only generation-bound candidate query. Page work must remain scan-bounded; do not replace the existing CLI/MCP candidate APIs or add an index without measured evidence.
+- Before importing Textual, scrub the provider credential/HMAC variables and Textual control variables listed in the approved technical design. The TUI never migrates an older database; direct the user to the CLI and reject newer unsupported schemas.
+- Pass every dynamic configuration, ledger, provider, and stored-error string through the terminal presentation encoder. Render provider excerpts literally with `markup=False`; never derive widget identities, CSS selectors, commands, actions, or bindings from dynamic text.
+- The command palette is a fixed allowlist without Screenshot. Only validated WorkTrace stable IDs may reach an application clipboard action; do not add evidence-body, packet, title, error, URL, screenshot, log, or export capture actions.
+- Keep the complete review journey keyboard-operable at 80x24 and verify the full layout at 120x40. Package TCSS explicitly and test the installed wheel. Do not expose an incomplete TUI shell.
