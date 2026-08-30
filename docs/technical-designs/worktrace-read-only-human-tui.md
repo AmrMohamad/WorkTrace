@@ -312,9 +312,29 @@ labels. Dynamic values from configuration, SQLite, providers, stored errors, tit
 paths, modules, IDs displayed as prose, limitations, and notifications all pass through the
 encoder. Static source-controlled UI strings do not.
 
-Dynamic text is never used to construct widget IDs, CSS selectors, bindings, action names, command
-names, or command-palette entries. Provider text is rendered with a scrollable
-`Static(markup=False)`, never Markdown, Rich markup, or a selectable `TextArea`.
+### Literal-renderable sink rule
+
+Encoding controls is necessary but does not disable Rich markup. Every encoded dynamic value must
+therefore cross one literal-renderable sink before it reaches Textual:
+
+```python
+def literal_dynamic_text(value: str) -> Text:
+    encoded = terminal_safe_text(value)
+    return Text(encoded.text)
+```
+
+`Text(encoded.text)` is constructed as plain text and does not call `Text.from_markup`. Dynamic
+`DataTable`, tree, list, option, label, and other renderable cells receive this `Text` value, never
+a bare `str`. Dynamic widget updates, modal titles and bodies, errors, and notifications must use a
+`Text` renderable, `markup=False`, or another API that explicitly treats the value literally. If a
+Textual/Rich API accepts only a markup-capable string and has no literal mode, it may receive only
+fixed source-controlled text; the dynamic detail must be shown in a separate literal renderable.
+
+Passing encoded dynamic content as a bare `str` to any markup-capable Textual/Rich API is
+forbidden. Dynamic text is also never used to construct widget IDs, CSS selectors, bindings,
+action names, command names, or command-palette entries. Provider excerpts use a scrollable
+`Static(literal_dynamic_text(value), markup=False)`, never Markdown, Rich markup, or a selectable
+`TextArea`.
 
 The UI displays an encoded presentation value but retains the original DTO value separately. A
 clipboard action validates and copies the original stable ID exactly; it never copies the encoded
@@ -480,6 +500,12 @@ in an incomplete shell PR.
 - The terminal corpus covers CSI, OSC 8/52, DCS, ST/BEL termination, C0/C1, CR, BS, DEL,
   U+2028/U+2029, bidi controls, lone surrogates, Rich/action markup, prompt-injection text, and
   output-expansion bounds. No dangerous raw control survives.
+- Candidate rows plus representative tree/list cells, modal titles and bodies, source errors, and
+  notifications render `[bold]`, `[@click=...]`, and link markup visibly as text. Their Rich
+  renderables contain no markup-derived spans or links, and interaction creates no actions,
+  commands, or bindings.
+- Tests fail if encoded dynamic content is passed as a bare `str` to a markup-capable cell or
+  widget update instead of the literal-renderable helper or an explicit literal API.
 
 ### Interaction and packaging
 

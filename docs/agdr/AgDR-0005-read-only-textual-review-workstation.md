@@ -56,8 +56,13 @@ approved terminal workflow while preserving CLI and MCP authority boundaries.
    the email HMAC key and disables environment-driven Textual logging, drivers, input, and
    screenshots.
 9. All dynamic configuration, ledger, provider, and stored-error text crosses a presentation-only
-   terminal encoder. Provider excerpts render in a scrollable `Static(markup=False)`. Dynamic text
-   never supplies widget identities, CSS selectors, commands, bindings, actions, or palette items.
+   terminal encoder and then one literal-renderable sink. Table/tree/list cells and every other
+   renderable surface receive `Text(encoded.text)` rather than a bare string. Dynamic widget
+   updates, modal titles and bodies, errors, and notifications use that literal `Text`,
+   `markup=False`, or an equivalent explicitly literal API. Encoded dynamic content must never be
+   passed as a bare `str` to a markup-capable Textual/Rich API. Provider excerpts render through
+   the same boundary in a scrollable literal `Static`. Dynamic text never supplies widget
+   identities, CSS selectors, commands, bindings, actions, or palette items.
 10. The command palette is a fixed allowlist without Textual's default screenshot command. Only a
     validated WorkTrace stable ID may reach the application clipboard action. Provider URLs are
     non-clickable.
@@ -100,7 +105,9 @@ recovery, and cancellation; it must not silently broaden this record.
 - Candidate tests prove fixed scan bounds, generation invalidation, short-page continuation, and no
   full-table projection.
 - Terminal tests cover CSI, OSC, DCS, C0/C1, bidi, lone-surrogate, markup, prompt-injection, and
-  expansion-limit cases.
+  expansion-limit cases. Candidate rows and representative tree/list, modal, error, and
+  notification surfaces prove Rich/action markup remains visible literal text, produces no
+  markup-derived spans or links, and creates no actions, commands, or bindings.
 - Textual tests prove the keyboard journey at 80x24 and 120x40, stale-worker rejection, fixed
   commands, stable-ID-only clipboard, and fresh-process `NO_COLOR` behavior.
 - An isolated wheel smoke proves the dependency, entry point, and TCSS resource are installed.

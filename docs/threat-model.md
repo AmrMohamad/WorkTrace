@@ -105,9 +105,15 @@ Controls:
 - one presentation encoder visibly replaces all non-newline C0 controls, ESC, DEL, C1 controls,
   U+2028/U+2029, lone surrogates, and the approved bidi-control set while bounding replacement
   expansion;
+- every encoded dynamic value then becomes a literal `Text(encoded.text)` renderable before it
+  reaches table, tree, list, option, label, or other Rich/Textual renderable surfaces; dynamic
+  widget updates, modal titles and bodies, errors, and notifications use that literal renderable,
+  `markup=False`, or an equivalent explicitly literal API;
+- encoded dynamic content is never passed as a bare string to a markup-capable Textual/Rich API;
 - dynamic configuration, ledger, provider, and stored-error strings are never used as widget IDs,
   CSS selectors, commands, bindings, action names, or command-palette entries;
-- provider excerpts use a scrollable literal widget with markup disabled and expose no URL action;
+- provider excerpts use the same literal-renderable boundary in a scrollable widget and expose no
+  URL action;
 - the command palette is a fixed allowlist that excludes Textual's default Screenshot command; and
 - only a validated stable WorkTrace ID may invoke the application clipboard action.
 
@@ -218,6 +224,9 @@ injection, prompt-injection text, and output-expansion bounds. Tests also prove 
 scrubbing occurs before Textual import, the fixed command palette has no screenshot action, only
 validated stable IDs reach the clipboard, no screenshot/log/export file appears, every connection
 rejects writes, and TUI journeys do not reach credentials, providers, sockets, or file writes.
+Candidate rows and representative tree/list cells, modal titles and bodies, source errors, and
+notifications additionally prove Rich/action markup remains visible literal text, creates no
+markup-derived spans or links, and registers or triggers no actions, commands, or bindings.
 
 ## Residual risk
 
