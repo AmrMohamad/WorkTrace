@@ -2,10 +2,14 @@
 
 # PRD: WorkTrace Read-Only Human TUI
 
-**Status**: Approved  
-**Author**: Mariam (Product Manager)  
-**Created**: 2026-08-30  
-**Last Updated**: 2026-08-30  
+**Status**: Approved
+
+**Author**: Mariam (Product Manager)
+
+**Created**: 2026-08-30
+
+**Last Updated**: 2026-08-30
+
 **Parent Feature**: [#6 — Read-only human contribution-review TUI](https://github.com/AmrMohamad/WorkTrace/issues/6)
 
 ## Overview
@@ -253,4 +257,3 @@ No calendar date is committed before Engineering completes technical design and 
 | Product authority | Amr Mohamad | 2026-08-30 | Approved through the implementation request |
 | Tech Lead | Hisham | — | Pending technical-design handoff |
 | Solution Architect | Tariq | — | Pending design-artifact review |
-
