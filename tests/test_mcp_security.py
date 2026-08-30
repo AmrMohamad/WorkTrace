@@ -19,6 +19,7 @@ from worktrace.mcp_server.limits import enforce_total_limit
 from worktrace.mcp_server.server import SERVER_INSTRUCTIONS, build_mcp_server
 from worktrace.mcp_server.tools import WorkTraceTools
 from worktrace.normalize.redaction import Redactor
+from worktrace.packets.schema import PHASE4_QUESTIONS
 from worktrace.services import export_app
 
 
@@ -210,6 +211,94 @@ def test_unconfigured_apps_and_malicious_cursors_are_rejected(tmp_path: Path) ->
         tools.list_contribution_candidates(
             app_id="sample_store", cursor="offset:0;DELETE FROM apps"
         )
+
+
+def test_mcp_candidate_cursor_remains_the_existing_opaque_offset_contract(
+    tmp_path: Path,
+) -> None:
+    _, _, tools = _mcp_state(tmp_path)
+
+    first = tools.list_contribution_candidates(app_id="sample_store", limit=5)
+    assert first["next_cursor"] == "offset:5"
+    second = tools.list_contribution_candidates(
+        app_id="sample_store", limit=5, cursor=first["next_cursor"]
+    )
+
+    first_ids = {item["candidate_id"] for item in first["candidates"]}
+    second_ids = {item["candidate_id"] for item in second["candidates"]}
+    assert first_ids.isdisjoint(second_ids)
+
+
+def test_mcp_phase4_packet_keeps_all_v2_questions_within_the_existing_limit(
+    tmp_path: Path,
+) -> None:
+    _, _, tools = _mcp_state(tmp_path)
+
+    packet = tools.build_phase4_packet(contribution_id="candidate:manual_1")
+    question_ids = [
+        item["question_id"] for questions in packet["sections"].values() for item in questions
+    ]
+
+    assert packet["schema_version"] == 2
+    assert question_ids == [question.question_id for question in PHASE4_QUESTIONS]
+    assert len(json.dumps(packet, sort_keys=True, separators=(",", ":"))) <= MAX_RESPONSE_CHARS
+
+
+def test_oversized_phase4_packet_compacts_content_but_keeps_question_contract() -> None:
+    sections: dict[str, list[dict[str, object]]] = {}
+    original_citations: dict[str, str] = {}
+    for index, specification in enumerate(PHASE4_QUESTIONS):
+        evidence_id = f"obs:phase4-{index}"
+        original_citations[specification.question_id] = evidence_id
+        sections.setdefault(specification.section, []).append(
+            {
+                "question_id": specification.question_id,
+                "question": specification.text,
+                "answer_draft": "Synthetic answer content. " * 50,
+                "status": "supported",
+                "observation_types": ["source_asserted"],
+                "supporting_evidence_ids": [evidence_id, f"obs:secondary-{index}"],
+                "contradicting_evidence_ids": [],
+                "limitations": ["Synthetic limitation. " * 50],
+                "missing_information": [],
+            }
+        )
+
+    bounded = WorkTraceTools._bounded_response(
+        {
+            "schema_version": 2,
+            "sections": sections,
+            "limitations": [],
+        },
+        preserve_phase4_questions=True,
+    )
+    bounded_questions = [
+        question for section in bounded["sections"].values() for question in section
+    ]
+
+    assert bounded["response_truncated"] is True
+    assert (
+        len(
+            json.dumps(
+                bounded,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        <= MAX_RESPONSE_CHARS
+    )
+    assert [question["question_id"] for question in bounded_questions] == [
+        specification.question_id for specification in PHASE4_QUESTIONS
+    ]
+    assert [question["question"] for question in bounded_questions] == [
+        specification.text for specification in PHASE4_QUESTIONS
+    ]
+    assert all(
+        original_citations[str(question["question_id"])] in question["supporting_evidence_ids"]
+        for question in bounded_questions
+        if question["answer_draft"] is not None
+    )
 
 
 def test_mcp_database_connection_is_query_only_and_rejects_real_writes(

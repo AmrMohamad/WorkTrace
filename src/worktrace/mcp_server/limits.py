@@ -173,7 +173,11 @@ def _serialized_size(value: JsonValue) -> int:
     return len(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
-def _longest_string(value: JsonValue) -> tuple[object, object, str] | None:
+def _longest_string(
+    value: JsonValue,
+    *,
+    protected_string_keys: frozenset[str] = frozenset(),
+) -> tuple[object, object, str] | None:
     best: tuple[object, object, str] | None = None
 
     def visit(current: JsonValue, field_name: str | None = None) -> None:
@@ -181,8 +185,10 @@ def _longest_string(value: JsonValue) -> tuple[object, object, str] | None:
         if isinstance(current, dict):
             for key, item in current.items():
                 if isinstance(item, str):
-                    if not _is_structured_identifier(item, key) and (
-                        best is None or len(item) > len(best[2])
+                    if (
+                        key not in protected_string_keys
+                        and not _is_structured_identifier(item, key)
+                        and (best is None or len(item) > len(best[2]))
                     ):
                         best = (current, key, item)
                 else:
@@ -201,16 +207,20 @@ def _longest_string(value: JsonValue) -> tuple[object, object, str] | None:
     return best
 
 
-def _longest_list(value: JsonValue) -> list[JsonValue] | None:
+def _longest_list(
+    value: JsonValue,
+    *,
+    protected_list_keys: frozenset[str] = frozenset(),
+) -> list[JsonValue] | None:
     best: list[JsonValue] | None = None
 
-    def visit(current: JsonValue) -> None:
+    def visit(current: JsonValue, field_name: str | None = None) -> None:
         nonlocal best
         if isinstance(current, dict):
-            for item in current.values():
-                visit(item)
+            for key, item in current.items():
+                visit(item, key)
         elif isinstance(current, list):
-            if best is None or len(current) > len(best):
+            if field_name not in protected_list_keys and (best is None or len(current) > len(best)):
                 best = current
             for item in current:
                 visit(item)
@@ -219,7 +229,12 @@ def _longest_list(value: JsonValue) -> list[JsonValue] | None:
     return best
 
 
-def enforce_total_limit(payload: dict[str, object]) -> dict[str, object]:
+def enforce_total_limit(
+    payload: dict[str, object],
+    *,
+    protected_list_keys: frozenset[str] = frozenset(),
+    protected_string_keys: frozenset[str] = frozenset(),
+) -> dict[str, object]:
     sanitized = redact_output(payload)
     if not isinstance(sanitized, dict):
         raise TypeError("MCP response must be an object")
@@ -235,7 +250,7 @@ def enforce_total_limit(payload: dict[str, object]) -> dict[str, object]:
     limitations.append("Response was truncated to the server-wide text budget.")
 
     while _serialized_size(result) > MAX_RESPONSE_CHARS:
-        longest = _longest_string(result)
+        longest = _longest_string(result, protected_string_keys=protected_string_keys)
         if longest is not None and len(longest[2]) > 64:
             parent, key, text = longest
             shortened = text[: max(32, len(text) // 2)] + "…[truncated]"
@@ -244,7 +259,7 @@ def enforce_total_limit(payload: dict[str, object]) -> dict[str, object]:
             elif isinstance(parent, list) and isinstance(key, int):
                 parent[key] = shortened
             continue
-        longest_list = _longest_list(result)
+        longest_list = _longest_list(result, protected_list_keys=protected_list_keys)
         if longest_list is not None and len(longest_list) > 1:
             del longest_list[max(1, len(longest_list) // 2) :]
             continue

@@ -475,7 +475,10 @@ def test_cli_git_only_journey_reaches_packet_gaps_and_mcp_entrypoint(
     gaps = runner.invoke(app, ["gaps", contribution_id, "--config", str(config)])
     assert packet.exit_code == 0, packet.stdout
     assert gaps.exit_code == 0, gaps.stdout
-    assert json.loads(packet.stdout)["contribution"]["id"] == contribution_id
+    packet_payload = json.loads(packet.stdout)
+    assert packet_payload["schema_version"] == 2
+    assert packet_payload["contribution"]["id"] == contribution_id
+    assert sum(len(questions) for questions in packet_payload["sections"].values()) == 30
     assert isinstance(json.loads(gaps.stdout), dict)
 
     decision_commands = (

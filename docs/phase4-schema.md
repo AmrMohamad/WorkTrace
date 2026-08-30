@@ -1,4 +1,4 @@
-# Phase 4 packet schema
+# Phase 4 packet schema version 2
 
 ## Purpose
 
@@ -10,27 +10,52 @@ The packet is a read model, not a stored career narrative and not a claim that t
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "contribution": {
     "id": "CONTRIB-001",
+    "candidate_id": "candidate:fixture-001",
     "title": "Checkout validation correction",
     "app_id": "sample_store",
-    "app_name": "Sample Store",
-    "period": {"from": "2026-01-05", "to": "2026-01-14"}
+    "type": "bug_fix",
+    "date_from": "2026-01-05",
+    "date_to": "2026-01-14"
   },
   "as_of": "2026-01-15T12:00:00Z",
   "source_status": {},
+  "evidence_summary": {},
+  "sections": {},
   "participation": {},
   "release_ladder": {},
-  "sections": {},
   "contradictions": [],
-  "gaps": [],
   "defensibility": {},
   "limitations": []
 }
 ```
 
-`as_of` is the packet-build time. `source_status` is included even when all configured sources are complete.
+`as_of` is the newest evidence timestamp represented by the contribution. Contribution dates remain
+the `date_from` and `date_to` fields. `source_status` is included even when all configured sources
+are complete. Evidence gaps are derived as a separate response and are not duplicated in this
+packet envelope.
+
+## Version 2 compatibility correction
+
+Version 2 is a deliberate one-way correction of the generated read model. WorkTrace does not emit
+a dual-version packet or repeat a legacy alias map in every response. No database migration is
+required because packets and question IDs are not persisted ledger state.
+
+| Version 1 ID | Version 2 ID |
+| --- | --- |
+| `problem.requirement_clarity` | `problem.ambiguity` |
+| `action.tools` | `action.technology` |
+| `result.changed` | `result.change` |
+| `result.measured` | `result.measurement` |
+| `result.efficiency` | `result.errors_time` |
+| `result.released` | `result.release` |
+| `result.reused` | `result.reuse` |
+| `result.interview_defensible` | `result.defensibility` |
+
+Version 2 also separates `action.review` from `action.coordination`. Reviewer participation supports
+the review question. Review-only evidence does not support the coordination question.
 
 ## Source status
 
@@ -115,7 +140,7 @@ Allowed statuses are `supported`, `partially_supported`, `human_attested`, `cont
 | `action.architecture` | Which layers or data flow changed? | Changed modules and discussion |
 | `action.coordination` | What coordination occurred? | Cross-role comments and discussions |
 | `action.quality` | What tests, docs, or monitoring changed? | Changed-path metadata and MR description |
-| `action.review` | Did the user review others? | Reviewer participations and discussion records |
+| `action.review` | Did the user review others? | Participations centrally classified as `reviewed` |
 
 ### Result
 
