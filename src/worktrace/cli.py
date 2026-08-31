@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -58,6 +60,25 @@ app.add_typer(rebuild_app, name="rebuild")
 
 ConfigOption = Annotated[Path | None, typer.Option("--config", exists=True, dir_okay=False)]
 DateArgument = Annotated[str | None, typer.Argument()]
+
+_TUI_ENVIRONMENT_VARIABLES = (
+    "WORKTRACE_JIRA_BASE_URL",
+    "WORKTRACE_JIRA_EMAIL",
+    "WORKTRACE_JIRA_API_TOKEN",
+    "WORKTRACE_GITLAB_BASE_URL",
+    "WORKTRACE_GITLAB_TOKEN",
+    "WORKTRACE_EMAIL_HMAC_KEY",
+    "TEXTUAL",
+    "TEXTUAL_DEBUG",
+    "TEXTUAL_DRIVER",
+    "TEXTUAL_LOG",
+    "TEXTUAL_DEVTOOLS_HOST",
+    "TEXTUAL_DEVTOOLS_PORT",
+    "TEXTUAL_PRESS",
+    "TEXTUAL_SCREENSHOT",
+    "TEXTUAL_SCREENSHOT_LOCATION",
+    "TEXTUAL_SCREENSHOT_FILENAME",
+)
 
 
 def _emit(value: object) -> None:
@@ -240,6 +261,57 @@ def main() -> None:
 def version() -> None:
     """Print the WorkTrace version."""
     typer.echo(__version__)
+
+
+def _sanitize_tui_environment() -> None:
+    for name in _TUI_ENVIRONMENT_VARIABLES:
+        os.environ.pop(name, None)
+
+
+@app.command("ui")
+def launch_ui(
+    app_id: Annotated[str | None, typer.Option("--app")] = None,
+    candidate_id: Annotated[str | None, typer.Option("--candidate")] = None,
+    config: ConfigOption = None,
+) -> None:
+    """Review contribution evidence in an interactive, read-only terminal UI."""
+
+    if candidate_id is not None and app_id is None:
+        typer.echo("error: --candidate requires --app", err=True)
+        raise typer.Exit(2)
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        typer.echo("error: worktrace ui requires an interactive terminal", err=True)
+        typer.echo("Use `worktrace --help` for non-interactive commands.", err=True)
+        raise typer.Exit(2)
+
+    try:
+        configuration = load_config(config)
+        if app_id is not None:
+            configuration.app(app_id)
+        if candidate_id is not None:
+            from worktrace.mcp_server.schemas import stable_id
+
+            stable_id(candidate_id, "candidate_id")
+    except WorkTraceError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        typer.echo("Run `worktrace doctor` from the CLI, then retry.", err=True)
+        raise typer.Exit(1) from exc
+
+    if not configuration.database_path.is_file():
+        typer.echo("error: WorkTrace has not been initialized", err=True)
+        typer.echo("Run `worktrace init`, then `worktrace doctor`.", err=True)
+        raise typer.Exit(1)
+
+    _sanitize_tui_environment()
+
+    from worktrace.read_workspace import ReadOnlyWorkspace
+    from worktrace.tui.app import run_worktrace_ui
+
+    run_worktrace_ui(
+        ReadOnlyWorkspace(configuration),
+        initial_app_id=app_id,
+        initial_candidate_id=candidate_id,
+    )
 
 
 @app.command("init")

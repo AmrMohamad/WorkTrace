@@ -1,0 +1,83 @@
+Screen {
+    background: $surface;
+    color: $text;
+}
+
+Footer {
+    background: $panel;
+}
+
+.page-title {
+    height: 1;
+    text-style: bold;
+    padding: 0 1;
+}
+
+.notice {
+    height: auto;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+.error {
+    height: auto;
+    padding: 1 2;
+    border: solid $error;
+}
+
+.loading {
+    height: 1fr;
+    content-align: center middle;
+}
+
+DataTable {
+    height: 1fr;
+}
+
+DataTable:focus {
+    border: solid $accent;
+}
+
+TabbedContent {
+    height: 1fr;
+}
+
+.review-scroll, .excerpt-scroll {
+    height: 1fr;
+    padding: 0 1;
+}
+
+.review-scroll:focus, .excerpt-scroll:focus {
+    border: solid $accent;
+}
+
+#source-status-scroll {
+    height: 7;
+    max-height: 7;
+}
+
+#source-status-scroll:focus {
+    border: solid $accent;
+}
+
+#source-status {
+    height: auto;
+}
+
+#evidence-dialog, #help-dialog, #terminal-dialog {
+    width: 90%;
+    height: 90%;
+    border: solid $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#help-dialog, #terminal-dialog {
+    width: 72;
+    height: auto;
+    max-height: 90%;
+}
+
+.compact .optional-column {
+    display: none;
+}
