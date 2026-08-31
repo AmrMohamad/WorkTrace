@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from worktrace.candidates.builder import SEED_PRIORITY, suggest_contribution_type
 from worktrace.candidates.decisions import (
     CREATION_ACTIONS,
+    _DecisionProjectionContext,
     active_decisions,
     creation_decision_scope_app,
 )
@@ -28,7 +30,13 @@ class CandidateView:
     decisions: tuple[dict[str, object], ...]
 
 
-def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> CandidateView:
+def project_candidate(
+    connection: sqlite3.Connection,
+    candidate_id: str,
+    *,
+    decision_context: _DecisionProjectionContext | None = None,
+    current_observations: Mapping[str, sqlite3.Row] | None = None,
+) -> CandidateView:
     row = connection.execute(
         "SELECT * FROM candidate_groups WHERE id=?", (candidate_id,)
     ).fetchone()
@@ -51,7 +59,7 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
     status = str(row["status"])
     human_title = False
     human_type = False
-    decisions = active_decisions(connection, candidate_id)
+    decisions = active_decisions(connection, candidate_id, context=decision_context)
     for decision in decisions:
         payload = decision.payload
         is_creation = (
@@ -62,7 +70,12 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
         if decision.action == "confirm" or is_creation:
             if (
                 is_creation
-                and creation_decision_scope_app(connection, candidate_id, payload) != app_id
+                and (
+                    decision_context.decision_scopes.get(decision.id)
+                    if decision_context is not None
+                    else creation_decision_scope_app(connection, candidate_id, payload)
+                )
+                != app_id
             ):
                 continue
             status = "confirmed"
@@ -156,11 +169,15 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
             if isinstance(keep, list):
                 allowed = {str(value) for value in keep}
                 members = {key: value for key, value in members.items() if key in allowed}
-    current = {
-        str(observation["source_object_id"]): observation
-        for observation in authoritative_current_observations(connection, app_id)
-    }
-    eligible_member_ids = sorted(set(members) & set(current))
+    current = (
+        current_observations
+        if current_observations is not None
+        else {
+            str(observation["source_object_id"]): observation
+            for observation in authoritative_current_observations(connection, app_id)
+        }
+    )
+    eligible_member_ids = sorted(object_id for object_id in members if object_id in current)
     has_authoritative_support = bool(eligible_member_ids)
     if not has_authoritative_support and status != "confirmed":
         raise NotFound(f"candidate has no authoritative current evidence: {candidate_id}")
@@ -201,7 +218,9 @@ def project_candidate(connection: sqlite3.Connection, candidate_id: str) -> Cand
         for object_id in eligible_member_ids
     )
     unsupported_member_ids = (
-        tuple(sorted(set(members) - set(eligible_member_ids))) if status == "confirmed" else ()
+        tuple(sorted(object_id for object_id in members if object_id not in current))
+        if status == "confirmed"
+        else ()
     )
     return CandidateView(
         id=candidate_id,

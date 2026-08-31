@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 
 from worktrace.errors import NotFound, ScopeViolation
 from worktrace.normalize.redaction import Redactor
@@ -30,6 +31,40 @@ class DecisionLineage:
     contribution_ids: frozenset[str]
     canonical_candidate_id: str
     decisions: tuple[Decision, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DecisionProjectionContext:
+    """One read-snapshot projection shared by every candidate on a bounded page."""
+
+    active_decisions: tuple[Decision, ...]
+    decisions_by_target: Mapping[str, tuple[Decision, ...]]
+    decision_scopes: Mapping[str, str | None]
+    lineages: tuple[DecisionLineage, ...]
+    lineages_by_identifier: Mapping[str, tuple[DecisionLineage, ...]]
+
+    def for_target(self, target_id: str) -> tuple[Decision, ...]:
+        return self.decisions_by_target.get(target_id, ())
+
+    def resolve_lineage(
+        self,
+        identifier: str,
+        *,
+        app_id: str | None = None,
+    ) -> DecisionLineage | None:
+        matches = [
+            lineage
+            for lineage in self.lineages_by_identifier.get(identifier, ())
+            if app_id is None or lineage.app_id == app_id
+        ]
+        matched_apps = {lineage.app_id for lineage in matches}
+        if len(matched_apps) > 1:
+            raise ScopeViolation("contribution identifier belongs to more than one configured app")
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ScopeViolation("contribution identifier has ambiguous decision lineage")
+        return matches[0]
 
 
 VALID_ACTIONS = {
@@ -243,7 +278,14 @@ def undo_decision(connection: sqlite3.Connection, decision_id: str) -> str:
     )
 
 
-def active_decisions(connection: sqlite3.Connection, target_id: str) -> list[Decision]:
+def active_decisions(
+    connection: sqlite3.Connection,
+    target_id: str,
+    *,
+    context: _DecisionProjectionContext | None = None,
+) -> list[Decision]:
+    if context is not None:
+        return list(context.for_target(target_id))
     return [
         decision
         for decision in decision_stream(connection, active_only=True)
@@ -367,8 +409,18 @@ def decision_node_apps(
 ) -> dict[str, set[str]]:
     """Map every declared candidate/contribution lineage identifier to owning apps."""
 
+    return _decision_node_apps(
+        connection,
+        decision_stream(connection, active_only=active_only),
+    )
+
+
+def _decision_node_apps(
+    connection: sqlite3.Connection,
+    decisions: Sequence[Decision],
+) -> dict[str, set[str]]:
     result: dict[str, set[str]] = {}
-    for decision in decision_stream(connection, active_only=active_only):
+    for decision in decisions:
         if decision.action not in CREATION_ACTIONS:
             continue
         app_id = creation_decision_scope_app(
@@ -403,7 +455,15 @@ def decision_scope_map(
     """
 
     decisions = decision_stream(connection, active_only=active_only)
-    node_apps = decision_node_apps(connection, active_only=active_only)
+    node_apps = _decision_node_apps(connection, decisions)
+    return _decision_scope_map(connection, decisions, node_apps)
+
+
+def _decision_scope_map(
+    connection: sqlite3.Connection,
+    decisions: Sequence[Decision],
+    node_apps: Mapping[str, set[str]],
+) -> dict[str, str | None]:
     decisions_by_id = {decision.id: decision for decision in decisions}
     result: dict[str, str | None] = {}
     for decision in decisions:
@@ -453,6 +513,16 @@ def decision_lineages(
     """Build app-scoped lineage components for the selected decision projection."""
 
     decisions = decision_stream(connection, active_only=active_only)
+    node_apps = _decision_node_apps(connection, decisions)
+    decision_scopes = _decision_scope_map(connection, decisions, node_apps)
+    return _decision_lineages(connection, decisions, decision_scopes)
+
+
+def _decision_lineages(
+    connection: sqlite3.Connection,
+    decisions: Sequence[Decision],
+    decision_scopes: Mapping[str, str | None],
+) -> tuple[DecisionLineage, ...]:
     adjacency: dict[tuple[str, str], set[tuple[str, str]]] = {}
     node_kind: dict[tuple[str, str], str] = {}
     for decision in decisions:
@@ -485,8 +555,6 @@ def decision_lineages(
             adjacency[candidate_node].update(
                 other for other in candidate_nodes if other != candidate_node
             )
-
-    decision_scopes = decision_scope_map(connection, active_only=active_only)
 
     result: list[DecisionLineage] = []
     visited: set[tuple[str, str]] = set()
@@ -530,6 +598,33 @@ def decision_lineages(
             )
         )
     return tuple(result)
+
+
+def _build_decision_projection_context(
+    connection: sqlite3.Connection,
+) -> _DecisionProjectionContext:
+    decisions = tuple(decision_stream(connection, active_only=True))
+    by_target: dict[str, list[Decision]] = {}
+    for decision in decisions:
+        by_target.setdefault(decision.target_id, []).append(decision)
+    node_apps = _decision_node_apps(connection, decisions)
+    scopes = _decision_scope_map(connection, decisions, node_apps)
+    lineages = _decision_lineages(connection, decisions, scopes)
+    by_identifier: dict[str, list[DecisionLineage]] = {}
+    for lineage in lineages:
+        for identifier in lineage.candidate_ids | lineage.contribution_ids:
+            by_identifier.setdefault(identifier, []).append(lineage)
+    return _DecisionProjectionContext(
+        active_decisions=decisions,
+        decisions_by_target=MappingProxyType(
+            {key: tuple(value) for key, value in by_target.items()}
+        ),
+        decision_scopes=MappingProxyType(dict(scopes)),
+        lineages=lineages,
+        lineages_by_identifier=MappingProxyType(
+            {key: tuple(value) for key, value in by_identifier.items()}
+        ),
+    )
 
 
 def resolve_decision_lineage(
