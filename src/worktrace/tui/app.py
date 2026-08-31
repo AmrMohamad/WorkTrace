@@ -7,6 +7,7 @@ from typing import ClassVar
 from textual import work
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding, BindingType
+from textual.containers import VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Footer, Static
 
@@ -94,9 +95,16 @@ class InitialErrorScreen(WorkTraceScreen):
 
 class HelpModal(WorkTraceModal):
     ALLOW_SELECT = False
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("q,escape", "dismiss", "Close"),
+    ]
 
     def compose(self) -> ComposeResult:
-        yield Static(_HELP_TEXT, id="help-dialog", markup=False)
+        with VerticalScroll(id="help-dialog", can_focus=True):
+            yield Static(_HELP_TEXT, id="help-content", markup=False)
+
+    def on_mount(self) -> None:
+        self.query_one("#help-dialog", VerticalScroll).focus()
 
 
 class SmallTerminalScreen(ModalScreen[bool], inherit_bindings=False):

@@ -73,9 +73,21 @@ TabbedContent {
 }
 
 #help-dialog, #terminal-dialog {
-    width: 72;
-    height: auto;
+    width: 90%;
+    max-width: 72;
     max-height: 90%;
+}
+
+#help-dialog {
+    height: 90%;
+}
+
+#help-dialog:focus {
+    border: solid $accent;
+}
+
+#help-content, #terminal-dialog {
+    height: auto;
 }
 
 .compact .optional-column {

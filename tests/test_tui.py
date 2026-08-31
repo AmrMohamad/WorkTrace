@@ -11,12 +11,13 @@ from pathlib import Path
 
 import pytest
 from rich.text import Text
+from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import DataTable, Static, TabbedContent
 
 from tests.test_packets_golden import _packet_state
 from worktrace.read_workspace import ReadOnlyWorkspace
-from worktrace.tui.app import SmallTerminalScreen, WorkTraceApp
+from worktrace.tui.app import HelpModal, SmallTerminalScreen, WorkTraceApp
 from worktrace.tui.modals.evidence import EvidenceModal
 from worktrace.tui.screens.applications import ApplicationScreen
 from worktrace.tui.screens.candidates import CandidateScreen
@@ -160,11 +161,42 @@ async def test_compact_terminal_reduces_candidate_columns(tmp_path: Path) -> Non
 
     async with app.run_test(size=(70, 18)) as pilot:
         assert isinstance(app.screen, SmallTerminalScreen)
+        terminal_dialog = app.screen.query_one("#terminal-dialog", Static)
+        assert terminal_dialog.size.width <= 70
+        assert terminal_dialog.size.height <= 18
         await pilot.press("c")
         await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
         table = app.screen.query_one("#candidate-table", DataTable)
         assert len(table.columns) == 4
         assert app.compact_mode is True
+
+
+@pytest.mark.asyncio
+async def test_compact_help_scrolls_to_final_commands_and_q_closes(tmp_path: Path) -> None:
+    app, _ = _app(tmp_path)
+
+    async with app.run_test(size=(70, 18)) as pilot:
+        assert isinstance(app.screen, SmallTerminalScreen)
+        await pilot.press("c")
+        await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
+        candidate_screen = app.screen
+        await pilot.press("?")
+        await _pause_until(pilot, lambda: isinstance(app.screen, HelpModal))
+        help_modal = app.screen
+        assert isinstance(help_modal, HelpModal)
+        help_scroll = help_modal.query_one("#help-dialog", VerticalScroll)
+        help_content = help_modal.query_one("#help-content", Static)
+        assert help_scroll.has_focus
+        assert help_scroll.size.width <= 70
+        assert help_scroll.size.height <= 18
+        assert help_scroll.max_scroll_y > 0
+        assert "1-5     Contribution tabs" in help_content.render().plain
+
+        await pilot.press("end")
+        await pilot.pause()
+        assert help_scroll.scroll_y == help_scroll.max_scroll_y
+        await pilot.press("q")
+        assert app.screen is candidate_screen
 
 
 @pytest.mark.asyncio
