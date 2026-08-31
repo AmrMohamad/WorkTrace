@@ -58,6 +58,18 @@ async def _pause_until(
     raise AssertionError("Textual state did not settle")
 
 
+async def _drag_selection_attempt(
+    pilot: object,
+    widget: Static,
+    *,
+    start: tuple[int, int],
+    end: tuple[int, int],
+) -> None:
+    assert await pilot.mouse_down(widget, offset=start)  # type: ignore[attr-defined]
+    assert await pilot.mouse_up(widget, offset=end)  # type: ignore[attr-defined]
+    await pilot.pause()  # type: ignore[attr-defined]
+
+
 def _copy_binding_actions(screen: Screen[object]) -> list[str]:
     return [
         binding.action
@@ -197,6 +209,66 @@ async def test_compact_help_scrolls_to_final_commands_and_q_closes(tmp_path: Pat
         assert help_scroll.scroll_y == help_scroll.max_scroll_y
         await pilot.press("q")
         assert app.screen is candidate_screen
+
+
+@pytest.mark.asyncio
+async def test_modal_mouse_selection_cannot_copy_but_explicit_evidence_id_can(
+    tmp_path: Path,
+) -> None:
+    app, _ = _app(tmp_path)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
+        candidate_screen = app.screen
+        assert isinstance(candidate_screen, CandidateScreen)
+        candidate_table = candidate_screen.query_one("#candidate-table", DataTable)
+        await _pause_until(pilot, lambda: candidate_table.row_count == 1)
+
+        await pilot.press("?")
+        await _pause_until(pilot, lambda: isinstance(app.screen, HelpModal))
+        help_modal = app.screen
+        assert isinstance(help_modal, HelpModal)
+        help_content = help_modal.query_one("#help-content", Static)
+        await _drag_selection_attempt(
+            pilot,
+            help_content,
+            start=(1, 1),
+            end=(20, 4),
+        )
+        await pilot.press("ctrl+c", "super+c")
+        assert app.copied == []
+        assert help_modal.selections == {}
+        assert help_modal.get_selected_text() is None
+        await pilot.press("q")
+        assert app.screen is candidate_screen
+
+        await pilot.press("enter")
+        await _pause_until(
+            pilot,
+            lambda: isinstance(app.screen, ContributionScreen) and app.screen._review is not None,
+        )
+        await pilot.press("2", "enter")
+        await _pause_until(pilot, lambda: isinstance(app.screen, EvidenceModal))
+        evidence_modal = app.screen
+        assert isinstance(evidence_modal, EvidenceModal)
+        evidence_body = evidence_modal.query_one("#evidence-body", Static)
+        await _drag_selection_attempt(
+            pilot,
+            evidence_body,
+            start=(1, 0),
+            end=(20, 0),
+        )
+        await pilot.press("ctrl+c", "super+c")
+        assert app.copied == []
+        assert evidence_modal.selections == {}
+        assert evidence_modal.get_selected_text() is None
+
+        selected = evidence_modal.selected_stable_id()
+        assert selected is not None
+        expected_evidence_id = selected[0]
+        assert expected_evidence_id.startswith("obs:")
+        await pilot.press("y")
+        assert app.copied == [expected_evidence_id]
 
 
 @pytest.mark.asyncio
