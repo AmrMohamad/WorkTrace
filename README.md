@@ -52,6 +52,21 @@ uv run worktrace gaps candidate:stable-id
 Use `worktrace --help` and each subcommand's `--help` for all commands. Human corrections are
 append-only events; `undo` writes a compensating event rather than deleting history.
 
+## Human review UI
+
+Launch the keyboard-first, read-only evidence workstation in an interactive terminal:
+
+```console
+uv run worktrace ui
+uv run worktrace ui --app sample_store_b2c
+uv run worktrace ui --app sample_store_b2c --candidate candidate:stable-id
+```
+
+The UI reviews source-attempt status, bounded candidate pages, contribution evidence,
+participation, seven independent delivery states, Phase 4 questions and gaps, and bounded source
+excerpts. It does not import evidence, contact providers, write decisions, rebuild data, or perform
+maintenance; those operations remain explicit CLI commands.
+
 ## MCP
 
 `worktrace serve-mcp` exposes exactly six bounded, read-only tools over stdio. See

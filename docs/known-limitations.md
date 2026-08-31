@@ -11,10 +11,9 @@ This document records intentional v0.1 boundaries and validation gaps. It must n
 
 ## Read-only human TUI boundary
 
-- The approved first TUI is a review surface only. Until its complete vertical-slice issue is
-  merged, WorkTrace remains operated through the existing CLI and MCP interfaces; a technical
-  design does not itself make `worktrace ui` available.
-- The TUI will not import, confirm, ignore, rename, merge, split, edit membership, add evidence or
+- The first TUI is a review surface only. It complements the existing CLI and MCP interfaces and
+  does not broaden their authority boundaries.
+- The TUI does not import, confirm, ignore, rename, merge, split, edit membership, add evidence or
   attestations, rebuild, migrate, export, back up, purge, edit configuration, contact providers, or
   watch the database.
 - Candidate pages are internally consistent for one short read transaction. Another CLI process
@@ -28,7 +27,7 @@ This document records intentional v0.1 boundaries and validation gaps. It must n
 - Removing screenshot and broad clipboard actions reduces accidental disclosure. It cannot stop an
   authorized local user from taking an operating-system screenshot, selecting terminal text,
   photographing the screen, logging the terminal, or otherwise capturing displayed information.
-- The Textual interface will support keyboard operation, visible focus, text/symbol states,
+- The Textual interface supports keyboard operation, visible focus, text/symbol states,
   `NO_COLOR`, and an 80x24 compact layout, but it does not claim full screen-reader accessibility.
   CLI JSON and MCP remain the structured alternatives.
 - Synthetic headless tests cannot establish behavior across every real terminal emulator,
