@@ -331,10 +331,10 @@ async def test_candidate_next_previous_and_generation_restart(tmp_path: Path) ->
 
         await pilot.press("n")
         await _pause_until(pilot, lambda: table.row_count == 6)
-        assert len(screen._cursor_stack) == 2
+        assert len(screen._committed_history) == 2
         await pilot.press("p")
         await _pause_until(pilot, lambda: table.row_count == 25)
-        assert len(screen._cursor_stack) == 1
+        assert len(screen._committed_history) == 1
 
         writer = sqlite3.connect(app.workspace.database_path)
         try:
@@ -350,7 +350,280 @@ async def test_candidate_next_previous_and_generation_restart(tmp_path: Path) ->
             pilot,
             lambda: any("suggestions changed" in message for message in app.notifications),
         )
-        assert screen._cursor_stack == [None]
+        assert screen._committed_history == [None]
+
+
+@pytest.mark.asyncio
+async def test_rapid_page_keys_never_mutate_committed_history(tmp_path: Path) -> None:
+    import threading
+
+    from tests.tui_support import add_visible_candidate_page
+    from worktrace.read_workspace import DatabaseBusy
+
+    connection, _, config, _ = _packet_state(tmp_path)
+    add_visible_candidate_page(connection)
+    connection.close()
+    app = RecordingWorkTraceApp(ReadOnlyWorkspace(config), initial_app_id="sample_store")
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
+        screen = app.screen
+        assert isinstance(screen, CandidateScreen)
+        table = screen.query_one("#candidate-table", DataTable)
+        message = screen.query_one("#candidate-message", Static)
+        await _pause_until(pilot, lambda: screen._page is not None)
+        assert table.row_count == 25
+
+        original_page = app.workspace.candidate_page
+        gate = threading.Event()
+        calls: list[str] = []
+
+        def gated_page(*args: object, **kwargs: object) -> object:
+            calls.append("call")
+            assert gate.wait(timeout=10)
+            return original_page(*args, **kwargs)
+
+        app.workspace.candidate_page = gated_page  # type: ignore[method-assign]
+        try:
+            await pilot.press("n")
+            await _pause_until(pilot, lambda: screen._pending_direction == "next")
+            await pilot.press("n", "p", "r")
+            still_loading = [m for m in app.notifications if "still loading" in m]
+            assert len(still_loading) == 3
+            assert len(calls) == 1
+            assert screen._committed_history == [None]
+            assert "Page 2" not in str(message.render())
+            assert table.row_count == 25
+
+            gate.set()
+            await _pause_until(pilot, lambda: screen._pending_direction is None)
+            assert len(screen._committed_history) == 2
+            assert table.row_count == 6
+            assert "Page 2" in str(message.render())
+
+            failure_gate = threading.Event()
+
+            def busy_page(*args: object, **kwargs: object) -> object:
+                assert failure_gate.wait(timeout=10)
+                raise DatabaseBusy("secret raw database detail")
+
+            app.workspace.candidate_page = busy_page  # type: ignore[method-assign]
+            await pilot.press("p")
+            await _pause_until(pilot, lambda: screen._pending_direction == "previous")
+            failure_gate.set()
+            await _pause_until(pilot, lambda: "data is busy" in str(message.render()))
+            assert len(screen._committed_history) == 2
+            assert table.row_count == 6
+            assert "secret raw database detail" not in str(message.render())
+        finally:
+            app.workspace.candidate_page = original_page  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+async def test_generation_invalidation_restarts_exactly_once_at_page_one(
+    tmp_path: Path,
+) -> None:
+    import threading
+
+    from tests.tui_support import add_visible_candidate_page
+    from worktrace.read_models.candidates import CandidateGenerationChanged
+
+    connection, _, config, _ = _packet_state(tmp_path)
+    add_visible_candidate_page(connection)
+    connection.close()
+    app = RecordingWorkTraceApp(ReadOnlyWorkspace(config), initial_app_id="sample_store")
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
+        screen = app.screen
+        assert isinstance(screen, CandidateScreen)
+        table = screen.query_one("#candidate-table", DataTable)
+        message = screen.query_one("#candidate-message", Static)
+        await _pause_until(pilot, lambda: screen._page is not None)
+        await pilot.press("n")
+        await _pause_until(pilot, lambda: len(screen._committed_history) == 2)
+
+        original_page = app.workspace.candidate_page
+        restart_gate = threading.Event()
+        calls: list[str] = []
+
+        def stale_then_restart(*args: object, **kwargs: object) -> object:
+            calls.append("call")
+            if len(calls) == 1:
+                raise CandidateGenerationChanged("generation moved")
+            assert restart_gate.wait(timeout=10)
+            return original_page(*args, **kwargs)
+
+        app.workspace.candidate_page = stale_then_restart  # type: ignore[method-assign]
+        try:
+            await pilot.press("p")
+            await _pause_until(
+                pilot,
+                lambda: any("suggestions changed" in m for m in app.notifications),
+            )
+            assert screen._committed_history == [None]
+            await _pause_until(
+                pilot,
+                lambda: len(calls) == 2 and screen._pending_direction == "restart",
+            )
+            await pilot.press("n", "p", "r")
+            assert len(calls) == 2
+            restart_gate.set()
+            await _pause_until(pilot, lambda: screen._pending_direction is None)
+            assert screen._committed_history == [None]
+            assert table.row_count == 25
+            assert "Page 1" in str(message.render())
+            assert "Page 2" not in str(message.render())
+            assert sum("suggestions changed" in m for m in app.notifications) == 1
+        finally:
+            app.workspace.candidate_page = original_page  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+async def test_global_return_restores_the_same_candidate_screen(tmp_path: Path) -> None:
+    from tests.tui_support import add_visible_candidate_page
+
+    connection, _, config, _ = _packet_state(tmp_path)
+    add_visible_candidate_page(connection)
+    connection.close()
+    app = RecordingWorkTraceApp(ReadOnlyWorkspace(config), initial_app_id="sample_store")
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
+        screen = app.screen
+        assert isinstance(screen, CandidateScreen)
+        table = screen.query_one("#candidate-table", DataTable)
+        await _pause_until(pilot, lambda: screen._page is not None)
+        await pilot.press("n")
+        await _pause_until(pilot, lambda: len(screen._committed_history) == 2)
+        await pilot.press("j", "j", "j")
+        assert table.cursor_row == 3
+        depth_before = len(app.screen_stack)
+
+        await pilot.press("enter")
+        await _pause_until(pilot, lambda: isinstance(app.screen, ContributionScreen))
+        assert len(app.screen_stack) == depth_before + 1
+
+        app.action_return_to_candidates()
+        await _pause_until(pilot, lambda: app.screen is screen)
+        assert app.screen is screen
+        assert len(app.screen_stack) == depth_before
+        assert table.cursor_row == 3
+        assert len(screen._committed_history) == 2
+        assert screen._pending_direction is None
+
+        app.action_return_to_candidates()
+        await pilot.pause()
+        assert app.screen is screen
+        assert len(app.screen_stack) == depth_before
+
+
+@pytest.mark.asyncio
+async def test_application_switching_leaves_no_hidden_nested_screens(tmp_path: Path) -> None:
+    from tests.tui_support import add_second_application
+
+    connection, _, config, _ = _packet_state(tmp_path)
+    config = add_second_application(connection, config, tmp_path)
+    connection.close()
+    app = RecordingWorkTraceApp(ReadOnlyWorkspace(config))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _pause_until(pilot, lambda: isinstance(app.screen, ApplicationScreen))
+        await pilot.press("enter")
+        await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
+        first_candidate_screen = app.screen
+        assert isinstance(first_candidate_screen, CandidateScreen)
+        await _pause_until(pilot, lambda: first_candidate_screen._page is not None)
+        await pilot.press("enter")
+        await _pause_until(pilot, lambda: isinstance(app.screen, ContributionScreen))
+
+        await pilot.press("a")
+        await _pause_until(pilot, lambda: isinstance(app.screen, ApplicationScreen))
+        assert len(app.screen_stack) == 2
+        assert not any(
+            isinstance(entry, (CandidateScreen, ContributionScreen)) for entry in app.screen_stack
+        )
+
+        await pilot.press("j", "enter")
+        await _pause_until(
+            pilot,
+            lambda: (
+                isinstance(app.screen, CandidateScreen) and app.screen is not first_candidate_screen
+            ),
+        )
+        assert len(app.screen_stack) == 2
+
+
+@pytest.mark.asyncio
+async def test_modal_command_palettes_expose_only_safe_actions(tmp_path: Path) -> None:
+    app, _ = _app(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
+        candidate_screen = app.screen
+        assert isinstance(candidate_screen, CandidateScreen)
+        table = candidate_screen.query_one("#candidate-table", DataTable)
+        await _pause_until(pilot, lambda: table.row_count == 1)
+        assert [command.title for command in app.get_system_commands(candidate_screen)] == [
+            "Quit",
+            "Keyboard help",
+            "Switch application",
+            "Refresh",
+        ]
+
+        await pilot.press("?")
+        await _pause_until(pilot, lambda: isinstance(app.screen, HelpModal))
+        help_modal = app.screen
+        assert isinstance(help_modal, HelpModal)
+        assert [command.title for command in app.get_system_commands(help_modal)] == ["Quit"]
+        await pilot.press("q")
+        assert app.screen is candidate_screen
+
+        await pilot.press("enter")
+        await _pause_until(
+            pilot,
+            lambda: isinstance(app.screen, ContributionScreen) and app.screen._review is not None,
+        )
+        contribution = app.screen
+        assert isinstance(contribution, ContributionScreen)
+        assert [command.title for command in app.get_system_commands(contribution)] == [
+            "Quit",
+            "Keyboard help",
+            "Switch application",
+            "Refresh",
+            "Return to candidates",
+        ]
+        await pilot.press("2", "enter")
+        await _pause_until(pilot, lambda: isinstance(app.screen, EvidenceModal))
+        evidence_modal = app.screen
+        assert isinstance(evidence_modal, EvidenceModal)
+        assert [command.title for command in app.get_system_commands(evidence_modal)] == ["Quit"]
+
+    small_root = tmp_path / "small"
+    small_root.mkdir()
+    connection, _, small_config, _ = _packet_state(small_root)
+    connection.close()
+    small_app = RecordingWorkTraceApp(ReadOnlyWorkspace(small_config))
+    async with small_app.run_test(size=(70, 18)) as pilot:
+        await _pause_until(pilot, lambda: isinstance(small_app.screen, SmallTerminalScreen))
+        assert [command.title for command in small_app.get_system_commands(small_app.screen)] == [
+            "Quit"
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("size", "expected_columns"),
+    [((80, 24), 4), ((120, 40), 6)],
+)
+async def test_candidate_columns_match_terminal_layout(
+    tmp_path: Path,
+    size: tuple[int, int],
+    expected_columns: int,
+) -> None:
+    app, _ = _app(tmp_path)
+    async with app.run_test(size=size) as pilot:
+        await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
+        screen = app.screen
+        assert isinstance(screen, CandidateScreen)
+        table = screen.query_one("#candidate-table", DataTable)
+        await _pause_until(pilot, lambda: table.row_count == 1)
+        assert len(table.columns) == expected_columns
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 from rich.text import Text
 from textual import work
@@ -23,6 +23,11 @@ from worktrace.tui.terminal_text import literal_dynamic_text
 
 if TYPE_CHECKING:
     from worktrace.tui.app import WorkTraceApp
+
+# A page load is one navigation action at a time. "next"/"previous" commit the
+# cursor history only when their page loads successfully; "restart" lands on
+# page one (initial mount, refresh, and generation invalidation).
+_PageDirection = Literal["next", "previous", "restart"]
 
 
 _FAILURE_TEXT = {
@@ -116,7 +121,11 @@ class CandidateScreen(WorkTraceScreen):
         self.application = application
         self._source_request_id = 0
         self._page_request_id = 0
-        self._cursor_stack: list[CandidateCursor | None] = [None]
+        # Cursor history for the page currently displayed. It changes only when
+        # a page load succeeds; a pending navigation never mutates it.
+        self._committed_history: list[CandidateCursor | None] = [None]
+        self._pending_direction: _PageDirection | None = None
+        self._pending_cursor: CandidateCursor | None = None
         self._page: CandidatePage | None = None
         self._items: tuple[CandidateListItem, ...] = ()
 
@@ -145,17 +154,18 @@ class CandidateScreen(WorkTraceScreen):
             table.add_columns("State", "Contribution", "Authority", "Period", "Sources", "Roles")
         table.focus()
         self._load_source_status()
-        self._load_current_page()
+        self._begin_page_load(None, "restart")
 
     def refresh_data(self) -> None:
         self.action_refresh()
 
     def action_refresh(self) -> None:
-        self._cursor_stack = [None]
-        self._page = None
+        if self._page_load_in_flight():
+            self.app.notify("A candidate page is still loading.", markup=False)
+            return
         self.query_one("#candidate-message", Static).update("Refreshing read-only data…")
         self._load_source_status()
-        self._load_current_page()
+        self._begin_page_load(None, "restart")
 
     def action_cursor_down(self) -> None:
         focused = self.focused
@@ -172,18 +182,25 @@ class CandidateScreen(WorkTraceScreen):
             self.query_one("#candidate-table", DataTable).action_cursor_up()
 
     def action_next_page(self) -> None:
-        if self._page is None or self._page.next_cursor is None:
+        if self._page_load_in_flight():
+            self.app.notify("A candidate page is still loading.", markup=False)
+            return
+        if self._page is None:
+            self.app.notify("No candidate page is loaded. Press r to retry.", markup=False)
+            return
+        if self._page.next_cursor is None:
             self.app.notify("No later candidate page is available.", markup=False)
             return
-        self._cursor_stack.append(self._page.next_cursor)
-        self._load_current_page()
+        self._begin_page_load(self._page.next_cursor, "next")
 
     def action_previous_page(self) -> None:
-        if len(self._cursor_stack) == 1:
+        if self._page_load_in_flight():
+            self.app.notify("A candidate page is still loading.", markup=False)
+            return
+        if len(self._committed_history) == 1:
             self.app.notify("Already on the first candidate page.", markup=False)
             return
-        self._cursor_stack.pop()
-        self._load_current_page()
+        self._begin_page_load(self._committed_history[-2], "previous")
 
     def selected_stable_id(self) -> tuple[str, frozenset[str]] | None:
         table = self.query_one("#candidate-table", DataTable)
@@ -202,11 +219,16 @@ class CandidateScreen(WorkTraceScreen):
                 return_to_existing=True,
             )
 
-    def _load_current_page(self) -> None:
+    def _page_load_in_flight(self) -> bool:
+        return self._pending_direction is not None
+
+    def _begin_page_load(self, cursor: CandidateCursor | None, direction: _PageDirection) -> None:
         self._page_request_id += 1
         request_id = self._page_request_id
+        self._pending_direction = direction
+        self._pending_cursor = cursor
         self.query_one("#candidate-message", Static).update("Loading candidate page…")
-        self.load_candidate_page(request_id, self._cursor_stack[-1])
+        self.load_candidate_page(request_id, cursor)
 
     def _load_source_status(self) -> None:
         self._source_request_id += 1
@@ -245,6 +267,17 @@ class CandidateScreen(WorkTraceScreen):
     def on_candidate_page_loaded(self, message: CandidatePageLoaded) -> None:
         if message.request_id != self._page_request_id:
             return
+        direction = self._pending_direction
+        pending_cursor = self._pending_cursor
+        self._pending_direction = None
+        self._pending_cursor = None
+        if direction == "next":
+            self._committed_history.append(pending_cursor)
+        elif direction == "previous":
+            if len(self._committed_history) > 1:
+                self._committed_history.pop()
+        elif direction == "restart":
+            self._committed_history = [None]
         self._page = message.page
         self._items = message.page.items
         table = self.query_one("#candidate-table", DataTable)
@@ -280,7 +313,7 @@ class CandidateScreen(WorkTraceScreen):
                     "`worktrace rebuild candidates APP_ID` from the CLI."
                 )
         else:
-            state = f"Page {len(self._cursor_stack)} · {len(self._items)} candidates"
+            state = f"Page {len(self._committed_history)} · {len(self._items)} candidates"
             if message.page.next_cursor is not None and len(self._items) < 25:
                 state += " · hidden or unavailable candidates were skipped; press n to continue"
         self.query_one("#candidate-message", Static).update(state)
@@ -293,9 +326,16 @@ class CandidateScreen(WorkTraceScreen):
             return
         if message.operation != "candidate_page" or message.request_id != self._page_request_id:
             return
+        self._pending_direction = None
+        self._pending_cursor = None
         if message.kind is FailureKind.GENERATION_CHANGED:
-            self._cursor_stack = [None]
+            # Restart exactly once at page one. The restart request itself uses
+            # no cursor, so it cannot raise another generation change, and n/p/r
+            # stay inert while it is in flight.
+            self._committed_history = [None]
             self.app.notify(_FAILURE_TEXT[message.kind], markup=False)
-            self._load_current_page()
+            self._begin_page_load(None, "restart")
             return
+        # Ordinary failure: the committed history, displayed rows, and page
+        # label remain those of the last successful page.
         self.query_one("#candidate-message", Static).update(_FAILURE_TEXT[message.kind])
