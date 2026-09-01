@@ -116,6 +116,20 @@ class ReadOnlyWorkspace:
             if connection is not None:
                 connection.close()
 
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                yield connection
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            else:
+                if connection.in_transaction:
+                    connection.execute("COMMIT")
+
     def applications(self) -> tuple[ApplicationSummary, ...]:
         with self._connection():
             return tuple(
@@ -161,7 +175,7 @@ class ReadOnlyWorkspace:
 
     def contribution_review(self, app_id: str, candidate_id: str) -> ContributionReview:
         self._config.app(app_id)
-        with self._connection() as connection:
+        with self._read_snapshot() as connection:
             projected = project_candidate(connection, candidate_id)
             if projected.app_id != app_id:
                 raise ScopeViolation("candidate belongs to another application")
@@ -202,15 +216,15 @@ class ReadOnlyWorkspace:
                     )
                     for row in rows
                 )
-            return ContributionReview(
-                app_id=app_id,
-                candidate_id=candidate_id,
-                resolved_contribution_id=contribution_id,
-                status=projected.status,
-                packet=packet,
-                gaps=build_gap_report(packet),
-                unsupported_members=unsupported,
-            )
+        return ContributionReview(
+            app_id=app_id,
+            candidate_id=candidate_id,
+            resolved_contribution_id=contribution_id,
+            status=projected.status,
+            packet=packet,
+            gaps=build_gap_report(packet),
+            unsupported_members=unsupported,
+        )
 
     def evidence_excerpt(
         self,
