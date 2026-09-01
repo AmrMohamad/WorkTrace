@@ -230,6 +230,17 @@ class CandidateScreen(WorkTraceScreen):
         self.query_one("#candidate-message", Static).update("Loading candidate page…")
         self.load_candidate_page(request_id, cursor)
 
+    def _clear_loaded_page(self) -> None:
+        """Remove stale rows before a generation restart begins.
+
+        A generation-bound cursor can no longer describe the displayed rows.
+        If the automatic first-page restart then fails, no stale candidate may
+        remain selectable, openable, or copyable.
+        """
+        self._page = None
+        self._items = ()
+        self.query_one("#candidate-table", DataTable).clear()
+
     def _load_source_status(self) -> None:
         self._source_request_id += 1
         self.load_source_status(self._source_request_id)
@@ -333,6 +344,7 @@ class CandidateScreen(WorkTraceScreen):
             # no cursor, so it cannot raise another generation change, and n/p/r
             # stay inert while it is in flight.
             self._committed_history = [None]
+            self._clear_loaded_page()
             self.app.notify(_FAILURE_TEXT[message.kind], markup=False)
             self._begin_page_load(None, "restart")
             return

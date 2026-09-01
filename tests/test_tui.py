@@ -478,6 +478,70 @@ async def test_generation_invalidation_restarts_exactly_once_at_page_one(
 
 
 @pytest.mark.asyncio
+async def test_generation_invalidation_clears_stale_rows_when_restart_fails(
+    tmp_path: Path,
+) -> None:
+    import threading
+
+    from tests.tui_support import add_visible_candidate_page
+    from worktrace.read_models.candidates import CandidateGenerationChanged
+    from worktrace.read_workspace import DatabaseBusy
+
+    connection, _, config, _ = _packet_state(tmp_path)
+    add_visible_candidate_page(connection)
+    connection.close()
+    app = RecordingWorkTraceApp(ReadOnlyWorkspace(config), initial_app_id="sample_store")
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
+        screen = app.screen
+        assert isinstance(screen, CandidateScreen)
+        table = screen.query_one("#candidate-table", DataTable)
+        message = screen.query_one("#candidate-message", Static)
+        await _pause_until(pilot, lambda: screen._page is not None)
+        await pilot.press("n")
+        await _pause_until(pilot, lambda: len(screen._committed_history) == 2)
+
+        original_page = app.workspace.candidate_page
+        restart_gate = threading.Event()
+        calls: list[str] = []
+
+        def stale_then_busy(*args: object, **kwargs: object) -> object:
+            calls.append("call")
+            if len(calls) == 1:
+                raise CandidateGenerationChanged("generation moved")
+            assert restart_gate.wait(timeout=10)
+            raise DatabaseBusy("secret raw database detail")
+
+        app.workspace.candidate_page = stale_then_busy  # type: ignore[method-assign]
+        try:
+            await pilot.press("p")
+            await _pause_until(pilot, lambda: len(calls) == 2)
+            assert screen._committed_history == [None]
+            assert screen._page is None
+            assert screen._items == ()
+            assert table.row_count == 0
+            assert screen.selected_stable_id() is None
+
+            await pilot.press("enter", "y")
+            assert app.copied == []
+
+            restart_gate.set()
+            await _pause_until(pilot, lambda: "data is busy" in str(message.render()))
+            assert screen._committed_history == [None]
+            assert screen._page is None
+            assert screen._items == ()
+            assert table.row_count == 0
+
+            app.workspace.candidate_page = original_page  # type: ignore[method-assign]
+            await pilot.press("r")
+            await _pause_until(pilot, lambda: screen._page is not None)
+            assert screen._committed_history == [None]
+            assert table.row_count == 25
+        finally:
+            app.workspace.candidate_page = original_page  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
 async def test_global_return_restores_the_same_candidate_screen(tmp_path: Path) -> None:
     from tests.tui_support import add_visible_candidate_page
 
@@ -570,8 +634,10 @@ async def test_modal_command_palettes_expose_only_safe_actions(tmp_path: Path) -
         await _pause_until(pilot, lambda: isinstance(app.screen, HelpModal))
         help_modal = app.screen
         assert isinstance(help_modal, HelpModal)
-        assert [command.title for command in app.get_system_commands(help_modal)] == ["Quit"]
-        await pilot.press("q")
+        help_commands = list(app.get_system_commands(help_modal))
+        assert [command.title for command in help_commands] == ["Close", "Quit"]
+        help_commands[0].callback()
+        await _pause_until(pilot, lambda: app.screen is candidate_screen)
         assert app.screen is candidate_screen
 
         await pilot.press("enter")
@@ -592,7 +658,16 @@ async def test_modal_command_palettes_expose_only_safe_actions(tmp_path: Path) -
         await _pause_until(pilot, lambda: isinstance(app.screen, EvidenceModal))
         evidence_modal = app.screen
         assert isinstance(evidence_modal, EvidenceModal)
-        assert [command.title for command in app.get_system_commands(evidence_modal)] == ["Quit"]
+        evidence_commands = list(app.get_system_commands(evidence_modal))
+        assert [command.title for command in evidence_commands] == [
+            "Close",
+            "Copy evidence ID",
+            "Quit",
+        ]
+        evidence_commands[1].callback()
+        assert app.copied == [evidence_modal.selected_stable_id()[0]]  # type: ignore[index]
+        evidence_commands[0].callback()
+        await _pause_until(pilot, lambda: isinstance(app.screen, ContributionScreen))
 
     small_root = tmp_path / "small"
     small_root.mkdir()
@@ -601,15 +676,22 @@ async def test_modal_command_palettes_expose_only_safe_actions(tmp_path: Path) -
     small_app = RecordingWorkTraceApp(ReadOnlyWorkspace(small_config))
     async with small_app.run_test(size=(70, 18)) as pilot:
         await _pause_until(pilot, lambda: isinstance(small_app.screen, SmallTerminalScreen))
-        assert [command.title for command in small_app.get_system_commands(small_app.screen)] == [
-            "Quit"
+        terminal_commands = list(small_app.get_system_commands(small_app.screen))
+        assert [command.title for command in terminal_commands] == [
+            "Continue compact",
+            "Recheck terminal",
+            "Quit",
         ]
+        terminal_commands[1].callback()
+        assert isinstance(small_app.screen, SmallTerminalScreen)
+        terminal_commands[0].callback()
+        await _pause_until(pilot, lambda: isinstance(small_app.screen, CandidateScreen))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("size", "expected_columns"),
-    [((80, 24), 4), ((120, 40), 6)],
+    [((80, 24), 4), ((100, 40), 4), ((120, 40), 6)],
 )
 async def test_candidate_columns_match_terminal_layout(
     tmp_path: Path,
@@ -624,6 +706,21 @@ async def test_candidate_columns_match_terminal_layout(
         table = screen.query_one("#candidate-table", DataTable)
         await _pause_until(pilot, lambda: table.row_count == 1)
         assert len(table.columns) == expected_columns
+
+
+@pytest.mark.asyncio
+async def test_small_terminal_continue_uses_compact_layout(tmp_path: Path) -> None:
+    app, _ = _app(tmp_path)
+    async with app.run_test(size=(120, 20)) as pilot:
+        await _pause_until(pilot, lambda: isinstance(app.screen, SmallTerminalScreen))
+        await pilot.press("c")
+        await _pause_until(pilot, lambda: isinstance(app.screen, CandidateScreen))
+        screen = app.screen
+        assert isinstance(screen, CandidateScreen)
+        table = screen.query_one("#candidate-table", DataTable)
+        await _pause_until(pilot, lambda: table.row_count == 1)
+        assert app.compact_mode is True
+        assert len(table.columns) == 4
 
 
 @pytest.mark.asyncio
