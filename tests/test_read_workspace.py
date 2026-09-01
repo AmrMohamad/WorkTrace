@@ -10,6 +10,8 @@ import pytest
 
 import worktrace.read_workspace as read_workspace_module
 from tests.test_packets_golden import _packet_state
+from worktrace.candidates.decisions import append_decision
+from worktrace.db.connection import connect
 from worktrace.errors import ScopeViolation
 from worktrace.read_workspace import (
     DatabaseBusy,
@@ -74,6 +76,132 @@ def test_workspace_builds_packet_once_and_derives_gaps_from_same_object(
 
     assert len(packet_ids) == 1
     assert gap_packet_ids == packet_ids
+
+
+def test_contribution_review_uses_one_snapshot_during_concurrent_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, candidate_id = _workspace(tmp_path)
+    journal = sqlite3.connect(workspace.database_path, autocommit=True)
+    try:
+        assert str(journal.execute("PRAGMA journal_mode = WAL").fetchone()[0]) == "wal"
+    finally:
+        journal.close()
+
+    baseline = workspace.contribution_review("sample_store", candidate_id)
+    summary = baseline.packet["evidence_summary"]
+    assert isinstance(summary, dict)
+    members = summary["members"]
+    assert isinstance(members, list)
+    member_ids = [
+        str(member["object_id"])
+        for member in members
+        if isinstance(member, dict) and member.get("object_id")
+    ]
+    baseline_contribution = baseline.packet["contribution"]
+    assert isinstance(baseline_contribution, dict)
+    baseline_signature = (
+        baseline.status,
+        baseline_contribution.get("title"),
+        baseline_contribution.get("title_authority"),
+        baseline_contribution.get("title_status"),
+    )
+
+    projection_ready = threading.Event()
+    writer_committed = threading.Event()
+    original_project_candidate = read_workspace_module.project_candidate
+    paused = False
+
+    def project_then_pause(*args: Any, **kwargs: Any) -> Any:
+        nonlocal paused
+        projected = original_project_candidate(*args, **kwargs)
+        if not paused:
+            paused = True
+            projection_ready.set()
+            assert writer_committed.wait(timeout=5)
+        return projected
+
+    monkeypatch.setattr(read_workspace_module, "project_candidate", project_then_pause)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(workspace.contribution_review, "sample_store", candidate_id)
+        assert projection_ready.wait(timeout=5)
+        writer = connect(workspace.database_path)
+        try:
+            append_decision(
+                writer,
+                "confirm_candidate",
+                candidate_id,
+                {
+                    "contribution_id": "contribution:concurrent-confirmation",
+                    "app_id": "sample_store",
+                    "title": "Concurrent human-reviewed title",
+                    "members": member_ids,
+                },
+            )
+        finally:
+            writer.close()
+            writer_committed.set()
+        interleaved = future.result(timeout=5)
+
+    interleaved_contribution = interleaved.packet["contribution"]
+    assert isinstance(interleaved_contribution, dict)
+    assert (
+        interleaved.status,
+        interleaved_contribution.get("title"),
+        interleaved_contribution.get("title_authority"),
+        interleaved_contribution.get("title_status"),
+    ) == baseline_signature
+
+    settled = workspace.contribution_review("sample_store", candidate_id)
+    settled_contribution = settled.packet["contribution"]
+    assert isinstance(settled_contribution, dict)
+    assert settled.status == "confirmed"
+    assert settled_contribution["title"] == "Concurrent human-reviewed title"
+
+
+def test_contribution_review_rolls_back_snapshot_before_closing_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, candidate_id = _workspace(tmp_path)
+    original_connect = read_workspace_module.connect_read_only
+    events: list[str | tuple[str, bool]] = []
+
+    class TrackingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.connection, name)
+
+        def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+            command = sql.strip().split(maxsplit=1)[0].upper()
+            if command in {"BEGIN", "COMMIT", "ROLLBACK"}:
+                events.append(command)
+            return self.connection.execute(sql, *args)
+
+        def close(self) -> None:
+            events.append(("CLOSE", self.connection.in_transaction))
+            self.connection.close()
+
+    def tracking_connect(path: Path, *, busy_timeout_ms: int) -> Any:
+        return TrackingConnection(original_connect(path, busy_timeout_ms=busy_timeout_ms))
+
+    def fail_packet(*args: object, **kwargs: object) -> dict[str, object]:
+        raise RuntimeError("synthetic packet failure")
+
+    monkeypatch.setattr(read_workspace_module, "connect_read_only", tracking_connect)
+    monkeypatch.setattr(read_workspace_module.PacketBuilder, "build_packet", fail_packet)
+
+    with pytest.raises(RuntimeError, match="synthetic packet failure"):
+        workspace.contribution_review("sample_store", candidate_id)
+
+    assert events.count("BEGIN") == 1
+    assert events.count("ROLLBACK") == 1
+    assert "COMMIT" not in events
+    assert events[-1] == ("CLOSE", False)
 
 
 def test_workspace_connection_is_worker_created_query_only_500ms_and_closed(
@@ -153,13 +281,13 @@ def test_workspace_reports_older_and_newer_database_versions(tmp_path: Path) -> 
         writer.close()
 
 
-def test_workspace_bounds_lock_contention_to_busy_error(tmp_path: Path) -> None:
-    workspace, _ = _workspace(tmp_path)
+def test_contribution_review_bounds_lock_contention_to_busy_error(tmp_path: Path) -> None:
+    workspace, candidate_id = _workspace(tmp_path)
     blocker = sqlite3.connect(workspace.database_path, timeout=0.1, isolation_level=None)
     try:
         blocker.execute("BEGIN EXCLUSIVE")
         with pytest.raises(DatabaseBusy):
-            workspace.applications()
+            workspace.contribution_review("sample_store", candidate_id)
     finally:
         blocker.execute("ROLLBACK")
         blocker.close()
