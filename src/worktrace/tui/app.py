@@ -14,9 +14,21 @@ from textual.widgets import Footer, Static
 from worktrace.mcp_server.schemas import stable_id
 from worktrace.read_workspace import ApplicationSummary, ReadOnlyWorkspace
 from worktrace.tui.messages import ApplicationsLoaded, FailureKind, ReadFailed, failure_kind
+from worktrace.tui.modals.evidence import EvidenceModal
 from worktrace.tui.screens.applications import ApplicationScreen
 from worktrace.tui.screens.base import WorkTraceModal, WorkTraceScreen
 from worktrace.tui.screens.candidates import CandidateScreen
+from worktrace.tui.screens.contribution import ContributionScreen
+
+# Below this width the candidate browser uses the four-column compact table; the
+# six-column full layout is reserved for the documented full terminal size.
+_FULL_LAYOUT_WIDTH = 120
+
+
+def _uses_compact_layout(width: int, height: int) -> bool:
+    """Return the fixed launch-time layout choice for a usable terminal."""
+    return width < _FULL_LAYOUT_WIDTH or height < 24
+
 
 _HELP_TEXT = """WorkTrace read-only review
 
@@ -169,15 +181,42 @@ class WorkTraceApp(App[None], inherit_bindings=False):
         if self.size.width < 80 or self.size.height < 24:
             self.push_screen(SmallTerminalScreen(), self._after_terminal_check)
         else:
+            self.compact_mode = _uses_compact_layout(self.size.width, self.size.height)
             self.action_restart()
 
     def _after_terminal_check(self, proceed: bool | None) -> None:
         if proceed:
-            self.compact_mode = self.size.width < 80 or self.size.height < 24
+            self.compact_mode = _uses_compact_layout(self.size.width, self.size.height)
             self.action_restart()
 
     def get_system_commands(self, screen: Screen[object]) -> Iterable[SystemCommand]:
+        if isinstance(screen, HelpModal):
+            yield SystemCommand("Close", "Close keyboard help", screen.dismiss)
+            yield SystemCommand("Quit", "Quit WorkTrace", self.action_quit)
+            return
+        if isinstance(screen, EvidenceModal):
+            yield SystemCommand("Close", "Close evidence excerpt", screen.dismiss)
+            yield SystemCommand(
+                "Copy evidence ID",
+                "Copy the validated WorkTrace evidence ID",
+                self.action_copy_selected_id,
+            )
+            yield SystemCommand("Quit", "Quit WorkTrace", self.action_quit)
+            return
+        if isinstance(screen, SmallTerminalScreen):
+            yield SystemCommand(
+                "Continue compact",
+                "Continue using the compact layout",
+                screen.action_continue_compact,
+            )
+            yield SystemCommand("Recheck terminal", "Recheck terminal size", screen.action_recheck)
+            yield SystemCommand("Quit", "Quit WorkTrace", self.action_quit)
+            return
         yield SystemCommand("Quit", "Quit WorkTrace", self.action_quit)
+        if isinstance(screen, ModalScreen):
+            # Unknown modal screens remain constrained to quitting rather than
+            # restructuring screens beneath the modal.
+            return
         yield SystemCommand("Keyboard help", "Show safe keyboard commands", self.action_show_help)
         yield SystemCommand(
             "Switch application",
@@ -185,7 +224,7 @@ class WorkTraceApp(App[None], inherit_bindings=False):
             self.action_switch_application,
         )
         yield SystemCommand("Refresh", "Refresh the current read-only view", self.action_refresh)
-        if isinstance(screen, (CandidateScreen,)) is False and self.current_app_id is not None:
+        if isinstance(screen, ContributionScreen) and self.current_app_id is not None:
             yield SystemCommand(
                 "Return to candidates",
                 "Return to the selected application's candidate page",
@@ -202,10 +241,15 @@ class WorkTraceApp(App[None], inherit_bindings=False):
         self.load_applications(request_id)
 
     def _show_screen(self, screen: Screen[None]) -> None:
-        if self.screen.id == "_default":
-            self.push_screen(screen)
-        else:
-            self.switch_screen(screen)
+        """Reset the stack to exactly one visible base screen.
+
+        Popping back to the default screen before pushing removes hidden nested
+        screens left by earlier navigation, so application switching and global
+        restarts can never stack a new screen above a stale one.
+        """
+        while len(self.screen_stack) > 1:
+            self.pop_screen()
+        self.push_screen(screen)
 
     def action_show_help(self) -> None:
         self.push_screen(HelpModal())
@@ -221,8 +265,26 @@ class WorkTraceApp(App[None], inherit_bindings=False):
             self.action_restart()
 
     def action_return_to_candidates(self) -> None:
-        if self.current_app_id is not None:
-            self.open_application(self.current_app_id)
+        if self.current_app_id is None:
+            return
+        if self._pop_to_candidate(self.current_app_id):
+            return
+        self.open_application(self.current_app_id)
+
+    def _pop_to_candidate(self, app_id: str) -> bool:
+        """Reveal an existing CandidateScreen for app_id, preserving its state.
+
+        Returns True when the running CandidateScreen was revealed; everything
+        above it (contribution review, modals) is popped so the stack depth and
+        the candidate row, cursor history, and page position are restored.
+        """
+        for index in range(len(self.screen_stack) - 1, -1, -1):
+            screen = self.screen_stack[index]
+            if isinstance(screen, CandidateScreen) and screen.application.app_id == app_id:
+                while len(self.screen_stack) - 1 > index:
+                    self.pop_screen()
+                return True
+        return False
 
     def action_copy_selected_id(self) -> None:
         selected = getattr(self.screen, "selected_stable_id", lambda: None)()
@@ -317,8 +379,6 @@ class WorkTraceApp(App[None], inherit_bindings=False):
         *,
         return_to_existing: bool,
     ) -> None:
-        from worktrace.tui.screens.contribution import ContributionScreen
-
         self.current_app_id = app_id
         screen = ContributionScreen(
             app_id,
