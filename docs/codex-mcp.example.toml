@@ -1,6 +1,10 @@
 # Copy this block into a trusted project `.codex/config.toml` or the user's
 # Codex config after replacing the absolute executable path. Do not forward Jira
 # or GitLab credentials: WorkTrace MCP reads only the local SQLite ledger.
+# Restart MCP after schema upgrades, database replacement, or restore. Capture
+# view_token and send expected_view_token on related reads. Discard stale/legacy
+# cursors; follow non-null continuations even on empty pages. Packet section or
+# question_id detail retrieval uses the same build_phase4_packet tool.
 
 [mcp_servers.worktrace]
 command = "/absolute/path/to/WorkTrace/.venv/bin/python"

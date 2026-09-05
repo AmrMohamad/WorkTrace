@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
 
+from worktrace.db.read_state import mark_read_states_changed
 from worktrace.errors import NotFound, ScopeViolation
 from worktrace.normalize.redaction import Redactor
 
@@ -241,7 +242,13 @@ def append_decision(
         if validated != stored_payload:
             raise ValueError("redaction is required before decision persistence")
     decision_id = f"decision:{uuid.uuid4()}"
-    with connection:
+    # WorkTrace's normal writer connection uses autocommit=False, which starts
+    # its next transaction immediately after a commit. An explicit BEGIN on an
+    # autocommit=True connection is therefore the only caller-owned form here.
+    owns_transaction = connection.autocommit is False or not connection.in_transaction
+    if owns_transaction and connection.autocommit is True:
+        connection.execute("BEGIN")
+    try:
         connection.execute(
             """
             INSERT INTO human_decisions(
@@ -258,6 +265,16 @@ def append_decision(
                 undo_target_id,
             ),
         )
+        affected_app = decision_scope_map(connection).get(decision_id)
+        if affected_app is not None:
+            mark_read_states_changed(connection, [affected_app])
+    except BaseException:
+        if owns_transaction and connection.in_transaction:
+            connection.rollback()
+        raise
+    else:
+        if owns_transaction and connection.in_transaction:
+            connection.commit()
     return decision_id
 
 

@@ -64,7 +64,7 @@ def test_cli_help_init_status_search_export_and_confirmed_purge(
 
     first_init = runner.invoke(app, ["init", "--config", str(config)])
     assert first_init.exit_code == 0, first_init.stdout
-    assert json.loads(first_init.stdout)["migrations_applied"] == [1, 2, 3, 4, 5]
+    assert json.loads(first_init.stdout)["migrations_applied"] == [1, 2, 3, 4, 5, 6]
 
     second_init = runner.invoke(app, ["init", "--config", str(config)])
     assert second_init.exit_code == 0, second_init.stdout

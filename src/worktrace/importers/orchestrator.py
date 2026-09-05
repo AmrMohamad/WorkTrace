@@ -370,10 +370,7 @@ def import_snapshot(
             key_progress = json.loads(str(row[0]))
             key_progress["jira_key_retrieval"] = key_retrieval
             key_progress["limitations"] = list(limitations)
-            repository.connection.execute(
-                "UPDATE sync_runs SET progress_json=? WHERE id=?",
-                (json.dumps(key_progress), run_id),
-            )
+            repository.update_run_progress(run_id, key_progress)
     completeness = (
         Completeness.SELECTION_BIASED.value if selection_biased else Completeness.COMPLETE.value
     )
@@ -384,6 +381,7 @@ def import_snapshot(
     with repository.connection:
         if guarded_selector:
             assert configuration is not None
+            # Reserve the writer without manufacturing a visible-state revision.
             repository.connection.execute(
                 "UPDATE apps SET read_revision=read_revision WHERE id=?", (app.id,)
             )
@@ -396,10 +394,7 @@ def import_snapshot(
                 ).fetchone()
                 progress_value = json.loads(str(row[0]))
                 progress_value["selector_replacement"] = proposal
-                repository.connection.execute(
-                    "UPDATE sync_runs SET progress_json=? WHERE id=?",
-                    (json.dumps(progress_value), run_id),
-                )
+                repository.update_run_progress(run_id, progress_value)
                 message = "selector_replacement_requires_approval"
                 repository.finish_sync_run(run_id, "failed", Completeness.PARTIAL.value, message)
                 if finish_session:

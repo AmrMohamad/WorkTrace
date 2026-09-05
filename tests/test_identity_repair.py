@@ -141,7 +141,7 @@ def test_populated_legacy_repair_preserves_ids_and_records_rereview(tmp_path: Pa
         assert identity_policy_status(connection, config, "sample")["requires_rereview"]
         assert (
             connection.execute("SELECT read_revision FROM apps WHERE id='sample'").fetchone()[0]
-            == 2
+            == 3
         )
     finally:
         connection.close()
@@ -265,7 +265,7 @@ def test_audit_failure_rolls_back_entire_repair_but_preserves_caller_changes(
         assert connection.execute("SELECT count(*) FROM app_identity_policy").fetchone()[0] == 0
         assert (
             connection.execute("SELECT read_revision FROM apps WHERE id='sample'").fetchone()[0]
-            == 0
+            == 1
         )
     finally:
         connection.rollback()

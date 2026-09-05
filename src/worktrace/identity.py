@@ -23,6 +23,7 @@ from worktrace.candidates.decisions import (
     snapshot_member_ids,
 )
 from worktrace.config import WorkTraceConfig
+from worktrace.db.read_state import mark_read_state_changed, mark_read_states_changed
 from worktrace.errors import ConfigurationError, ScopeViolation
 from worktrace.normalize.redaction import Redactor
 
@@ -122,11 +123,6 @@ def initialize_identity(
                 is None
             ):
                 _accept_policy(connection, config, app.id)
-
-
-def mark_read_state_changed(connection: sqlite3.Connection, app_id: str) -> None:
-    """Invalidate app reads in the caller's visible-state transaction."""
-    connection.execute("UPDATE apps SET read_revision=read_revision+1 WHERE id=?", (app_id,))
 
 
 def identity_policy_status(
@@ -423,7 +419,7 @@ def repair_identities(
         connection.execute(
             "UPDATE app_identity_policy SET rebuild_required=1 WHERE app_id=?", (app_id,)
         )
-        mark_read_state_changed(connection, app_id)
+        mark_read_states_changed(connection, report["affected_apps"])
         report["applied"] = True
         repair_id = "identity-repair:" + str(uuid.uuid4())
         connection.execute(

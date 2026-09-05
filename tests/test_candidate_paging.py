@@ -461,7 +461,7 @@ def test_default_page_is_scan_bounded_and_advances_by_the_last_raw_row(
     assert diagnostics.decision_lineage_count == 100
     assert diagnostics.authority_context_builds == 1
     assert sum(statement.strip() == "BEGIN" for statement in statements) == 1
-    assert sum(statement.strip() == "COMMIT" for statement in statements) == 1
+    assert sum(statement.strip() == "ROLLBACK" for statement in statements) == 1
     assert sum("worktrace_page_authority_evidence_context" in value for value in statements) == 1
     assert sum("authoritative_current_observations AS" in value for value in statements) == 1
     assert sum("authoritative_current_availability_events AS" in value for value in statements) == 1
@@ -886,6 +886,21 @@ def test_empty_generation_has_no_token_or_cursor(tmp_path: Path) -> None:
             )
     finally:
         read_only.close()
+
+
+def test_candidate_page_joins_a_caller_owned_read_snapshot(
+    scale_state: tuple[Path, WorkTraceConfig],
+) -> None:
+    database_path, config = scale_state
+    connection = connect_read_only(database_path)
+    try:
+        connection.execute("BEGIN")
+        page = candidate_page(connection, config, _APP_ID)
+        assert page.generation_token is not None
+        assert connection.in_transaction
+        connection.execute("ROLLBACK")
+    finally:
+        connection.close()
 
 
 def test_rebuild_generation_invalidates_an_existing_cursor(

@@ -14,6 +14,7 @@ from worktrace.db.authority import (
     authoritative_current_observations,
     authoritative_current_run_ctes,
 )
+from worktrace.db.read_state import mark_read_states_changed
 from worktrace.domain.models import (
     ActorObservation,
     AvailabilityObservation,
@@ -67,10 +68,10 @@ class EvidenceRepository:
 
         with self.connection:
             for app in config.apps:
-                is_new = (
-                    self.connection.execute("SELECT 1 FROM apps WHERE id=?", (app.id,)).fetchone()
-                    is None
-                )
+                existing = self.connection.execute(
+                    "SELECT name, market, business_type FROM apps WHERE id=?", (app.id,)
+                ).fetchone()
+                is_new = existing is None
                 self.connection.execute(
                     """
                     INSERT INTO apps(id, name, market, business_type)
@@ -82,6 +83,12 @@ class EvidenceRepository:
                     """,
                     (app.id, app.name, app.market, app.business_type),
                 )
+                if existing is not None and (
+                    str(existing["name"]) != app.name
+                    or str(existing["market"]) != app.market
+                    or str(existing["business_type"]) != app.business_type
+                ):
+                    mark_read_states_changed(self.connection, [app.id])
                 if is_new:
                     self.connection.execute(
                         "INSERT INTO app_identity_policy(app_id, version, fingerprint) "
@@ -99,16 +106,58 @@ class EvidenceRepository:
                 """,
                 (session_id, app.id, iso(utc_now()), iso(date_from), iso(date_to)),
             )
+            mark_read_states_changed(self.connection, [app.id])
         return session_id
+
+    def update_import_session_progress(
+        self, session_id: str, summary: dict[str, JsonValue]
+    ) -> None:
+        """Persist visible import-session progress with its app revision atomically."""
+        owns_transaction = self.connection.autocommit is False or not self.connection.in_transaction
+        if owns_transaction and self.connection.autocommit is True:
+            self.connection.execute("BEGIN")
+        try:
+            row = self.connection.execute(
+                "SELECT app_id FROM import_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise DatabaseError("import session not found")
+            self.connection.execute(
+                "UPDATE import_sessions SET summary_json=? WHERE id=?",
+                (json.dumps(summary, sort_keys=True), session_id),
+            )
+            mark_read_states_changed(self.connection, [str(row["app_id"])])
+        except BaseException:
+            if owns_transaction and self.connection.in_transaction:
+                self.connection.rollback()
+            raise
+        else:
+            if owns_transaction and self.connection.in_transaction:
+                self.connection.commit()
 
     def finish_import_session(
         self, session_id: str, status: str, summary: dict[str, JsonValue]
     ) -> None:
-        with self.connection:
+        owns_transaction = self.connection.autocommit is False or not self.connection.in_transaction
+        if owns_transaction and self.connection.autocommit is True:
+            self.connection.execute("BEGIN")
+        try:
+            row = self.connection.execute(
+                "SELECT app_id FROM import_sessions WHERE id=?", (session_id,)
+            ).fetchone()
             self.connection.execute(
                 "UPDATE import_sessions SET status=?, completed_at=?, summary_json=? WHERE id=?",
                 (status, iso(utc_now()), json.dumps(summary, sort_keys=True), session_id),
             )
+            if row is not None:
+                mark_read_states_changed(self.connection, [str(row["app_id"])])
+        except BaseException:
+            if owns_transaction and self.connection.in_transaction:
+                self.connection.rollback()
+            raise
+        else:
+            if owns_transaction and self.connection.in_transaction:
+                self.connection.commit()
 
     def start_sync_run(
         self,
@@ -138,12 +187,22 @@ class EvidenceRepository:
                     json.dumps(scope, sort_keys=True),
                 ),
             )
+            mark_read_states_changed(self.connection, [app_id])
         return run_id
 
     def update_run_progress(self, run_id: str, progress: dict[str, JsonValue]) -> None:
         self.connection.execute(
             "UPDATE sync_runs SET progress_json=? WHERE id=?",
             (json.dumps(progress, sort_keys=True), run_id),
+        )
+        mark_read_states_changed(
+            self.connection,
+            [
+                str(row["app_id"])
+                for row in self.connection.execute(
+                    "SELECT app_id FROM sync_runs WHERE id=?", (run_id,)
+                )
+            ],
         )
 
     def finish_sync_run(
@@ -153,7 +212,13 @@ class EvidenceRepository:
         completeness: str,
         error_summary: str | None = None,
     ) -> None:
-        with self.connection:
+        owns_transaction = self.connection.autocommit is False or not self.connection.in_transaction
+        if owns_transaction and self.connection.autocommit is True:
+            self.connection.execute("BEGIN")
+        try:
+            row = self.connection.execute(
+                "SELECT app_id FROM sync_runs WHERE id=?", (run_id,)
+            ).fetchone()
             self.connection.execute(
                 """
                 UPDATE sync_runs
@@ -163,6 +228,15 @@ class EvidenceRepository:
                 (status, completeness, iso(utc_now()), error_summary, run_id),
             )
             self._project_authoritative_availability(run_id)
+            if row is not None:
+                mark_read_states_changed(self.connection, [str(row["app_id"])])
+        except BaseException:
+            if owns_transaction and self.connection.in_transaction:
+                self.connection.rollback()
+            raise
+        else:
+            if owns_transaction and self.connection.in_transaction:
+                self.connection.commit()
 
     def _project_authoritative_availability(self, run_id: str) -> None:
         """Reconcile affected objects from eligible events only.
@@ -223,6 +297,14 @@ class EvidenceRepository:
     def mark_stale_runs_failed(self, older_than: timedelta = timedelta(hours=6)) -> int:
         cutoff = iso(utc_now() - older_than)
         with self.connection:
+            affected_apps = [
+                str(row["app_id"])
+                for row in self.connection.execute(
+                    "SELECT DISTINCT app_id FROM sync_runs "
+                    "WHERE status='running' AND started_at < ?",
+                    (cutoff,),
+                )
+            ]
             cursor = self.connection.execute(
                 """
                 UPDATE sync_runs SET status='running_stale', completed_at=?,
@@ -231,6 +313,7 @@ class EvidenceRepository:
                 """,
                 (iso(utc_now()), cutoff),
             )
+            mark_read_states_changed(self.connection, affected_apps)
         return cursor.rowcount
 
     def store_page(
@@ -273,12 +356,32 @@ class EvidenceRepository:
                         raise DatabaseError(
                             "source page escaped its configured sync-run source scope"
                         )
+                page_actor_ids: set[str] = set()
                 for item in page_objects:
-                    observation_ids.append(self._store_object(run_id, item))
+                    observation_id, actor_ids = self._store_object(run_id, item)
+                    observation_ids.append(observation_id)
+                    page_actor_ids.update(actor_ids)
                 for unavailable in page_unavailable:
                     self._record_object_unavailable(run_id, unavailable)
                 if progress is not None:
                     self.update_run_progress(run_id, progress)
+                actor_apps: list[str] = []
+                if page_actor_ids:
+                    placeholders = ",".join("?" for _ in page_actor_ids)
+                    actor_apps = [
+                        str(row["app_id"])
+                        for row in self.connection.execute(
+                            f"""
+                            SELECT DISTINCT object.app_id
+                            FROM participations participation
+                            JOIN source_objects object
+                              ON object.id=participation.source_object_id
+                            WHERE participation.actor_id IN ({placeholders})
+                            """,
+                            tuple(sorted(page_actor_ids)),
+                        )
+                    ]
+                mark_read_states_changed(self.connection, [str(run["app_id"]), *actor_apps])
         except sqlite3.Error as exc:
             raise DatabaseError("failed to persist source page") from exc
         return observation_ids
@@ -351,7 +454,7 @@ class EvidenceRepository:
         assert row is not None
         return str(row["id"])
 
-    def _store_object(self, run_id: str, item: NormalizedObject) -> str:
+    def _store_object(self, run_id: str, item: NormalizedObject) -> tuple[str, set[str]]:
         identity = item.identity
         validation_redactor = self.redactor or Redactor(b"worktrace-validation-only")
         external_id = validation_redactor.protect_identifier(
@@ -547,7 +650,7 @@ class EvidenceRepository:
                     json.dumps(participation.details, sort_keys=True),
                 ),
             )
-        return observation_id
+        return observation_id, set(actors.values())
 
     def _append_availability_event(
         self,
@@ -584,7 +687,7 @@ class EvidenceRepository:
         """Stage an exact-object availability transition for a running scoped run."""
 
         with self.connection:
-            return self._record_object_unavailable(
+            object_id = self._record_object_unavailable(
                 run_id,
                 AvailabilityObservation(
                     source=source,
@@ -594,6 +697,12 @@ class EvidenceRepository:
                     reason=reason,
                 ),
             )
+            row = self.connection.execute(
+                "SELECT app_id FROM sync_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if row is not None:
+                mark_read_states_changed(self.connection, [str(row["app_id"])])
+            return object_id
 
     def _record_object_unavailable(self, run_id: str, unavailable: AvailabilityObservation) -> str:
         run = self.connection.execute(

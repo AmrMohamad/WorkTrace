@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from worktrace.candidates.decisions import _build_decision_projection_context
 from worktrace.config import WorkTraceConfig
+from worktrace.db.read_state import read_snapshot
 from worktrace.errors import DatabaseError, NotFound, WorkTraceError
 
 DEFAULT_PAGE_SIZE = 25
@@ -264,16 +265,13 @@ def _candidate_page(
 ) -> CandidatePage:
     if not 1 <= page_size <= MAX_PAGE_SIZE:
         raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
-    if connection.in_transaction:
-        raise DatabaseError("candidate page requires a connection outside a transaction")
 
     config.app(app_id)
     batch_size = page_size * 2
     scan_budget = min(page_size * 4, MAX_SCAN_BUDGET)
     from worktrace.packets.builder import PacketBuilder, _build_authority_evidence_context
 
-    connection.execute("BEGIN")
-    try:
+    with read_snapshot(connection):
         generation = _active_generation(connection, app_id)
         if generation is None:
             if cursor is not None:
@@ -359,9 +357,4 @@ def _candidate_page(
                 items=tuple(items),
                 next_cursor=next_cursor,
             )
-        connection.execute("COMMIT")
         return result
-    except Exception:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        raise

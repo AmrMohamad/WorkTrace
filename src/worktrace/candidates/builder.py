@@ -9,6 +9,7 @@ from worktrace.db.authority import (
     authoritative_current_participation_ctes,
     authoritative_current_reference_ctes,
 )
+from worktrace.db.read_state import mark_read_states_changed
 from worktrace.db.repository import EvidenceRepository, stable_id
 from worktrace.participation import (
     ParticipationCategory,
@@ -246,6 +247,7 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
                     "INSERT INTO candidate_members VALUES (?, ?, 'textual_reference', 1)",
                     (candidate_id, member),
                 )
+        mark_read_states_changed(connection, [app_id])
     row = connection.execute(
         "SELECT COUNT(*) AS count FROM candidate_groups WHERE app_id=?", (app_id,)
     ).fetchone()

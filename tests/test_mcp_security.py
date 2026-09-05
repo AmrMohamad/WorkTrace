@@ -16,6 +16,7 @@ from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
 from worktrace.errors import NotFound, ScopeViolation
 from worktrace.mcp_server.limits import enforce_total_limit
+from worktrace.mcp_server.responses import shape_packet
 from worktrace.mcp_server.server import SERVER_INSTRUCTIONS, build_mcp_server
 from worktrace.mcp_server.tools import WorkTraceTools
 from worktrace.normalize.redaction import Redactor
@@ -139,7 +140,7 @@ def _insert_manual_object(
             f"candidate:manual_{index}",
             object_id,
             f"Synthetic evidence {index}",
-            observed_at,
+            "2026-08-26T12:00:00+00:00",
         ),
     )
     connection.execute(
@@ -224,19 +225,19 @@ def test_unconfigured_apps_and_malicious_cursors_are_rejected(tmp_path: Path) ->
     _, _, tools = _mcp_state(tmp_path)
     with pytest.raises(ScopeViolation, match="unconfigured app_id"):
         tools.list_contribution_candidates(app_id="other_app")
-    with pytest.raises(ScopeViolation, match="cursor is invalid"):
-        tools.list_contribution_candidates(
-            app_id="sample_store", cursor="offset:0;DELETE FROM apps"
-        )
+    invalid = tools.list_contribution_candidates(
+        app_id="sample_store", cursor="offset:0;DELETE FROM apps"
+    )
+    assert invalid["error"]["code"] == "cursor_upgrade_required"
 
 
-def test_mcp_candidate_cursor_remains_the_existing_opaque_offset_contract(
+def test_mcp_candidate_cursor_uses_versioned_keyset_contract(
     tmp_path: Path,
 ) -> None:
     _, _, tools = _mcp_state(tmp_path)
 
     first = tools.list_contribution_candidates(app_id="sample_store", limit=5)
-    assert first["next_cursor"] == "offset:5"
+    assert first["next_cursor"].startswith("wtc1:")
     second = tools.list_contribution_candidates(
         app_id="sample_store", limit=5, cursor=first["next_cursor"]
     )
@@ -281,13 +282,12 @@ def test_oversized_phase4_packet_compacts_content_but_keeps_question_contract() 
             }
         )
 
-    bounded = WorkTraceTools._bounded_response(
+    bounded = shape_packet(
         {
             "schema_version": 2,
             "sections": sections,
             "limitations": [],
         },
-        preserve_phase4_questions=True,
     )
     bounded_questions = [
         question for section in bounded["sections"].values() for question in section

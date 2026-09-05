@@ -167,6 +167,30 @@ maintenance; those operations remain explicit CLI commands.
 
 ## MCP
 
+Schema 6 fences the revision-aware read protocol: old schema-5 binaries refuse the upgraded
+ledger. Stop all CLI writers and MCP/TUI readers, preserve the coherent database and matching
+HMAC key, upgrade through the CLI, then restart MCP and discard old cursors. No identity key or
+human decision is replaced. Restoring/replacing a database also requires stopped writers/readers
+and an MCP restart; never silently roll back decisions made since a backup.
+
+Every MCP call uses a short SQLite read snapshot and returns `view_token`. Pass it as
+`expected_view_token` on related reads. `evidence_changed` means restart the investigation before
+combining results. Configuration changes, visible ledger writes and server restarts invalidate
+the view. Tokens are consistency markers, not authentication or evidence-readiness approval.
+
+Candidate/search cursors now start with `wtc1:` and bind the app, collection, filters, view and
+continuation position. Legacy `offset:` cursors return `cursor_upgrade_required`. Follow a
+non-null continuation even after a short or empty page. Each call returns at most 20 records and
+processes at most 200 raw matching rows; authority/decision context and SQLite search costs can
+still grow with history. Unrelated evidence bodies are not hydrated for candidate-page summaries.
+
+Small `build_phase4_packet` responses retain full Phase 4 v2 detail. Oversized packets compact
+without dropping any of the 30 question IDs/statuses or support/contradiction presence. Request
+detail with either `section` (the canonical section name) or `question_id`, then follow
+`detail_cursor`, always carrying `expected_view_token`. Detail entries include stable citation
+IDs and ordered answer/limitation chunks. An explicit size error never advances continuation.
+The TUI keeps its existing navigation and cursor contract; no seventh tool is introduced.
+
 `worktrace serve-mcp` exposes exactly six bounded, read-only tools over stdio. See
 [`docs/codex-mcp.example.toml`](docs/codex-mcp.example.toml). The server accepts configured app and
 stable evidence/candidate IDs, never filesystem paths or SQL.
