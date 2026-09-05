@@ -66,8 +66,13 @@ Resolve that policy before a source run. New actors may use it; ordinary page wr
 reclassify existing actors. Conflicting classification or changed policy requires reconciliation.
 Legacy unreconciled self flags cannot support personal implementation claims in any read surface.
 
-CLI `repair-identities APP_ID` defaults to dry run. Validate the existing key and policy continuity;
-never mint a key for a populated ledger. Report promotions, demotions, unresolved identities,
+CLI `repair-identities APP_ID` defaults to dry run. Validate key continuity against a ledger-bound
+verifier, not presence alone; an environment override is subject to the same check. Legacy ledgers
+have no verifier, so enrollment requires independently established stored identity/alias evidence
+or a trusted matching recovery pair. Zero alias matches cannot establish continuity. If continuity
+is unknown, block apply and imports pending an explicitly reviewed recovery/enrollment step; never
+mint a key for a populated ledger. Test missing and wrong-but-present keys. Report promotions,
+demotions, unresolved identities,
 affected apps and confirmed contributions using stable IDs, not raw emails. Apply recomputes the
 proposal inside its write transaction and rejects changed scope/policy. Normal CLI source-instance
 IDs include app ID, but actor uniqueness does not: inspect actual participation-to-app reachability
@@ -215,6 +220,11 @@ unsupported schemas; older schemas direct to CLI migration. Old binaries must no
 schemas. Recover using the coherent pair; never delete decisions to hide an incompatibility.
 Identity policy, audit/re-review and run selection metadata introduced during A-C must be readable
 in each intermediate release; fresh and populated-legacy fixtures cover migration/retry/recovery.
+The CLI is the sole writer; MCP/TUI are local consumers. Stop concurrent CLI writers and MCP/TUI
+for schema/repair cutover and recovery. Use bounded lock waits and abort on contention or failed
+backup before mutation. No zero-downtime migration is promised. Before cutover the old coherent
+database/key pair remains recoverable; after new decisions, prefer forward repair because restoring
+that older pair would discard intervening history. Never perform that restore implicitly.
 
 F exercises temporary real Git, synthetic Jira HTTP and actual CLI orchestration/canonical services;
 human approval simulation occurs only after discovery assertions. The separate installed wheel runs
