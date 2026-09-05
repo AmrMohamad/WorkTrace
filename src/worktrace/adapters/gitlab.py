@@ -168,7 +168,18 @@ class GitLabAdapter:
                     cursor_prefix=environment,
                 )
 
+    def resolved_self_ids(self, configured_email_hashes: set[str]) -> set[str]:
+        """Resolve the run identity before persistence using the authenticated user."""
+        self._verify_identity()
+        assert self._verified_user_id is not None
+        identities = {self._verified_user_id, *configured_email_hashes}
+        if self._verified_email:
+            identities.add(self._redactor.hash_email(self._verified_email))
+        return identities
+
     def _verify_identity(self) -> None:
+        if self._verified_user_id is not None:
+            return
         response = request_with_retry(
             self._client,
             "GET",
@@ -185,6 +196,8 @@ class GitLabAdapter:
         username = _text(document.get("username"))
         if user_id is None or username is None:
             raise PermanentSourceError("GitLab identity omitted stable fields")
+        if not user_id.isascii() or not user_id.isdecimal() or int(user_id) < 1:
+            raise PermanentSourceError("GitLab identity returned an invalid numeric user ID")
         if self._config.user_id is not None and user_id != str(self._config.user_id):
             raise ScopeViolation("GitLab authenticated user does not match configured user_id")
         if (

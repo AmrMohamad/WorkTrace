@@ -72,8 +72,8 @@ def test_populated_v2_upgrade_preserves_ids_and_seeds_baseline(tmp_path: Path) -
         )
         connection.commit()
 
-        assert migrate(connection, database_path) == [3]
-        assert user_version(connection) == 3
+        assert migrate(connection, database_path) == [3, 4]
+        assert user_version(connection) == 4
         assert connection.execute("SELECT id FROM source_objects").fetchone()[0] == "obj:stable"
         assert connection.execute("SELECT id FROM observations").fetchone()[0] == "obs:stable"
         assert (

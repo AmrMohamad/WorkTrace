@@ -34,10 +34,18 @@ from worktrace.db.authority import (
 from worktrace.db.connection import connect
 from worktrace.db.migrations import backup_database, migrate
 from worktrace.db.queries import search_evidence, source_status
+from worktrace.db.readiness import DatabaseReadinessStatus, database_readiness
 from worktrace.db.repository import EvidenceRepository, stable_id
 from worktrace.doctor import run_doctor
 from worktrace.domain.models import JsonValue
 from worktrace.errors import ConfigurationError, WorkTraceError
+from worktrace.identity import (
+    finish_identity_rebuild,
+    identity_policy_status,
+    initialize_identity,
+    prepare_identity_import,
+    repair_identities,
+)
 from worktrace.importers.orchestrator import ImportResult, import_snapshot
 from worktrace.linking.builder import rebuild_references
 from worktrace.linking.extractors import extract_jira_keys
@@ -247,9 +255,17 @@ def _open(
     config_path: Path | None = None,
 ) -> tuple[WorkTraceConfig, sqlite3.Connection, EvidenceRepository]:
     config = load_config(config_path)
+    if not config.database_path.is_file():
+        raise WorkTraceError("database is missing; run worktrace init")
     connection = connect(config.database_path)
-    redactor = Redactor(email_hmac_key(config.data_directory, create=False))
-    return config, connection, EvidenceRepository(connection, redactor)
+    try:
+        if database_readiness(connection).status is not DatabaseReadinessStatus.READY:
+            raise WorkTraceError("unsupported database schema; run the matching worktrace init")
+        redactor = Redactor(email_hmac_key(config.data_directory, create=False))
+        return config, connection, EvidenceRepository(connection, redactor)
+    except BaseException:
+        connection.close()
+        raise
 
 
 @app.callback()
@@ -319,16 +335,48 @@ def initialize(config: ConfigOption = None) -> None:
     """Create or upgrade the private local ledger idempotently."""
     configuration = load_config(config)
     ensure_private_directory(configuration.data_directory)
-    email_hmac_key(configuration.data_directory, create=True)
+    existing = (
+        configuration.database_path.exists() and configuration.database_path.stat().st_size > 0
+    )
+    key = email_hmac_key(configuration.data_directory, create=not existing)
     connection = connect(configuration.database_path)
     try:
+        binding_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='identity_key_binding'"
+        ).fetchone()
+        if binding_table and connection.execute("SELECT 1 FROM identity_key_binding").fetchone():
+            with connection:
+                initialize_identity(connection, configuration, key)
         applied = migrate(connection, configuration.database_path)
         repository = EvidenceRepository(connection)
         repository.ensure_apps(configuration)
+        populated = any(
+            connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+            for table in (
+                "actors",
+                "source_objects",
+                "observations",
+                "human_decisions",
+                "sync_runs",
+            )
+        )
+        if not populated:
+            with connection:
+                initialize_identity(connection, configuration, key)
+        identity = {
+            item.id: identity_policy_status(connection, configuration, item.id)
+            for item in configuration.apps
+        }
     finally:
         connection.close()
     configuration.database_path.chmod(0o600)
-    _emit({"database": str(configuration.database_path), "migrations_applied": applied})
+    _emit(
+        {
+            "database": str(configuration.database_path),
+            "migrations_applied": applied,
+            "identity": identity,
+        }
+    )
 
 
 @app.command()
@@ -368,6 +416,113 @@ def _git_self_ids(configuration: WorkTraceConfig, key: bytes) -> set[str]:
     return {redactor.hash_email(email) for email in configuration.identity.git_author_emails}
 
 
+def _verified_repair_identities(
+    configuration: WorkTraceConfig, app_id: str, key: bytes
+) -> tuple[dict[str, str], frozenset[str]]:
+    """Run only for the explicit --verify-providers repair option."""
+    selected = configuration.app(app_id)
+    verified: dict[str, str] = {}
+    verified_emails: frozenset[str] = frozenset()
+    if selected.jira_project_keys:
+        credentials = jira_credentials()
+        if credentials is None or configuration.identity.jira_account_id is None:
+            raise WorkTraceError("Jira credentials and account ID are required for verification")
+        with httpx.Client(
+            base_url=credentials.base_url,
+            auth=(credentials.email, credentials.token),
+            timeout=30,
+        ) as client:
+            adapter = JiraAdapter(
+                JiraConfig(
+                    base_url=credentials.base_url,
+                    source_instance=_source_instance(app_id, "jira", credentials.base_url),
+                    app_id=app_id,
+                    project_keys=selected.jira_project_keys,
+                    account_id=configuration.identity.jira_account_id,
+                    date_from=configuration.employment_from,
+                    date_to=configuration.employment_to,
+                    email_key=key,
+                ),
+                client,
+            )
+            verified["jira"] = adapter.resolved_self_id()
+    if selected.gitlab_project_ids:
+        credentials_gitlab = gitlab_credentials()
+        if credentials_gitlab is None:
+            raise WorkTraceError("GitLab credentials are required for verification")
+        with httpx.Client(
+            base_url=credentials_gitlab.base_url,
+            headers={"PRIVATE-TOKEN": credentials_gitlab.token, "Accept": "application/json"},
+            timeout=30,
+        ) as client:
+            gitlab_adapter = GitLabAdapter(
+                GitLabConfig(
+                    base_url=credentials_gitlab.base_url,
+                    source_instance=_source_instance(
+                        app_id, "gitlab", selected.gitlab_project_ids[0]
+                    ),
+                    app_id=app_id,
+                    project_id=selected.gitlab_project_ids[0],
+                    user_id=configuration.identity.gitlab_user_id,
+                    username=configuration.identity.gitlab_username,
+                    date_from=configuration.employment_from,
+                    date_to=configuration.employment_to,
+                    email_key=key,
+                ),
+                client,
+            )
+            ids = gitlab_adapter.resolved_self_ids(_git_self_ids(configuration, key))
+            verified["gitlab"] = next(value for value in ids if value.isdecimal())
+            verified_emails = frozenset(
+                value for value in ids if value.startswith("email_hmac_sha256:")
+            )
+    return verified, verified_emails
+
+
+@app.command("repair-identities")
+def repair_identity_command(
+    app_id: str,
+    apply: Annotated[bool, typer.Option("--apply")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    proof_actor_id: Annotated[str | None, typer.Option("--proof-actor-id")] = None,
+    proof_alias_index: Annotated[int | None, typer.Option("--proof-alias-index", min=0)] = None,
+    expected_proposal: Annotated[str | None, typer.Option("--expected-proposal")] = None,
+    verify_providers: Annotated[
+        bool,
+        typer.Option("--verify-providers", help="Explicitly verify provider identities online."),
+    ] = False,
+    config: ConfigOption = None,
+) -> None:
+    """Preview identity reconciliation; apply only explicitly approved changes."""
+    if apply and dry_run:
+        raise WorkTraceError("choose --apply or --dry-run, not both")
+    configuration, connection, _ = _open(config)
+    try:
+        configuration.app(app_id)
+        key = email_hmac_key(configuration.data_directory, create=False)
+        verified, verified_emails = (
+            _verified_repair_identities(configuration, app_id, key)
+            if verify_providers
+            else ({}, frozenset())
+        )
+        with connection:
+            result = repair_identities(
+                connection,
+                configuration,
+                key,
+                app_id,
+                apply=apply,
+                proof_actor_id=proof_actor_id,
+                proof_alias_index=proof_alias_index,
+                expected_proposal=expected_proposal,
+                verified_self_ids=verified,
+                verified_gitlab_email_hashes=verified_emails,
+            )
+        _emit(result)
+    finally:
+        connection.close()
+
+
 @dataclass(frozen=True, slots=True)
 class _CommitSeedSelection:
     values: tuple[str, ...]
@@ -400,7 +555,8 @@ def _relevant_git_commit_shas(
             JOIN actors a ON a.id=p.actor_id
             JOIN source_objects so ON so.id=p.source_object_id
             WHERE so.app_id=? AND so.source='git' AND so.kind='git_commit'
-              AND a.is_self=1 AND p.role IN ('git_author', 'git_coauthor')
+              AND a.is_self=1 AND a.identity_policy_version=1
+              AND p.role IN ('git_author', 'git_coauthor')
               AND p.observation_id IN ({placeholders})
             """,
             [app_id, *current_observation_ids],
@@ -513,6 +669,8 @@ def import_git(
         scoped_repo = configured_app.assert_repo_scope(repo)
         source_instance = _source_instance(app_id, "git", scoped_repo)
         key = email_hmac_key(configuration.data_directory, create=False)
+        with connection:
+            prepare_identity_import(connection, configuration, key, app_id)
         adapter = LocalGitAdapter(
             LocalGitConfig(
                 repository_path=scoped_repo,
@@ -534,9 +692,6 @@ def import_git(
             date_from=start,
             date_to=end,
             self_actor_ids=_git_self_ids(configuration, key),
-            self_display_names={
-                name.casefold() for name in configuration.identity.git_author_names
-            },
             scope_details={"selection_reasons": ["configured repository read-only snapshot"]},
         )
         _emit(
@@ -568,6 +723,8 @@ def import_jira(
             raise WorkTraceError("Jira credentials are not configured")
         key = email_hmac_key(configuration.data_directory, create=False)
         source_instance = _source_instance(app_id, "jira", credentials.base_url)
+        with connection:
+            prepare_identity_import(connection, configuration, key, app_id)
         discovered_keys = _discovered_jira_keys(repository, configured_app)
         with httpx.Client(
             base_url=credentials.base_url,
@@ -654,6 +811,8 @@ def import_gitlab(
             raise WorkTraceError("GitLab identity is required for user-scoped discovery")
         key = email_hmac_key(configuration.data_directory, create=False)
         commit_seeds = _relevant_git_commit_shas(repository, app_id)
+        with connection:
+            prepare_identity_import(connection, configuration, key, app_id)
         with httpx.Client(
             base_url=credentials.base_url,
             headers={"PRIVATE-TOKEN": credentials.token, "Accept": "application/json"},
@@ -677,11 +836,7 @@ def import_gitlab(
                 ),
                 client,
             )
-            own_ids = set()
-            if configuration.identity.gitlab_user_id is not None:
-                own_ids.add(str(configuration.identity.gitlab_user_id))
-            if configuration.identity.gitlab_username:
-                own_ids.add(configuration.identity.gitlab_username)
+            own_ids = adapter.resolved_self_ids(_git_self_ids(configuration, key))
             result = import_snapshot(
                 configured_app,
                 adapter,
@@ -731,6 +886,13 @@ def import_all(
     start, end = _window(configuration, date_from, date_to)
     configured_app = configuration.app(app_id)
     _assert_no_scope_contraction(repository, app_id, start, end)
+    try:
+        key = email_hmac_key(configuration.data_directory, create=False)
+        with connection:
+            prepare_identity_import(connection, configuration, key, app_id)
+    except BaseException:
+        connection.close()
+        raise
     session_id = repository.create_import_session(configured_app, start, end)
     results: list[dict[str, object]] = []
     try:
@@ -758,9 +920,6 @@ def import_all(
                 date_from=start,
                 date_to=end,
                 self_actor_ids=_git_self_ids(configuration, key),
-                self_display_names={
-                    name.casefold() for name in configuration.identity.git_author_names
-                },
                 import_session_id=session_id,
                 finish_session=False,
                 scope_details={"selection_reasons": ["configured repository read-only snapshot"]},
@@ -828,33 +987,27 @@ def import_all(
                 headers={"PRIVATE-TOKEN": gitlab_auth.token, "Accept": "application/json"},
                 timeout=30,
             ) as client:
-                own_ids = {
-                    str(value)
-                    for value in (
-                        configuration.identity.gitlab_user_id,
-                        configuration.identity.gitlab_username,
-                    )
-                    if value is not None
-                }
+                gitlab_adapter = GitLabAdapter(
+                    GitLabConfig(
+                        base_url=gitlab_auth.base_url,
+                        source_instance=source_instance,
+                        app_id=app_id,
+                        project_id=project_id,
+                        email_key=key,
+                        date_from=start,
+                        date_to=end,
+                        jira_project_keys=configured_app.jira_project_keys,
+                        user_id=configuration.identity.gitlab_user_id,
+                        username=configuration.identity.gitlab_username,
+                        production_environments=configured_app.production_environments,
+                        relevant_commit_shas=commit_seeds.values,
+                    ),
+                    client,
+                )
+                own_ids = gitlab_adapter.resolved_self_ids(_git_self_ids(configuration, key))
                 result = import_snapshot(
                     configured_app,
-                    GitLabAdapter(
-                        GitLabConfig(
-                            base_url=gitlab_auth.base_url,
-                            source_instance=source_instance,
-                            app_id=app_id,
-                            project_id=project_id,
-                            email_key=key,
-                            date_from=start,
-                            date_to=end,
-                            jira_project_keys=configured_app.jira_project_keys,
-                            user_id=configuration.identity.gitlab_user_id,
-                            username=configuration.identity.gitlab_username,
-                            production_environments=configured_app.production_environments,
-                            relevant_commit_shas=commit_seeds.values,
-                        ),
-                        client,
-                    ),
+                    gitlab_adapter,
                     repository,
                     source="gitlab",
                     source_instance=source_instance,
@@ -982,6 +1135,8 @@ def import_all(
 
         reference_count = rebuild_references(configured_app, repository)
         candidate_count = rebuild_candidates(app_id, repository)
+        with connection:
+            finish_identity_rebuild(connection, configuration, app_id)
         complete = all(result.get("status") == "complete" for result in results)
         overall = "complete" if complete else "partial"
         repository.finish_import_session(
@@ -1026,7 +1181,13 @@ def status(app_id: str, config: ConfigOption = None) -> None:
     configuration, connection, _ = _open(config)
     try:
         configuration.app(app_id)
-        _emit({"app_id": app_id, "sources": source_status(connection, app_id)})
+        _emit(
+            {
+                "app_id": app_id,
+                "sources": source_status(connection, app_id),
+                "identity": identity_policy_status(connection, configuration, app_id),
+            }
+        )
     finally:
         connection.close()
 
@@ -1245,11 +1406,16 @@ def _rebuild(
     configuration, connection, repository = _open(config_path)
     try:
         configured_app = configuration.app(app_id)
+        if not identity_policy_status(connection, configuration, app_id)["valid"]:
+            raise WorkTraceError("identity policy requires repair before rebuilding")
         result: dict[str, int] = {}
         if refs:
             result["references"] = rebuild_references(configured_app, repository)
         if candidates:
             result["candidates"] = rebuild_candidates(app_id, repository)
+        if refs and candidates:
+            with connection:
+                finish_identity_rebuild(connection, configuration, app_id)
         return result
     finally:
         connection.close()
@@ -1275,7 +1441,17 @@ def export_command(app_id: str, destination: Path, config: ConfigOption = None) 
     configuration, connection, _ = _open(config)
     try:
         configuration.app(app_id)
-        _emit({"objects": export_app(connection, app_id, destination), "path": str(destination)})
+        _emit(
+            {
+                "objects": export_app(
+                    connection,
+                    app_id,
+                    destination,
+                    identity_state=identity_policy_status(connection, configuration, app_id),
+                ),
+                "path": str(destination),
+            }
+        )
     finally:
         connection.close()
 

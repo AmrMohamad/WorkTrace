@@ -21,6 +21,7 @@ from worktrace.config import AppConfig, IdentityConfig, WorkTraceConfig
 from worktrace.db.connection import connect, connect_read_only
 from worktrace.db.migrations import migrate
 from worktrace.errors import ScopeViolation
+from worktrace.identity import identity_fingerprint
 from worktrace.packets.builder import PacketBuilder, _build_authority_evidence_context
 from worktrace.read_models.candidates import (
     _ACTIVE_GENERATION_SQL,
@@ -99,6 +100,10 @@ def _initialize(database_path: Path) -> sqlite3.Connection:
     connection.execute(
         "INSERT INTO apps(id, name, market, business_type) VALUES (?, ?, ?, ?)",
         (_APP_ID, "Sample Store", "XX", "fixture"),
+    )
+    connection.execute(
+        "INSERT INTO app_identity_policy(app_id, version, fingerprint) VALUES (?, 1, ?)",
+        (_APP_ID, identity_fingerprint(_config(database_path.parent))),
     )
     return connection
 
@@ -304,8 +309,9 @@ def _build_scale_database(database_path: Path, *, candidate_count: int = 3_000) 
         connection.executemany(
             """
             INSERT INTO actors(
-                id, source, source_instance, external_actor_id, display_name, is_self
-            ) VALUES (?, ?, ?, ?, ?, 1)
+                id, source, source_instance, external_actor_id, display_name, is_self,
+                identity_policy_version
+            ) VALUES (?, ?, ?, ?, ?, 1, 1)
             """,
             actor_rows,
         )

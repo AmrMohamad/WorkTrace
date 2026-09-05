@@ -64,7 +64,7 @@ def test_cli_help_init_status_search_export_and_confirmed_purge(
 
     first_init = runner.invoke(app, ["init", "--config", str(config)])
     assert first_init.exit_code == 0, first_init.stdout
-    assert json.loads(first_init.stdout)["migrations_applied"] == [1, 2, 3]
+    assert json.loads(first_init.stdout)["migrations_applied"] == [1, 2, 3, 4]
 
     second_init = runner.invoke(app, ["init", "--config", str(config)])
     assert second_init.exit_code == 0, second_init.stdout
@@ -77,7 +77,10 @@ def test_cli_help_init_status_search_export_and_confirmed_purge(
 
     status = runner.invoke(app, ["status", "sample_store", "--config", str(config)])
     assert status.exit_code == 0, status.stdout
-    assert json.loads(status.stdout) == {"app_id": "sample_store", "sources": []}
+    status_body = json.loads(status.stdout)
+    assert status_body["app_id"] == "sample_store"
+    assert status_body["sources"] == []
+    assert status_body["identity"]["valid"] is True
 
     search = runner.invoke(
         app,

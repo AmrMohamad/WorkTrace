@@ -332,15 +332,17 @@ def test_mr_author_with_complete_paths_and_other_authored_commit_is_not_implemen
         connection.execute(
             """
             INSERT INTO actors(
-                id, source, source_instance, external_actor_id, display_name, is_self
-            ) VALUES ('actor:gitlab:self', 'gitlab', '101', '7', 'Fixture Engineer', 1)
+                id, source, source_instance, external_actor_id, display_name, is_self,
+                identity_policy_version
+            ) VALUES ('actor:gitlab:self', 'gitlab', '101', '7', 'Fixture Engineer', 1, 1)
             """
         )
         connection.execute(
             """
             INSERT INTO actors(
-                id, source, source_instance, external_actor_id, display_name, is_self
-            ) VALUES ('actor:gitlab:other', 'gitlab', '101', '8', 'Collaborator', 0)
+                id, source, source_instance, external_actor_id, display_name, is_self,
+                identity_policy_version
+            ) VALUES ('actor:gitlab:other', 'gitlab', '101', '8', 'Collaborator', 0, 1)
             """
         )
         connection.execute(

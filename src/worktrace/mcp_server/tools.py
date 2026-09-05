@@ -8,6 +8,8 @@ from pathlib import Path
 from worktrace.config import WorkTraceConfig, load_config
 from worktrace.constants import DEFAULT_EXCERPT_CHARS
 from worktrace.db.connection import connect_read_only
+from worktrace.db.readiness import DatabaseReadinessStatus, database_readiness
+from worktrace.errors import DatabaseError
 from worktrace.mcp_server.limits import enforce_total_limit
 from worktrace.mcp_server.schemas import app_id as validate_app_id
 from worktrace.mcp_server.schemas import (
@@ -51,6 +53,8 @@ class WorkTraceTools:
         path = (self._database_path or config.database_path).expanduser().resolve()
         connection = connect_read_only(path)
         try:
+            if database_readiness(connection).status is not DatabaseReadinessStatus.READY:
+                raise DatabaseError("unsupported database schema; use the matching CLI to upgrade")
             yield PacketBuilder(connection, config)
         finally:
             connection.close()

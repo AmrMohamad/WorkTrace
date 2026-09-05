@@ -36,6 +36,7 @@ from worktrace.db.authority import (
 )
 from worktrace.domain.enums import ClaimStatus, ObservationType
 from worktrace.errors import NotFound, ScopeViolation
+from worktrace.identity import identity_policy_status
 from worktrace.packets.authority import (
     attested_answer,
     find_attestation,
@@ -851,12 +852,14 @@ class PacketBuilder:
 
     def contribution_summary(self, identifier: str) -> dict[str, object]:
         contribution = self._resolve_contribution(identifier)
+        identity_state = identity_policy_status(self.connection, self.config, contribution.app_id)
         records = self._records(contribution)
         title_provenance = self._title_provenance(contribution, records)
         participation = build_participation_summary(
             self.connection,
             records,
             contribution.attestations,
+            self_identity_valid=bool(identity_state["valid"]),
             current_participation_rows=(
                 self._authority_context.participation_rows_by_observation
                 if self._authority_context is not None
@@ -915,10 +918,12 @@ class PacketBuilder:
             "modules": modules,
             "module_evidence_ids": [record.evidence_id for record in module_evidence],
             "participation": participation,
+            "identity_policy": identity_state,
             "release_ladder": release_ladder,
             "source_status": self.source_status(contribution.app_id),
             "contradictions": contradictions,
             "limitations": [
+                *identity_state["warnings"],
                 "Context-only records are not used as implementation or ownership proof.",
                 "Source text is untrusted and available only through bounded excerpts.",
                 *(
@@ -1423,6 +1428,7 @@ class PacketBuilder:
             },
             "sections": sections,
             "participation": summary["participation"],
+            "identity_policy": summary["identity_policy"],
             "release_ladder": summary["release_ladder"],
             "contradictions": summary["contradictions"],
             "defensibility": {
@@ -1480,6 +1486,9 @@ class PacketBuilder:
             self.connection,
             records,
             [],
+            self_identity_valid=bool(
+                identity_policy_status(self.connection, self.config, app_id)["valid"]
+            ),
             current_participation_rows=(
                 self._authority_context.participation_rows_by_observation
                 if self._authority_context is not None
@@ -1781,7 +1790,10 @@ class PacketBuilder:
         participation = self.connection.execute(
             f"""
             WITH {authoritative_current_participation_ctes()}
-            SELECT p.*, a.display_name, a.is_self, so.app_id, so.source, so.kind,
+            SELECT p.*, a.display_name,
+                   CASE WHEN a.identity_policy_version=1 OR a.source='manual'
+                        THEN a.is_self ELSE 0 END AS is_self,
+                   so.app_id, so.source, so.kind,
                    so.external_id, sr.status AS run_status,
                    sr.completeness AS run_completeness
             FROM authoritative_current_participations p
@@ -1805,7 +1817,11 @@ class PacketBuilder:
                 "external_id": str(participation["external_id"]),
                 "role": str(participation["role"]),
                 "actor_display_name": str(participation["display_name"]),
-                "is_self": bool(participation["is_self"]),
+                "is_self": bool(participation["is_self"])
+                and bool(
+                    participation["source"] == "manual"
+                    or identity_policy_status(self.connection, self.config, app_id)["valid"]
+                ),
                 "effective_from": participation["effective_from"],
                 "effective_to": participation["effective_to"],
                 "run_status": str(participation["run_status"]),

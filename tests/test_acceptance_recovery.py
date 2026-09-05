@@ -571,6 +571,9 @@ def test_import_all_uses_git_then_gitlab_then_jira_discovery(
             self.source = source
             self.source_instance = str(cast(AdapterConfigView, adapter_config).source_instance)
 
+        def resolved_self_ids(self, configured_email_hashes: set[str]) -> set[str]:
+            return {"7", *configured_email_hashes}
+
         def iter_pages(self) -> Iterator[NormalizedPage]:
             yield NormalizedPage(
                 source_kind=self.source,
