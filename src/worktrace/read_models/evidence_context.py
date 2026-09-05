@@ -448,9 +448,7 @@ def _endpoint(row: sqlite3.Row, prefix: str, object_id: str) -> dict[str, object
     }
 
 
-def _reference_is_allowed(
-    app: AppConfig, connection: sqlite3.Connection, row: sqlite3.Row
-) -> bool:
+def _reference_is_allowed(app: AppConfig, connection: sqlite3.Connection, row: sqlite3.Row) -> bool:
     if not _object_in_scope(
         app,
         connection=connection,

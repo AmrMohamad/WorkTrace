@@ -223,11 +223,14 @@ def test_public_context_uses_jira_owning_identity_before_parent_metadata(
     assert {"ref:jira-out", "ref:jira-in", "ref:jira-fallback"} <= relation_ids
     # A foreign explicit issue_key and a missing parent binding both fail
     # closed even when source-controlled parent_key says DEMO-1.
-    assert not {
-        "ref:jira-conflict-out",
-        "ref:jira-conflict-in",
-        "ref:jira-missing",
-    } & relation_ids
+    assert (
+        not {
+            "ref:jira-conflict-out",
+            "ref:jira-conflict-in",
+            "ref:jira-missing",
+        }
+        & relation_ids
+    )
 
 
 def test_confirmed_rowless_context_membership_survives_legacy_generated_state(
