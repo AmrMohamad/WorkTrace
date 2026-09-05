@@ -261,3 +261,47 @@ def test_confirmed_noncurrent_record_can_seed_recovery_with_historical_label(sta
     assert result.seeds[0].supporting_observation_ids == (observations["old"],)
     assert "historical_confirmed_observation_not_current" in result.seeds[0].reasons
     assert repository.current_observations("sample") == []
+
+
+@pytest.mark.parametrize("retired", [False, True])
+@pytest.mark.parametrize("kind,field", [("issue", "key"), ("issue_comment", "issue_key")])
+def test_confirmed_jira_structured_key_survives_normal_summary_and_retirement(
+    state, retired, kind, field
+) -> None:
+    repository, config = state
+    item = build_record(
+        source_kind="jira",
+        source_instance="jira",
+        object_type=kind,
+        external_id="10001",
+        app_id="sample",
+        observed_at="2026-02-01T12:00:00Z",
+        source_updated_at="2026-01-10T12:00:00Z",
+        payload={field: "DEMO-7", "summary": "Improve search"},
+        redactor=_REDACTOR,
+    )
+    run = repository.start_sync_run("sample", "jira", "jira", {"selection_policy_version": 2})
+    repository.store_page(run, [record_to_object(item, set())])
+    repository.finish_sync_run(run, "complete", "complete_for_scope")
+    row = repository.current_observations("sample")[0]
+    append_decision(
+        repository.connection,
+        "confirm_candidate",
+        "candidate:jira-history",
+        {
+            "app_id": "sample",
+            "contribution_id": "contribution:jira-history",
+            "members": [str(row["source_object_id"])],
+            "context_members": [],
+        },
+    )
+    if retired:
+        replacement = repository.start_sync_run(
+            "sample", "jira", "jira", {"selection_policy_version": 2}
+        )
+        repository.finish_sync_run(replacement, "complete", "complete_for_scope")
+    selected = select_jira_seeds(repository, config.apps[0], configuration=config)
+    assert selected.keys == ("DEMO-7",)
+    assert selected.seeds[0].supporting_observation_ids == (str(row["id"]),)
+    assert "confirmed_contribution:candidate:jira-history" in selected.seeds[0].reasons
+    assert ("historical_confirmed_observation_not_current" in selected.seeds[0].reasons) is retired

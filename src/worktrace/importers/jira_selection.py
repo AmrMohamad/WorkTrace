@@ -211,6 +211,12 @@ def select_jira_seeds(
         reasons[key].add("explicit_user_key")
     for identifier, row in rows.items():
         keys = set(extract_jira_keys(f"{row['title'] or ''}\n{row['body_text'] or ''}", app))
+        payload = data[identifier]
+        if row["source"] == "jira" and isinstance(payload, dict):
+            field = "key" if row["kind"] == "jira_issue" else "issue_key"
+            key = str(payload.get(field, "")).upper()
+            if re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", key) and app.allows_jira_key(key):
+                keys.add(key)
         for ref in pending_by_object[identifier]:
             key = str(ref.get("target_external_id", "")).upper()
             if (
