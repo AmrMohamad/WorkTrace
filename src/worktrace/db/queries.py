@@ -65,6 +65,11 @@ def source_status(connection: sqlite3.Connection, app_id: str) -> list[dict[str,
         )
         if limitation and limitation not in limitations:
             limitations.append(limitation)
+        if row["source"] == "jira" and scope.get("activity_policy_version") != "1":
+            limitations.append(
+                "Full configured-range Jira reimport required for historical activity "
+                "metadata; existing observations were not backfilled."
+            )
         complete = authoritative and completeness_is_full_scope(str(row["completeness"]))
         result.append(
             {

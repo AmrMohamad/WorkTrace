@@ -203,6 +203,8 @@ def _packet_state(
         external_id="a" * 40,
         title="Checkout validation",
         data={
+            "authored_at": "2026-08-25T23:59:59Z",
+            "committed_at": "2026-08-25T23:59:59Z",
             "changed_paths": [
                 "src/checkout/Validation.py",
                 "src/generated/Bindings.py",
@@ -258,7 +260,7 @@ def _packet_state(
         kind="jira_issue",
         external_id="DEMO-7",
         title="Validate checkout full name",
-        data={"priority": "High"},
+        data={"priority": "High", "created_at": "2026-08-25T23:59:59Z"},
     )
     _insert_object(
         connection,

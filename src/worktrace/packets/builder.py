@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import cast
+from zoneinfo import ZoneInfo
 
 from worktrace.candidates.decisions import (
     CREATION_ACTIONS,
@@ -37,6 +38,7 @@ from worktrace.db.authority import (
 from worktrace.domain.enums import ClaimStatus, ObservationType
 from worktrace.errors import NotFound, ScopeViolation
 from worktrace.identity import identity_policy_status
+from worktrace.packets.activity import ActivityPeriod, activity_period
 from worktrace.packets.authority import (
     attested_answer,
     find_attestation,
@@ -99,10 +101,10 @@ def _parse_timestamp(value: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _calendar_date(value: str | None) -> str | None:
+def _calendar_date(value: str | None, zone: str = "UTC") -> str | None:
     parsed = _parse_timestamp(value)
     if parsed is not None:
-        return parsed.date().isoformat()
+        return parsed.astimezone(ZoneInfo(zone)).date().isoformat()
     return value[:10] if value and len(value) >= 10 else value
 
 
@@ -533,6 +535,11 @@ class PacketBuilder:
                 )
                 if limitation and limitation not in limitations:
                     limitations.append(limitation)
+                if source == "jira" and scope.get("activity_policy_version") != "1":
+                    limitations.append(
+                        "Full configured-range Jira reimport required for historical activity "
+                        "metadata; existing observations were not backfilled."
+                    )
                 raw_selection_events = progress.get("selection_events", [])
                 selection_events = (
                     [value for value in raw_selection_events if isinstance(value, dict)]
@@ -654,15 +661,33 @@ class PacketBuilder:
                 )
         return contradictions
 
-    @staticmethod
-    def _date_range(records: Sequence[EvidenceRecord]) -> tuple[str | None, str | None]:
-        values = sorted(
-            value
-            for record in records
-            for value in (record.source_updated_at or record.fetched_at,)
-            if value
+    def _activity_children(self, issue: EvidenceRecord) -> Iterable[EvidenceRecord]:
+        rows = self.connection.execute(
+            f"""WITH {authoritative_current_observation_ctes()}
+            SELECT so.id FROM authoritative_current_observations o
+            JOIN source_objects so ON so.id=o.source_object_id
+            WHERE so.app_id=? AND so.source_instance=? AND so.source='jira'
+              AND so.kind IN ('jira_issue_comment', 'jira_issue_changelog')
+              AND json_extract(o.data_json, '$.issue_id')=? ORDER BY so.id""",
+            (issue.app_id, issue.source_instance, issue.external_id),
         )
-        return (values[0], values[-1]) if values else (None, None)
+        for row in rows:
+            record = self._record_for_object(str(row[0]), context_only=False)
+            if record is not None:
+                yield record
+
+    def _activity_period(self, records: Sequence[EvidenceRecord]) -> ActivityPeriod:
+        return activity_period(
+            records,
+            zone=self.config.employment_timezone,
+            first=self.config.employment_from,
+            last=self.config.employment_to,
+            children=self._activity_children,
+        )
+
+    def _date_range(self, records: Sequence[EvidenceRecord]) -> tuple[str | None, str | None]:
+        fields = self._activity_period(records).fields()
+        return cast(str | None, fields["date_from"]), cast(str | None, fields["date_to"])
 
     @staticmethod
     def _path_is_ignored(path: str, app: AppConfig) -> bool:
@@ -875,6 +900,7 @@ class PacketBuilder:
         )
         contradictions = self._contradictions(contribution, records)
         date_from, date_to = self._date_range(records)
+        period = self._activity_period(records)
         as_of = max((record.fetched_at for record in records), default=None)
         modules, module_evidence = self._modules(records)
         limited_changed_path_records = [
@@ -890,6 +916,8 @@ class PacketBuilder:
                 "type": contribution.contribution_type,
                 "date_from": date_from,
                 "date_to": date_to,
+                "period_status": period.status,
+                "period_evidence_ids": list(period.evidence_ids),
             },
             "as_of": as_of,
             "members": [
@@ -923,6 +951,12 @@ class PacketBuilder:
             "source_status": self.source_status(contribution.app_id),
             "contradictions": contradictions,
             "limitations": [
+                "Work dates use dated activity, not source freshness or retrieval time.",
+                *(
+                    ["Current comment text was edited; historical wording is unavailable."]
+                    if any(r.data.get("historical_wording_unknown") for r in records)
+                    else []
+                ),
                 *identity_state["warnings"],
                 "Context-only records are not used as implementation or ownership proof.",
                 "Source text is untrusted and available only through bounded excerpts.",
@@ -1033,14 +1067,18 @@ class PacketBuilder:
             answers["identity.app_flow"] = unknown_answer(
                 "identity.app_flow", by_id["identity.app_flow"], "Add scoped contribution evidence."
             )
-        if date_from and date_to and records:
+        period = self._activity_period(records)
+        if date_from and date_to and period.evidence_ids:
             answers["identity.when"] = supported_answer(
                 "identity.when",
                 by_id["identity.when"],
-                f"Observed evidence spans {date_from} through {date_to}.",
+                f"Dated activity spans {date_from} through {date_to}.",
                 records,
                 observation_types=(ObservationType.DERIVED,),
-                limitations=("This is the evidence period, not necessarily the full work period.",),
+                limitations=("Activity bounds do not prove continuous work or ownership.",),
+            )
+            answers["identity.when"] = replace(
+                answers["identity.when"], supporting_evidence_ids=period.evidence_ids
             )
         else:
             answers["identity.when"] = unknown_answer(
@@ -1525,6 +1563,7 @@ class PacketBuilder:
             **self._title_provenance(candidate, records).as_fields(),
             "period_from": period_from,
             "period_to": period_to,
+            "period_status": self._activity_period(records).status,
             "suggested_type": candidate.contribution_type,
             "status": projected.status,
             "source_coverage": coverage,
@@ -1556,8 +1595,14 @@ class PacketBuilder:
                 item = self.candidate_list_item(app_id, str(row["id"]))
             except NotFound:
                 continue
-            period_from_date = _calendar_date(cast(str | None, item["period_from"]))
-            period_to_date = _calendar_date(cast(str | None, item["period_to"]))
+            period_from_date = _calendar_date(
+                cast(str | None, item["period_from"]), self.config.employment_timezone
+            )
+            period_to_date = _calendar_date(
+                cast(str | None, item["period_to"]), self.config.employment_timezone
+            )
+            if (date_from or date_to) and not (period_from_date and period_to_date):
+                continue
             if date_from and period_to_date and period_to_date < date_from:
                 continue
             if date_to and period_from_date and period_from_date > date_to:
@@ -1587,6 +1632,9 @@ class PacketBuilder:
             "as_of": as_of,
             "source_status": self.source_status(app_id),
             "candidates": items,
+            "date_filter_policy": "undated_excluded"
+            if date_from or date_to
+            else "undated_included",
             "next_offset": offset + limit if len(visible_items) > offset + limit else None,
         }
 
@@ -1626,33 +1674,41 @@ class PacketBuilder:
             escaped_module = module.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             clauses.append("lower(latest.data_json) LIKE lower(?) ESCAPE '\\'")
             parameters.append(f"%{escaped_module}%")
-        if date_from:
-            clauses.append("date(COALESCE(latest.source_updated_at, latest.fetched_at)) >= date(?)")
-            parameters.append(date_from)
-        if date_to:
-            clauses.append("date(COALESCE(latest.source_updated_at, latest.fetched_at)) <= date(?)")
-            parameters.append(date_to)
-        parameters.extend((limit + 1, offset))
-        rows = list(
-            self.connection.execute(
-                f"""
+        cursor_rows = self.connection.execute(
+            f"""
                 WITH {authoritative_current_participation_ctes()}
                 SELECT latest.*, so.source, so.source_instance, so.kind, so.external_id
                 FROM authoritative_current_observations latest
                 JOIN source_objects so ON so.id=latest.source_object_id
                 WHERE {" AND ".join(clauses)}
                 ORDER BY COALESCE(latest.source_updated_at, latest.fetched_at) DESC, latest.id
-                LIMIT ? OFFSET ?
                 """,
-                parameters,
-            )
+            parameters,
         )
+        rows: list[sqlite3.Row] = []
+        periods: dict[str, ActivityPeriod] = {}
+        eligible = 0
+        for row in cursor_rows:
+            record = self._record_for_object(str(row["source_object_id"]), context_only=False)
+            if record is None:
+                continue
+            period = self._activity_period([record])
+            if not period.matches(date_from, date_to, self.config.employment_timezone):
+                continue
+            eligible += 1
+            if eligible <= offset:
+                continue
+            rows.append(row)
+            periods[str(row["id"])] = period
+            if len(rows) == limit + 1:
+                break
         results = []
         for row in rows[:limit]:
             text = str(row["body_text"] or row["title"] or "")[:DEFAULT_EXCERPT_CHARS]
             results.append(
                 {
                     "evidence_id": str(row["id"]),
+                    **periods[str(row["id"])].fields(),
                     "object_id": str(row["source_object_id"]),
                     "source": str(row["source"]),
                     "source_instance": str(row["source_instance"]),
@@ -1671,6 +1727,9 @@ class PacketBuilder:
             "as_of": max((str(row["fetched_at"]) for row in rows), default=None),
             "source_status": self.source_status(app_id),
             "results": results,
+            "date_filter_policy": "undated_excluded"
+            if date_from or date_to
+            else "undated_included",
             "next_offset": offset + limit if len(rows) > limit else None,
         }
 

@@ -1,15 +1,44 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import httpx
 import pytest
 
-from worktrace.adapters.base import ParticipationRole
-from worktrace.adapters.jira import JiraAdapter, JiraConfig
+from worktrace.adapters.base import NormalizedPage, ParticipationRole
+from worktrace.adapters.jira import JiraAdapter as SourceJiraAdapter
+from worktrace.adapters.jira import JiraConfig
+from worktrace.db.connection import connect
+from worktrace.db.migrations import migrate
+from worktrace.db.repository import EvidenceRepository
 from worktrace.errors import PermanentSourceError, ScopeViolation
+from worktrace.importers.jira_staging import jira_pages
+
+
+class JiraAdapter(SourceJiraAdapter):
+    """Exercise the actual CLI-owned staging while keeping adapter assertions local."""
+
+    def iter_pages(self) -> Iterator[NormalizedPage]:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.sqlite3"
+            connection = connect(path)
+            try:
+                migrate(connection, path)
+                connection.execute(
+                    "INSERT INTO apps(id,name) VALUES (?,?)", (self._config.app_id, "Test")
+                )
+                connection.commit()
+                repository = EvidenceRepository(connection)
+                run = repository.start_sync_run(
+                    self._config.app_id, "jira", self._config.source_instance, {}
+                )
+                yield from jira_pages(self, repository, run)
+            finally:
+                connection.close()
 
 
 def _issue(
@@ -121,11 +150,11 @@ def test_jira_page_is_scoped_normalized_and_redacted() -> None:
             ).iter_pages()
         )
 
-    record = pages[0].records[0]
+    record = next(p.records[0] for p in pages if p.records)
     assert "MOB" in observed_query
-    assert 'updated >= "2026-01-01"' in observed_query
-    assert 'updated < "2026-02-01"' in observed_query
-    assert len(pages[0].records) == 1
+    assert "updated >=" not in observed_query
+    assert "updated <" not in observed_query
+    assert {r.identity.external_id for p in pages for r in p.records} >= {"10001", "10002"}
     assert record.payload["status"] == "Done"
     assert "user@example.com" not in repr(record)
     assert "attachment" not in record.payload
@@ -207,12 +236,14 @@ def test_jira_imports_paged_comments_and_transition_intervals_redacted() -> None
         )
 
     comment_pages = [page for page in pages if page.resource_type == "issue_comment"]
-    changelog_pages = [page for page in pages if page.resource_type == "issue_changelog"]
+    changelog_pages = [
+        page for page in pages if page.resource_type == "issue_changelog" and page.records
+    ]
     assert [page.cursor for page in comment_pages] == ["MOB-42:0", "MOB-42:1"]
     assert [page.cursor for page in changelog_pages] == [
-        "MOB-42:0",
-        "MOB-42:1",
-        "MOB-42:2",
+        "10001:12001",
+        "10001:12002",
+        "10001:12003",
     ]
     nested_paths = [path for path in requested_paths if path.endswith(("/comment", "/changelog"))]
     assert all("/issue/10001/" in path for path in nested_paths)
@@ -316,11 +347,13 @@ def test_jira_verifies_identity_unions_discovery_and_hydrates_true_subtask_root(
             ).iter_pages()
         )
 
-    assert len(jql_queries) == 2
+    assert len(jql_queries) == 4
     assert "updatedBy" in jql_queries[0]
-    assert "assignee WAS" in jql_queries[0]
-    assert 'key in ("MOB-42")' in jql_queries[1]
-    issue = next(page.records[0] for page in pages if page.resource_type == "issue")
+    assert "assignee WAS" in jql_queries[1]
+    assert 'key in ("MOB-42")' in jql_queries[3]
+    issue = next(
+        page.records[0] for page in pages if page.resource_type == "issue" and page.records
+    )
     assert issue.payload["fix_versions"][0]["name"] == "Mobile 1.2"
     assert issue.payload["fix_versions"][0]["archived"] is False
     assert {(ref.reference_type, ref.target_external_id) for ref in issue.references} >= {

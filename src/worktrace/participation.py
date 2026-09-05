@@ -44,6 +44,7 @@ _CANONICAL_BY_SOURCE_KIND_ROLE: dict[tuple[str, str, str], str] = {
     ("jira", "jira_issue", "reporter"): "jira_reporter",
     ("jira", "jira_issue", "creator"): "jira_creator",
     ("jira", "jira_issue_comment", "author"): "jira_comment_author",
+    ("jira", "jira_issue_comment", "editor"): "jira_comment_editor",
     ("jira", "jira_issue_changelog", "author"): "jira_changelog_author",
     ("jira", "jira_issue_changelog", "assignee"): "jira_assignee",
 }
@@ -69,6 +70,7 @@ _KNOWN_CANONICAL = {
     "jira_reporter",
     "jira_creator",
     "jira_comment_author",
+    "jira_comment_editor",
     "jira_changelog_author",
 }
 

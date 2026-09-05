@@ -13,10 +13,11 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.adapters.test_jira import JiraAdapter
 from worktrace.adapters.base import NormalizedPage
 from worktrace.adapters.git_local import LocalGitAdapter, LocalGitConfig
 from worktrace.adapters.gitlab import GitLabAdapter, GitLabConfig
-from worktrace.adapters.jira import JiraAdapter, JiraConfig
+from worktrace.adapters.jira import JiraConfig
 from worktrace.candidates.builder import rebuild_candidates
 from worktrace.candidates.decisions import append_decision
 from worktrace.candidates.projector import project_candidate

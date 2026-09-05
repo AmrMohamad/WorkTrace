@@ -89,6 +89,39 @@ to verify configured accounts using their existing credentials. This reads ident
 does not import evidence, and never falls back to display names. Unverified provider flags remain
 pending. Corrected full-range source imports are still needed for the later discovery fixes.
 
+## Historical Jira activity
+
+Jira discovery independently searches historical updates, assignment, creation, and exact
+configured-project keys. Later issue edits do not erase earlier work. Selection reasons explain
+why an issue was collected; they do not prove authorship or a precise work date. Day-level Jira
+queries use conservative expanded bounds, with the verified Jira calendar recorded separately
+from the optional `[employment].timezone` work calendar (default `UTC`).
+
+Comments retain creation and visible last-edit actors/times separately. A historically created
+comment edited later contains **current wording**, not a recovered historical text version.
+Assignment intervals require matching stable account IDs on both transitions; missing or
+ambiguous endpoints remain unknown. Predecessor/successor records are contextual evidence.
+Candidate periods, evidence date filters, and `identity.when` use activity dates, never fetch
+or issue freshness dates. Undated evidence is included without date filters and excluded when
+filtering; `period_status` distinguishes known, partially known, and unknown periods.
+
+Schema 5 adds CLI-owned, run-scoped staging of redacted Jira records. Discovery deduplicates by
+stable issue ID, unions reasons, and retains the first observed version if Jira changes between
+queries. Interrupted staging is nonauthoritative and never reused by a new run; successful
+finalization removes its temporary rows. Existing observations and human decisions are preserved.
+
+After the coherent backup/forward migration described above, existing Jira ledgers need an
+explicit **full configured-range reimport** to gain this metadata; there is no synthetic backfill.
+Do not shrink the configured interval to work around an import failure. After authorization:
+
+```console
+uv run worktrace import all APP_ID
+uv run worktrace status APP_ID
+```
+
+`import all` rebuilds references and candidates; separate source imports require an explicit
+`worktrace rebuild all APP_ID`. The six-tool MCP contract and cursor encoding are unchanged.
+
 ## Human review UI
 
 Launch the keyboard-first, read-only evidence workstation in an interactive terminal:

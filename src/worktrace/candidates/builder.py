@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections import deque
 from datetime import UTC, datetime
@@ -16,7 +17,7 @@ from worktrace.participation import (
     supports_category,
 )
 
-GENERATOR_VERSION = "3"
+GENERATOR_VERSION = "4"
 MAX_DEPTH = 3
 MAX_MEMBERS = 200
 MAX_CONTEXT = 50
@@ -85,6 +86,7 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
     connection = repository.connection
     current = repository.current_observations(app_id)
     objects = {str(row["source_object_id"]): row for row in current}
+    data = {identifier: json.loads(str(row["data_json"])) for identifier, row in objects.items()}
     references = list(
         connection.execute(
             f"""
@@ -106,7 +108,18 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
         kind = str(row["kind"])
         self_roles = roles.get(object_id, set())
         qualifies = (
-            (kind == "jira_issue" and (self_roles or object_id in linked_ids))
+            (
+                kind == "jira_issue"
+                and (
+                    self_roles
+                    or object_id in linked_ids
+                    or (
+                        data[object_id].get("activity_policy_version") == 1
+                        and set(data[object_id].get("selected_by", []))
+                        & {"historical_updater", "historical_assignee", "creator_created"}
+                    )
+                )
+            )
             or (
                 kind == "gitlab_mr"
                 and (
@@ -177,6 +190,12 @@ def rebuild_candidates(app_id: str, repository: EvidenceRepository) -> int:
                     if relationship == "jira_subtask_of" and not outbound:
                         continue
                     if relationship in STRUCTURAL:
+                        if data[target].get("boundary_context") is True:
+                            context.add(target)
+                            if len(context) > MAX_CONTEXT:
+                                overflow = True
+                                break
+                            continue
                         if target not in members:
                             members.add(target)
                             queue.append((target, depth + 1))
