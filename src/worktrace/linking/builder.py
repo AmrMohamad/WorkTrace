@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from worktrace.config import AppConfig
 from worktrace.db.read_state import mark_read_states_changed
 from worktrace.db.repository import EvidenceRepository, stable_id
-from worktrace.linking.extractors import extract_commit_shas, extract_jira_keys, extract_mr_iids
+from worktrace.linking.extractors import (
+    extract_commit_shas,
+    extract_full_commit_shas,
+    extract_jira_keys,
+    extract_mr_iids,
+)
+from worktrace.linking.mappings import mapped_commit_sha_allowed
 
 
 @dataclass(frozen=True)
@@ -78,18 +84,22 @@ def _insert(
 def rebuild_references(app: AppConfig, repository: EvidenceRepository) -> int:
     connection = repository.connection
     objects = _objects(repository, app.id)
-    by_source_kind_external: dict[tuple[str, str, str], CurrentObject] = {
-        (item.source, item.kind, item.external_id): item for item in objects
-    }
+    by_source_kind_external: dict[tuple[str, str, str], list[CurrentObject]] = {}
+    for item in objects:
+        by_source_kind_external.setdefault((item.source, item.kind, item.external_id), []).append(
+            item
+        )
     for item in objects:
         if item.kind == "jira_issue" and isinstance(item.data.get("key"), str):
-            by_source_kind_external[("jira", "jira_issue", str(item.data["key"]))] = item
+            alias_key = ("jira", "jira_issue", str(item.data["key"]))
+            if alias_key != (item.source, item.kind, item.external_id):
+                by_source_kind_external.setdefault(alias_key, []).append(item)
     jira = {
         str(item.data.get("key", item.external_id)).upper(): item
         for item in objects
         if item.kind == "jira_issue"
     }
-    commits = {item.external_id.lower(): item for item in objects if item.kind == "git_commit"}
+    commits = [item for item in objects if item.kind == "git_commit"]
     mrs_by_iid: dict[str, list[CurrentObject]] = {}
     for item in objects:
         if item.kind == "gitlab_mr":
@@ -107,17 +117,48 @@ def rebuild_references(app: AppConfig, repository: EvidenceRepository) -> int:
                     )
 
             for prefix in sorted(extract_commit_shas(text)):
-                matches = [commit for sha, commit in commits.items() if sha.startswith(prefix)]
+                matches = [
+                    commit for commit in commits if commit.external_id.lower().startswith(prefix)
+                ]
                 if len(matches) == 1 and matches[0].object_id != item.object_id:
+                    target = matches[0]
+                    if (
+                        item.source == target.source
+                        and item.source_instance != target.source_instance
+                    ):
+                        continue
+                    if item.source == "gitlab" and target.source == "git":
+                        # Cross-provider SHA matches require a full, explicit mapping.
+                        continue
                     _insert(
                         connection,
                         app.id,
                         item,
-                        matches[0],
+                        target,
                         "mentions_commit_sha",
                         "exact_text",
                         prefix,
                     )
+
+            if item.source == "gitlab":
+                for sha in sorted(extract_full_commit_shas(text)):
+                    matches = [
+                        commit
+                        for commit in commits
+                        if commit.external_id.casefold() == sha
+                        and commit.object_id != item.object_id
+                    ]
+                    for target in matches:
+                        if mapped_commit_sha_allowed(app, item, target, sha):
+                            _insert(
+                                connection,
+                                app.id,
+                                item,
+                                target,
+                                "mapped_commit_sha",
+                                "explicit_repo_project_full_sha:textual_reference",
+                                sha,
+                            )
 
             for iid in sorted(extract_mr_iids(text)):
                 matches = mrs_by_iid.get(iid, [])
@@ -137,8 +178,48 @@ def rebuild_references(app: AppConfig, repository: EvidenceRepository) -> int:
                         str(raw.get("target_kind", "")),
                         str(raw.get("target_external_id", "")),
                     )
-                    target = by_source_kind_external.get(target_key)
-                    if target and target.object_id != item.object_id:
+                    targets = (
+                        [
+                            commit
+                            for commit in commits
+                            if commit.external_id.casefold()
+                            == str(raw.get("target_external_id", "")).casefold()
+                        ]
+                        if target_key[:2] == ("git", "git_commit")
+                        else by_source_kind_external.get(target_key, [])
+                    )
+                    exact_value = (
+                        str(raw["exact_value"]) if raw.get("exact_value") is not None else None
+                    )
+                    for target in targets:
+                        if target.object_id == item.object_id:
+                            continue
+                        if (
+                            item.source == target.source
+                            and item.source_instance != target.source_instance
+                        ):
+                            continue
+                        if item.source == "gitlab" and target.source == "git":
+                            if target.kind != "git_commit" or exact_value is None:
+                                continue
+                            if mapped_commit_sha_allowed(app, item, target, exact_value):
+                                field = {
+                                    "gitlab_source_head": "source_head",
+                                    "gitlab_merge_commit": "merge_commit_sha",
+                                    "gitlab_squash_commit": "squash_commit_sha",
+                                    "gitlab_release_commit": "commit_record",
+                                    "gitlab_deployment_commit": "deployment",
+                                }.get(str(raw.get("relationship_type")), "pending_reference")
+                                _insert(
+                                    connection,
+                                    app.id,
+                                    item,
+                                    target,
+                                    "mapped_commit_sha",
+                                    f"explicit_repo_project_full_sha:{field}",
+                                    exact_value.casefold(),
+                                )
+                            continue
                         _insert(
                             connection,
                             app.id,
@@ -146,30 +227,59 @@ def rebuild_references(app: AppConfig, repository: EvidenceRepository) -> int:
                             target,
                             str(raw.get("relationship_type", "related_to")),
                             str(raw.get("extraction_method", "source_metadata")),
-                            str(raw["exact_value"]) if raw.get("exact_value") is not None else None,
+                            exact_value,
                         )
 
             structural: list[tuple[str, str, str]] = []
             if item.kind == "gitlab_mr":
                 commit_shas = item.data.get("commit_shas")
                 if isinstance(commit_shas, list):
-                    for sha in commit_shas:
-                        structural.append(("git_commit", str(sha), "mr_contains_commit"))
+                    for commit_sha in commit_shas:
+                        structural.append(("git_commit", str(commit_sha), "mr_contains_commit"))
                 for field in ("merge_commit_sha", "squash_commit_sha"):
-                    sha = item.data.get(field)
-                    if isinstance(sha, str) and sha:
-                        structural.append(("git_commit", sha, "commit_introduced_by_mr"))
+                    field_sha = item.data.get(field)
+                    if isinstance(field_sha, str) and field_sha:
+                        structural.append(("git_commit", field_sha, "commit_introduced_by_mr"))
+            elif item.kind == "gitlab_merge_request_commit":
+                commit_sha = item.data.get("sha")
+                if isinstance(commit_sha, str):
+                    structural.append(("git_commit", commit_sha, "commit_record"))
             elif item.kind == "git_deployment":
-                sha = item.data.get("sha")
-                if isinstance(sha, str):
-                    structural.append(("git_commit", sha, "deployment_contains_sha"))
+                deployment_sha = item.data.get("sha")
+                if isinstance(deployment_sha, str):
+                    structural.append(("git_commit", deployment_sha, "deployment_contains_sha"))
             elif item.kind == "git_tag":
-                sha = item.data.get("target_commit_sha")
-                if isinstance(sha, str):
-                    structural.append(("git_commit", sha, "tag_points_to_commit"))
+                target_sha = item.data.get("target_commit_sha")
+                if isinstance(target_sha, str):
+                    structural.append(("git_commit", target_sha, "tag_points_to_commit"))
             for kind, external_id, relationship in structural:
-                target = by_source_kind_external.get(("git", kind, external_id))
-                if target:
+                targets = (
+                    [
+                        commit
+                        for commit in commits
+                        if commit.external_id.casefold() == external_id.casefold()
+                    ]
+                    if kind == "git_commit"
+                    else by_source_kind_external.get(("git", kind, external_id), [])
+                )
+                for target in targets:
+                    if (
+                        item.source == target.source
+                        and item.source_instance != target.source_instance
+                    ):
+                        continue
+                    if item.source == "gitlab" and target.source == "git":
+                        if mapped_commit_sha_allowed(app, item, target, external_id):
+                            _insert(
+                                connection,
+                                app.id,
+                                item,
+                                target,
+                                "mapped_commit_sha",
+                                f"explicit_repo_project_full_sha:{relationship}",
+                                external_id.casefold(),
+                            )
+                        continue
                     _insert(
                         connection,
                         app.id,

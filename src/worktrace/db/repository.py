@@ -44,6 +44,12 @@ def stable_id(prefix: str, *parts: object) -> str:
     return f"{prefix}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
 
 
+def source_instance_id(app_id: str, source: str, identifier: object) -> str:
+    """Return the established opaque source-instance identifier without changing it."""
+
+    return stable_id("source", app_id, source, identifier)
+
+
 def payload_hash(title: str | None, body: str | None, data: dict[str, JsonValue]) -> str:
     payload = json.dumps(
         {"title": title, "body": body, "data": data},

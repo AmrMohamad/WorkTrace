@@ -481,12 +481,40 @@ def test_cli_git_only_journey_reaches_packet_gaps_and_mcp_entrypoint(
     assert sum(len(questions) for questions in packet_payload["sections"].values()) == 30
     assert isinstance(json.loads(gaps.stdout), dict)
 
+    ignored = runner.invoke(
+        app, ["ignore", candidate_id, "--reason", "fixture reason", "--config", str(config)]
+    )
+    assert ignored.exit_code == 0, ignored.stdout
+    rejected_ignored = runner.invoke(
+        app, ["split", candidate_id, object_id, "--config", str(config)]
+    )
+    assert rejected_ignored.exit_code != 0
+    restored_ignore = runner.invoke(
+        app, ["undo", json.loads(ignored.stdout)["decision_id"], "--config", str(config)]
+    )
+    assert restored_ignore.exit_code == 0, restored_ignore.stdout
+
     decision_commands = (
-        ["ignore", candidate_id, "--reason", "fixture reason", "--config", str(config)],
         ["rename", candidate_id, "Checkout contribution", "--config", str(config)],
         ["add-member", candidate_id, object_id, "--config", str(config)],
         ["remove-member", candidate_id, object_id, "--config", str(config)],
-        ["split", candidate_id, object_id, "--config", str(config)],
+    )
+    decision_ids: list[str] = []
+    for command in decision_commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, f"{command}: {result.stdout} {result.stderr}"
+        decision_ids.append(json.loads(result.stdout)["decision_id"])
+    rejected_removed = runner.invoke(
+        app, ["split", candidate_id, object_id, "--config", str(config)]
+    )
+    assert rejected_removed.exit_code != 0
+    restored_remove = runner.invoke(app, ["undo", decision_ids[-1], "--config", str(config)])
+    assert restored_remove.exit_code == 0, restored_remove.stdout
+    split = runner.invoke(app, ["split", candidate_id, object_id, "--config", str(config)])
+    assert split.exit_code == 0, split.stdout
+    decision_ids.append(json.loads(split.stdout)["decision_id"])
+    attested = runner.invoke(
+        app,
         [
             "attest",
             contribution_id,
@@ -496,11 +524,8 @@ def test_cli_git_only_journey_reaches_packet_gaps_and_mcp_entrypoint(
             str(config),
         ],
     )
-    decision_ids: list[str] = []
-    for command in decision_commands:
-        result = runner.invoke(app, command)
-        assert result.exit_code == 0, f"{command}: {result.stdout} {result.stderr}"
-        decision_ids.append(json.loads(result.stdout)["decision_id"])
+    assert attested.exit_code == 0, attested.stdout
+    decision_ids.append(json.loads(attested.stdout)["decision_id"])
     undone = runner.invoke(app, ["undo", decision_ids[-1], "--config", str(config)])
     assert undone.exit_code == 0, undone.stdout
 
@@ -632,7 +657,7 @@ def test_import_all_uses_git_then_gitlab_then_jira_discovery(
 
 
 @pytest.mark.asyncio
-async def test_mcp_stdio_initializes_and_lists_exactly_six_read_only_tools(
+async def test_mcp_stdio_initializes_and_lists_exactly_seven_read_only_tools(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repository"
@@ -661,6 +686,7 @@ async def test_mcp_stdio_initializes_and_lists_exactly_six_read_only_tools(
         "list_evidence_gaps",
         "search_evidence",
         "get_evidence_excerpt",
+        "get_evidence_context",
     }
 
 

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from worktrace.errors import DatabaseError
 
 READ_PROTOCOL_VERSION = 1
-READ_MODEL_VERSION = 1
+READ_MODEL_VERSION = 2
 
 
 def mark_read_state_changed(connection: sqlite3.Connection, app_id: str) -> None:

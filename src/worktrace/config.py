@@ -56,6 +56,14 @@ class ModuleRule:
 
 
 @dataclass(frozen=True)
+class GitLabRepositoryMapping:
+    """One explicitly configured GitLab project to local repository correspondence."""
+
+    repo_path: Path
+    gitlab_project_id: int
+
+
+@dataclass(frozen=True)
 class IdentityConfig:
     display_name: str
     git_author_emails: tuple[str, ...]
@@ -80,6 +88,7 @@ class AppConfig:
     ignored_paths: tuple[str, ...]
     module_rules: tuple[ModuleRule, ...] = field(default_factory=tuple)
     jira_custom_fields: dict[str, str] = field(default_factory=dict)
+    gitlab_repository_mappings: tuple[GitLabRepositoryMapping, ...] = field(default_factory=tuple)
 
     def assert_repo_scope(self, candidate: Path) -> Path:
         resolved = candidate.expanduser().resolve()
@@ -167,6 +176,52 @@ def _parse_app(raw: object, index: int) -> AppConfig:
     ):
         raise ConfigurationError("Jira custom field mappings must be strings")
 
+    raw_mappings = table.get("gitlab_repository_mappings", [])
+    if not isinstance(raw_mappings, list):
+        raise ConfigurationError(
+            f"apps[{index}].gitlab_repository_mappings must be an array of tables"
+        )
+    mappings: list[GitLabRepositoryMapping] = []
+    seen_mapping_pairs: set[tuple[Path, int]] = set()
+    for mapping_index, raw_mapping in enumerate(raw_mappings):
+        mapping = _require_table(
+            raw_mapping, f"apps[{index}].gitlab_repository_mappings[{mapping_index}]"
+        )
+        raw_repo_path = mapping.get("repo_path")
+        if not isinstance(raw_repo_path, str) or not raw_repo_path.strip():
+            raise ConfigurationError(
+                f"apps[{index}].gitlab_repository_mappings[{mapping_index}].repo_path "
+                "must be a nonblank string"
+            )
+        repo_path = Path(raw_repo_path).expanduser().resolve()
+        raw_project_id = mapping.get("gitlab_project_id")
+        if (
+            isinstance(raw_project_id, bool)
+            or not isinstance(raw_project_id, int)
+            or raw_project_id < 1
+        ):
+            raise ConfigurationError(
+                f"apps[{index}].gitlab_repository_mappings[{mapping_index}].gitlab_project_id "
+                "must be a positive integer"
+            )
+        if repo_path not in repo_paths:
+            raise ConfigurationError(
+                f"apps[{index}].gitlab_repository_mappings[{mapping_index}].repo_path "
+                "is not configured for this app"
+            )
+        if raw_project_id not in gitlab_ids:
+            raise ConfigurationError(
+                f"apps[{index}].gitlab_repository_mappings[{mapping_index}].gitlab_project_id "
+                "is not configured for this app"
+            )
+        pair = (repo_path, raw_project_id)
+        if pair in seen_mapping_pairs:
+            raise ConfigurationError("duplicate GitLab repository mapping")
+        seen_mapping_pairs.add(pair)
+        mappings.append(
+            GitLabRepositoryMapping(repo_path=repo_path, gitlab_project_id=raw_project_id)
+        )
+
     return AppConfig(
         id=app_id,
         name=name,
@@ -185,6 +240,9 @@ def _parse_app(raw: object, index: int) -> AppConfig:
         ignored_paths=_strings(table.get("ignored_paths"), f"apps[{index}].ignored_paths"),
         module_rules=tuple(rules),
         jira_custom_fields={str(key): str(value) for key, value in custom_fields.items()},
+        gitlab_repository_mappings=tuple(
+            sorted(mappings, key=lambda item: (str(item.repo_path), item.gitlab_project_id))
+        ),
     )
 
 

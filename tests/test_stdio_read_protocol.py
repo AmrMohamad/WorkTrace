@@ -159,6 +159,7 @@ async def test_stdio_read_protocol_binds_tokens_paging_mutation_and_restart(tmp_
             "list_evidence_gaps",
             "search_evidence",
             "get_evidence_excerpt",
+            "get_evidence_context",
         }
         for tool in listed.tools:
             assert "expected_view_token" in tool.input_schema["properties"]
@@ -170,6 +171,32 @@ async def test_stdio_read_protocol_binds_tokens_paging_mutation_and_restart(tmp_
         )
         token = cast(str, search["view_token"])
         assert isinstance(search["next_cursor"], str)
+        context = _payload(
+            await session.call_tool(
+                "get_evidence_context",
+                {
+                    "app_id": "sample_store",
+                    "object_id": "obj:stdio:0",
+                    "limit": 1,
+                    "expected_view_token": token,
+                },
+            )
+        )
+        assert context["view_token"] == token
+        relation_cursor = context["relations"]["next_cursor"]
+        if isinstance(relation_cursor, str):
+            relation_page = _payload(
+                await session.call_tool(
+                    "get_evidence_context",
+                    {
+                        "app_id": "sample_store",
+                        "object_id": "obj:stdio:0",
+                        "relation_cursor": relation_cursor,
+                        "expected_view_token": token,
+                    },
+                )
+            )
+            assert relation_page["memberships"]["requested"] is False
         continued = _payload(
             await session.call_tool(
                 "search_evidence",

@@ -21,6 +21,8 @@ _POSITIONS = {
     "candidates": {"candidate_id"},
     "evidence": {"sort_time", "observation_id"},
     "packet_details": {"question_id", "kind", "ordinal"},
+    "context_relations": {"phase", "key"},
+    "context_memberships": {"phase", "key"},
 }
 
 
@@ -106,7 +108,13 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def decode_cursor(
-    value: str | None, *, collection: str, app_id: str, view: str, filters: str
+    value: str | None,
+    *,
+    collection: str,
+    app_id: str,
+    view: str,
+    filters: str,
+    object_fingerprint: str | None = None,
 ) -> dict[str, object] | None:
     if value is None:
         return None
@@ -123,7 +131,7 @@ def decode_cursor(
             raise ValueError("bad alphabet")
         raw = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
         payload = json.loads(raw, object_pairs_hook=_unique_object)
-        if not isinstance(payload, dict) or set(payload) != {
+        base_fields = {
             "v",
             "collection",
             "app",
@@ -131,12 +139,21 @@ def decode_cursor(
             "filters",
             "generation",
             "position",
-        }:
+        }
+        if not isinstance(payload, dict) or (
+            set(payload) != base_fields and set(payload) != base_fields | {"object_fingerprint"}
+        ):
             raise ValueError("bad fields")
         if type(payload["v"]) is not int or payload["v"] != 1:
             raise ValueError("bad version")
         if not all(isinstance(payload[k], str) for k in ("collection", "app", "view", "filters")):
             raise ValueError("bad types")
+        context_fingerprint = payload.get("object_fingerprint")
+        if context_fingerprint is not None and (
+            not isinstance(context_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", context_fingerprint) is None
+        ):
+            raise ValueError("bad object fingerprint")
         if (
             _TOKEN.fullmatch(payload["view"]) is None
             or re.fullmatch(r"[0-9a-f]{64}", payload["filters"]) is None
@@ -157,8 +174,34 @@ def decode_cursor(
             not isinstance(generation, str) or re.fullmatch(r"[0-9a-f]{64}", generation) is None
         ):
             raise ValueError("bad generation")
-        if payload["collection"] != "candidates" and generation is not None:
+        if (
+            payload["collection"] not in {"candidates", "context_memberships"}
+            and generation is not None
+        ):
             raise ValueError("unexpected generation")
+        if payload["collection"] in {"context_relations", "context_memberships"}:
+            if context_fingerprint is None:
+                raise ValueError("missing object fingerprint")
+            if position["phase"] not in {"start", "after"}:
+                raise ValueError("bad context phase")
+            if position["phase"] == "start" and position["key"] != "-":
+                raise ValueError("bad context start")
+            if position["phase"] == "after" and not re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_-]{1,127}(?::[A-Za-z0-9._-]{1,128})*", position["key"]
+            ):
+                raise ValueError("bad context key")
+            if (
+                position["phase"] == "after"
+                and payload["collection"] == "context_relations"
+                and not position["key"].startswith("ref:")
+            ):
+                raise ValueError("bad relation key")
+            if (
+                position["phase"] == "after"
+                and payload["collection"] == "context_memberships"
+                and not position["key"].startswith(("candidate:", "contribution:"))
+            ):
+                raise ValueError("bad membership key")
         if (
             payload["collection"] == "evidence"
             and datetime.fromisoformat(position["sort_time"].replace("Z", "+00:00")).tzinfo is None
@@ -183,6 +226,10 @@ def decode_cursor(
         )
     if payload["filters"] != filters:
         raise ProtocolError("cursor_filter_mismatch", "Filters changed; restart without a cursor.")
+    if context_fingerprint != object_fingerprint:
+        raise ProtocolError(
+            "cursor_scope_mismatch", "Cursor belongs to a different context object."
+        )
     check_expected(payload["view"], view)
     return payload
 
@@ -195,8 +242,9 @@ def encode_cursor(
     filters: str,
     position: dict[str, str],
     generation: str | None = None,
+    object_fingerprint: str | None = None,
 ) -> str:
-    payload = {
+    payload: dict[str, object] = {
         "v": 1,
         "collection": collection,
         "app": app_id,
@@ -205,6 +253,8 @@ def encode_cursor(
         "generation": generation,
         "position": position,
     }
+    if object_fingerprint is not None:
+        payload["object_fingerprint"] = object_fingerprint
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     result = _CURSOR_PREFIX + base64.urlsafe_b64encode(raw).decode().rstrip("=")
     if len(result) > 2048:

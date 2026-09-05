@@ -155,6 +155,26 @@ def build_mcp_server(
             expected_view_token=expected_view_token,
         )
 
+    @server.tool(annotations=_READ_ONLY_ANNOTATIONS, structured_output=True)
+    def get_evidence_context(
+        app_id: str,
+        object_id: str,
+        relation_cursor: str | None = None,
+        membership_cursor: str | None = None,
+        limit: int = 10,
+        expected_view_token: str | None = None,
+    ) -> dict[str, object]:
+        """Explain one source object's bounded references and effective memberships."""
+
+        return service.get_evidence_context(
+            app_id=app_id,
+            object_id=object_id,
+            relation_cursor=relation_cursor,
+            membership_cursor=membership_cursor,
+            limit=limit,
+            expected_view_token=expected_view_token,
+        )
+
     return server
 
 

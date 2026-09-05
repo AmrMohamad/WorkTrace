@@ -160,7 +160,7 @@ connection creation, file writes, and clipboard calls with failing sentinels and
 journey. A real SQL write attempt through the TUI connection must fail.
 
 The TUI does not call MCP or execute WorkTrace CLI commands. This avoids turning protocol output or
-CLI JSON into an internal capability and leaves MCP's six-tool allowlist and response limits
+CLI JSON into an internal capability and leaves MCP's seven-tool allowlist and response limits
 unchanged.
 
 ### Database version and contention
@@ -209,7 +209,7 @@ Parser failures must never log the raw pre-redacted input. Redaction is versione
 ## MCP enforcement
 
 - Read-only SQLite URI and query-only connection behavior.
-- Exactly six allowlisted tools.
+- Exactly seven allowlisted tools.
 - Maximum 20 records.
 - Default excerpt 1,200 characters; explicit excerpt maximum 4,000.
 - Maximum serialized response text 20,000 characters.
