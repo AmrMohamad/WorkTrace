@@ -13,26 +13,32 @@ from worktrace.db.authority import (
     run_is_authoritative,
     selection_policy_version,
 )
+from worktrace.db.import_status import legacy_preflight_ids, source_readiness
 from worktrace.errors import NotFound, ScopeViolation
 
 
 def source_status(connection: sqlite3.Connection, app_id: str) -> list[dict[str, object]]:
+    readiness = source_readiness(connection, app_id)
+    legacy = legacy_preflight_ids(connection, app_id)
+    exclude = f"AND id NOT IN ({','.join('?' for _ in legacy)})" if legacy else ""
     rows = connection.execute(
-        """
+        f"""
         SELECT * FROM (
-            SELECT source, source_instance, status, completeness, started_at, completed_at,
+            SELECT id, source, source_instance, status, completeness, started_at, completed_at,
                    error_summary, progress_json, scope_json,
                    ROW_NUMBER() OVER (
                      PARTITION BY source, source_instance ORDER BY started_at DESC, id DESC
                    ) AS position
-            FROM sync_runs WHERE app_id=?
+            FROM sync_runs WHERE app_id=? {exclude}
         ) WHERE position=1 ORDER BY source, source_instance
         """,
-        (app_id,),
+        (app_id, *sorted(legacy)),
     )
     cutoff = datetime.now(UTC) - timedelta(days=STALE_AFTER_DAYS)
     result: list[dict[str, object]] = []
     for row in rows:
+        if str(row["id"]) in legacy:
+            continue
         completed = str(row["completed_at"] or row["started_at"])
         try:
             stale = datetime.fromisoformat(completed.replace("Z", "+00:00")) < cutoff
@@ -71,6 +77,11 @@ def source_status(connection: sqlite3.Connection, app_id: str) -> list[dict[str,
                 "metadata; existing observations were not backfilled."
             )
         complete = authoritative and completeness_is_full_scope(str(row["completeness"]))
+        if row["source"] == "jira" and selection_version != 3:
+            limitations.append(
+                "Jira discovery uses legacy selector policy; "
+                "full configured-range reimport required."
+            )
         result.append(
             {
                 "source": str(row["source"]),
@@ -86,8 +97,22 @@ def source_status(connection: sqlite3.Connection, app_id: str) -> list[dict[str,
                 "authoritative_current": authoritative,
                 "limitations": limitations,
                 "selection_events": progress.get("selection_events", []),
+                **readiness.get(str(row["source"]), {}),
             }
         )
+    represented = {str(item["source"]) for item in result}
+    for source, state in readiness.items():
+        if source not in represented:
+            result.append(
+                {
+                    "source": source,
+                    "source_instance": None,
+                    "status": "not_started",
+                    "complete": False,
+                    "authoritative_current": False,
+                    **state,
+                }
+            )
     return result
 
 

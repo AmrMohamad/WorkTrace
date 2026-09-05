@@ -20,6 +20,7 @@ from worktrace.config import WorkTraceConfig, gitlab_credentials, jira_credentia
 from worktrace.db.connection import connect_read_only
 from worktrace.db.migrations import migrations, user_version
 from worktrace.errors import ConfigurationError
+from worktrace.git_environment import local_git_environment
 
 CheckStatus = Literal["pass", "warn", "fail", "skipped"]
 
@@ -46,9 +47,6 @@ def _git(args: list[str], root: Path | None = None) -> subprocess.CompletedProce
     if root is not None:
         command.extend(("-C", str(root)))
     command.extend(args)
-    environment = os.environ.copy()
-    environment["GIT_OPTIONAL_LOCKS"] = "0"
-    environment["GIT_TERMINAL_PROMPT"] = "0"
     return subprocess.run(
         command,
         check=False,
@@ -58,7 +56,7 @@ def _git(args: list[str], root: Path | None = None) -> subprocess.CompletedProce
         errors="replace",
         timeout=10,
         shell=False,
-        env=environment,
+        env=local_git_environment(),
     )
 
 
