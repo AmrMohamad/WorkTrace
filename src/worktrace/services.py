@@ -66,7 +66,13 @@ def add_manual_evidence(
     return observation_ids[0]
 
 
-def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -> int:
+def export_app(
+    connection: sqlite3.Connection,
+    app_id: str,
+    destination: Path,
+    *,
+    identity_state: dict[str, object] | None = None,
+) -> int:
     current = EvidenceRepository(connection).current_observations(app_id)
     current_object_ids = {str(row["source_object_id"]) for row in current}
     current_observation_ids = {str(row["id"]) for row in current}
@@ -251,8 +257,13 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         "selection": "authoritative current observations only; legacy overbroad runs excluded",
     }
     payload["apps"] = [
-        dict(row) for row in connection.execute("SELECT * FROM apps WHERE id=?", (app_id,))
+        dict(row)
+        for row in connection.execute(
+            "SELECT id, name, market, business_type FROM apps WHERE id=?", (app_id,)
+        )
     ]
+    if identity_state is not None:
+        payload["identity_policy"] = identity_state
     sync_run_rows = [
         dict(row)
         for row in connection.execute(
@@ -300,11 +311,15 @@ def export_app(connection: sqlite3.Connection, app_id: str, destination: Path) -
         for row in connection.execute(
             f"""
             WITH {authoritative_current_participation_ctes()}
-            SELECT DISTINCT a.* FROM actors a
+            SELECT DISTINCT a.id, a.source, a.source_instance, a.external_actor_id,
+                a.display_name, a.email_hash,
+                CASE WHEN a.source='manual' OR (a.identity_policy_version=1 AND ?)
+                     THEN a.is_self ELSE 0 END AS is_self
+            FROM actors a
             JOIN authoritative_current_participations p ON p.actor_id=a.id
             WHERE p.observation_id IN ({placeholders(observation_ids)})
             """,
-            observation_ids,
+            [identity_state is None or bool(identity_state["valid"]), *observation_ids],
         )
     ]
     payload["source_object_availability_events"] = availability_rows

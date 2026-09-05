@@ -25,6 +25,7 @@ def build_participation_summary(
     attestations: Sequence[HumanAttestation],
     *,
     current_participation_rows: Mapping[str, tuple[sqlite3.Row, ...]] | None = None,
+    self_identity_valid: bool = True,
 ) -> dict[str, object]:
     """Return role observations without converting them into ownership labels."""
 
@@ -51,7 +52,10 @@ def build_participation_summary(
                     WITH {authoritative_current_participation_ctes()}
                     SELECT p.id, p.source_object_id, p.observation_id, p.role,
                         p.effective_from, p.effective_to, a.id AS actor_id,
-                        a.display_name, a.is_self, so.source, so.kind, so.external_id
+                        a.display_name,
+                        CASE WHEN a.identity_policy_version=1 OR a.source='manual'
+                             THEN a.is_self ELSE 0 END AS is_self,
+                        so.source, so.kind, so.external_id
                     FROM authoritative_current_participations p
                     JOIN actors a ON a.id=p.actor_id
                     JOIN source_objects so ON so.id=p.source_object_id
@@ -62,8 +66,16 @@ def build_participation_summary(
                 )
             )
 
-    self_rows = [row for row in rows if bool(row["is_self"])]
-    other_rows = [row for row in rows if not bool(row["is_self"])]
+    self_rows = [
+        row
+        for row in rows
+        if (self_identity_valid or row["source"] == "manual") and bool(row["is_self"])
+    ]
+    other_rows = [
+        row
+        for row in rows
+        if not ((self_identity_valid or row["source"] == "manual") and bool(row["is_self"]))
+    ]
     data_by_object = {record.object_id: record.data for record in records}
     self_by_object: dict[str, set[str]] = {}
     for row in self_rows:

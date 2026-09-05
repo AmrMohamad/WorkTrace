@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from collections.abc import Iterator
+from dataclasses import replace
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pytest
+
+from worktrace.adapters.base import (
+    ActorIdentity,
+    NormalizedPage,
+    NormalizedRecord,
+    ObservationMetadata,
+    Participation,
+    ParticipationRole,
+    SourceObjectIdentity,
+)
 from worktrace.candidates.decisions import append_decision
-from worktrace.config import AppConfig
+from worktrace.config import AppConfig, IdentityConfig, WorkTraceConfig
+from worktrace.db.authority import authoritative_current_observations
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
 from worktrace.db.repository import EvidenceRepository
@@ -17,6 +31,9 @@ from worktrace.domain.models import (
     PendingReference,
     SourceIdentity,
 )
+from worktrace.errors import DatabaseError
+from worktrace.identity import initialize_identity, repair_identities
+from worktrace.importers.orchestrator import import_snapshot
 from worktrace.normalize.redaction import Redactor
 from worktrace.services import add_manual_evidence, export_app
 
@@ -304,17 +321,22 @@ def test_provider_identity_and_pending_references_are_pseudonymized_before_ids(
     assert b"fixture-release-secret" not in database_path.read_bytes()
 
 
-def test_current_verified_actor_classification_can_clear_a_removed_self_alias(
+@pytest.mark.parametrize("conflict", ["classification", "email"])
+def test_source_page_cannot_change_accepted_identity_and_retains_previous_authority(
     tmp_path: Path,
+    conflict: str,
 ) -> None:
-    connection, repository, _, _ = _open_repository(tmp_path)
+    connection, repository, _, redactor = _open_repository(tmp_path)
 
-    def observed_commit(external_id: str, *, is_self: bool) -> NormalizedObject:
+    def observed_commit(
+        external_id: str, *, is_self: bool, email: str = "first@example.test"
+    ) -> NormalizedObject:
         actor = ActorObservation(
             source="git",
             source_instance="fixture-repository",
             external_actor_id="stable-provider-actor",
             display_name="Fixture Engineer",
+            email_hash=redactor.hash_email(email),
             is_self=is_self,
         )
         return NormalizedObject(
@@ -348,24 +370,138 @@ def test_current_verified_actor_classification_can_clear_a_removed_self_alias(
             == 1
         )
 
-        corrected = repository.start_sync_run(
+        baseline = authoritative_current_observations(connection, "sample_store")
+        attempted = repository.start_sync_run(
             "sample_store", "git", "fixture-repository", {"mode": "fixture"}
         )
-        repository.store_page(corrected, [observed_commit("b" * 40, is_self=False)])
-        repository.finish_sync_run(corrected, "complete", "complete_for_scope")
+        conflicting = observed_commit(
+            "b" * 40,
+            is_self=conflict != "classification",
+            email="other@example.test" if conflict == "email" else "first@example.test",
+        )
+        with pytest.raises(DatabaseError, match="identity_reconciliation_required"):
+            repository.store_page(attempted, [conflicting])
+        repository.finish_sync_run(attempted, "failed", "partial", "identity conflict")
 
         assert (
             connection.execute(
                 "SELECT is_self FROM actors WHERE external_actor_id='stable-provider-actor'"
             ).fetchone()[0]
-            == 0
+            == 1
         )
         assert (
             connection.execute(
                 "SELECT COUNT(*) FROM participations WHERE actor_id IN "
                 "(SELECT id FROM actors WHERE external_actor_id='stable-provider-actor')"
             ).fetchone()[0]
-            == 2
+            == 1
         )
+        assert list(authoritative_current_observations(connection, "sample_store")) == list(
+            baseline
+        )
+        assert connection.execute("SELECT COUNT(*) FROM source_objects").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+        assert connection.execute("SELECT email_hash FROM actors").fetchone()[
+            0
+        ] == redactor.hash_email("first@example.test")
+
+        repeated = repository.start_sync_run(
+            "sample_store", "git", "fixture-repository", {"mode": "fixture"}
+        )
+        repository.store_page(repeated, [observed_commit("a" * 40, is_self=True)])
+        repository.finish_sync_run(repeated, "complete", "complete_for_scope")
+        assert connection.execute("SELECT COUNT(*) FROM actors").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 2
+    finally:
+        connection.close()
+
+
+def test_failed_import_cannot_restore_classification_after_explicit_repair(tmp_path: Path) -> None:
+    connection, repository, _, redactor = _open_repository(tmp_path)
+    email_hash = redactor.hash_email("former@example.test")
+    app = _app()
+    config = WorkTraceConfig(
+        1,
+        tmp_path,
+        date(2026, 1, 1),
+        date(2026, 1, 31),
+        IdentityConfig("Fixture Engineer", ("former@example.test",), (), None, None, None),
+        (app,),
+        tmp_path / "config.toml",
+    )
+
+    class FixtureAdapter:
+        def iter_pages(self) -> Iterator[NormalizedPage]:
+            record = NormalizedRecord(
+                SourceObjectIdentity(
+                    "git", "fixture-repository", "commit", "a" * 40, "unused", app.id
+                ),
+                ObservationMetadata(
+                    "2026-01-10T10:00:00+00:00", "2026-01-10T10:00:00+00:00", "1", "1", "1"
+                ),
+                {"subject": "Synthetic work", "sha": "a" * 40},
+                (
+                    Participation(
+                        ActorIdentity(
+                            email_hash, "unused", "Fixture Engineer", email_hash=email_hash
+                        ),
+                        ParticipationRole.AUTHOR,
+                    ),
+                ),
+                (),
+                "fixture-hash",
+            )
+            yield NormalizedPage("git", "fixture-repository", "commit", None, None, True, (record,))
+
+    try:
+        with connection:
+            initialize_identity(connection, config, redactor.email_key)
+        first = import_snapshot(
+            app,
+            FixtureAdapter(),
+            repository,
+            source="git",
+            source_instance="fixture-repository",
+            date_from=config.employment_from,
+            date_to=config.employment_to,
+            self_actor_ids={email_hash},
+        )
+        assert first.status == "complete"
+        assert connection.execute("SELECT is_self FROM actors").fetchone()[0] == 1
+        changed = replace(
+            config, identity=replace(config.identity, git_author_emails=("current@example.test",))
+        )
+        with connection:
+            report = repair_identities(connection, changed, redactor.email_key, app.id, apply=True)
+        assert report["demotions"] == 1
+        assert connection.execute("SELECT is_self FROM actors").fetchone()[0] == 0
+
+        # Simulate a stale caller retaining the previous resolved identity set.
+        # The real import path must fail instead of reviving the shared actor flag.
+        failed = import_snapshot(
+            app,
+            FixtureAdapter(),
+            repository,
+            source="git",
+            source_instance="fixture-repository",
+            date_from=config.employment_from,
+            date_to=config.employment_to,
+            self_actor_ids={email_hash},
+        )
+        assert failed.status == "partial"
+        assert failed.pages == failed.records == 0
+        assert "identity_reconciliation_required" in (failed.error or "")
+        assert connection.execute("SELECT is_self FROM actors").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT status FROM sync_runs WHERE id=?", (failed.run_id,)
+            ).fetchone()[0]
+            == "failed"
+        )
+        current = authoritative_current_observations(connection, app.id)
+        assert current
+        assert {row["sync_run_id"] for row in current} == {first.run_id}
+        assert connection.execute("SELECT COUNT(*) FROM identity_repair_audit").fetchone()[0] == 1
     finally:
         connection.close()

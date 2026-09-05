@@ -274,7 +274,9 @@ def authoritative_participations_for_current_observations(
         SELECT participation.id, participation.source_object_id,
             participation.observation_id, participation.role,
             participation.effective_from, participation.effective_to,
-            actor.id AS actor_id, actor.display_name, actor.is_self,
+            actor.id AS actor_id, actor.display_name,
+            CASE WHEN actor.identity_policy_version=1 OR actor.source='manual'
+                 THEN actor.is_self ELSE 0 END AS is_self,
             object.source, object.kind, object.external_id
         FROM participations participation
         JOIN observations observation

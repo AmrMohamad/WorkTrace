@@ -14,6 +14,7 @@ from worktrace.config import (
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
 from worktrace.db.queries import source_status as query_source_status
+from worktrace.db.repository import EvidenceRepository
 from worktrace.mcp_server.tools import WorkTraceTools
 from worktrace.packets.builder import PacketBuilder
 
@@ -168,10 +169,8 @@ def _packet_state(
     database_path = tmp_path / "worktrace.sqlite3"
     connection = connect(database_path)
     migrate(connection, database_path)
-    connection.execute(
-        "INSERT INTO apps(id, name, market, business_type) "
-        "VALUES ('sample_store', 'Sample Store', 'XX', 'fixture')"
-    )
+    config = _config(tmp_path)
+    EvidenceRepository(connection).ensure_apps(config)
 
     _insert_run(
         connection,
@@ -277,9 +276,10 @@ def _packet_state(
     connection.execute(
         """
         INSERT INTO actors(
-            id, source, source_instance, external_actor_id, display_name, is_self
+            id, source, source_instance, external_actor_id, display_name, is_self,
+            identity_policy_version
         ) VALUES ('actor:self', 'git', 'fixture-repo', 'fixture-self',
-                  'Fixture Engineer', 1)
+                  'Fixture Engineer', 1, 1)
         """
     )
     connection.execute(
@@ -349,7 +349,7 @@ def _packet_state(
             ),
         )
     connection.commit()
-    return connection, database_path, _config(tmp_path), candidate_id
+    return connection, database_path, config, candidate_id
 
 
 def _all_questions(packet: dict[str, object]) -> list[dict[str, object]]:
@@ -383,11 +383,17 @@ def test_phase4_packet_preserves_claim_authority_and_independent_release_rungs(
         "evidence_summary",
         "sections",
         "participation",
+        "identity_policy",
         "release_ladder",
         "contradictions",
         "defensibility",
         "limitations",
     )
+    identity_policy = packet["identity_policy"]
+    assert isinstance(identity_policy, dict)
+    assert identity_policy["valid"] is True
+    assert identity_policy["version"] == 1
+    assert identity_policy["warnings"] == []
     assert questions
     assert tuple(question["question_id"] for question in questions) == EXPECTED_PHASE4_IDS
     assert len({question["question_id"] for question in questions}) == 30

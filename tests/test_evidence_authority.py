@@ -64,10 +64,7 @@ def _ledger(tmp_path: Path) -> tuple[sqlite3.Connection, Path]:
     database_path = tmp_path / "ledger.sqlite3"
     connection = connect(database_path)
     migrate(connection, database_path)
-    connection.execute(
-        "INSERT INTO apps(id, name, market, business_type) "
-        "VALUES ('sample_store', 'Sample Store', 'XX', 'fixture')"
-    )
+    EvidenceRepository(connection).ensure_apps(_config(tmp_path))
     connection.commit()
     return connection, database_path
 
@@ -797,9 +794,10 @@ def test_failed_reference_cannot_contradict_supported_claim_and_v2_control_can(
         connection.execute(
             """
             INSERT INTO actors(
-                id, source, source_instance, external_actor_id, display_name, is_self
+                id, source, source_instance, external_actor_id, display_name, is_self,
+                identity_policy_version
             ) VALUES ('actor:git-self', 'git', 'fixture-repo', 'fixture-self',
-                      'Fixture Engineer', 1)
+                      'Fixture Engineer', 1, 1)
             """
         )
         connection.execute(
@@ -1222,7 +1220,10 @@ def test_export_preserves_app_scoped_decision_closure_and_unsupported_history(
             "('candidate:legacy-history', 'obj:legacy-history', 'seed', 0)"
         )
 
-        connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
+        connection.execute(
+            "INSERT INTO apps(id, name, market, business_type) "
+            "VALUES ('other_app', 'Other App', 'YY', 'fixture')"
+        )
         connection.execute(
             """
             INSERT INTO sync_runs(
@@ -1521,7 +1522,10 @@ def test_cross_app_creation_payload_cannot_override_candidate_or_export_scope(
             completed_at="2026-08-27T10:00:00+00:00",
             title="Scoped authoritative title",
         )
-        connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
+        connection.execute(
+            "INSERT INTO apps(id, name, market, business_type) "
+            "VALUES ('other_app', 'Other App', 'YY', 'fixture')"
+        )
         connection.execute(
             """
             INSERT INTO candidate_groups(
@@ -2036,7 +2040,10 @@ def test_legacy_nested_undo_scope_follows_lineage_not_timestamp_order(
             "obj:legacy-undo-order",
             "Provider title",
         )
-        connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
+        connection.execute(
+            "INSERT INTO apps(id, name, market, business_type) "
+            "VALUES ('other_app', 'Other App', 'YY', 'fixture')"
+        )
         connection.commit()
 
         confirmation_id = append_decision(
@@ -2712,7 +2719,10 @@ def test_secondary_alias_collision_is_app_scoped_and_ambiguous_decisions_fail_cl
 ) -> None:
     connection, database_path = _ledger(tmp_path)
     try:
-        connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
+        connection.execute(
+            "INSERT INTO apps(id, name, market, business_type) "
+            "VALUES ('other_app', 'Other App', 'YY', 'fixture')"
+        )
         for app_id, suffix, hour in (
             ("sample_store", "a", 8),
             ("other_app", "b", 9),
@@ -2973,7 +2983,10 @@ def test_cross_app_contribution_collision_is_scoped_for_packets_and_export(
             "obj:collision-a",
             "Public app A title",
         )
-        connection.execute("INSERT INTO apps VALUES ('other_app', 'Other App', 'YY', 'fixture')")
+        connection.execute(
+            "INSERT INTO apps(id, name, market, business_type) "
+            "VALUES ('other_app', 'Other App', 'YY', 'fixture')"
+        )
         connection.execute(
             """
             INSERT INTO sync_runs(

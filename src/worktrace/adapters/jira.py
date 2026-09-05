@@ -113,6 +113,7 @@ class JiraAdapter:
         self._discovered_keys = discovered_keys
         self._client = client
         self._redactor = Redactor(config.email_key)
+        self._identity_verified = False
         self._window_start = datetime.combine(config.date_from, time.min, tzinfo=UTC)
         self._window_end = datetime.combine(
             config.date_to + timedelta(days=1),
@@ -174,7 +175,16 @@ class JiraAdapter:
             yield from self._changelog_pages(issue_id, issue_key, observed_at)
         yield from self._hierarchy_pages(tuple(unique_issues.values()), observed_at)
 
+    def resolved_self_id(self) -> str:
+        """Verify and return the configured account before accepting its actor policy."""
+        if self._config.account_id is None:
+            raise ConfigurationError("Jira self identity requires a configured account_id")
+        self._verify_identity()
+        return self._config.account_id
+
     def _verify_identity(self) -> None:
+        if self._identity_verified:
+            return
         if self._config.account_id is None:
             return
         response = request_with_retry(
@@ -186,6 +196,7 @@ class JiraAdapter:
         document = self._response_mapping(response, "identity")
         if _text(document.get("accountId")) != self._config.account_id:
             raise ScopeViolation("Jira authenticated identity does not match configured account")
+        self._identity_verified = True
 
     def _discovery_queries(self) -> tuple[tuple[str, bool], ...]:
         quoted_projects = ", ".join(f'"{key}"' for key in self._projects)

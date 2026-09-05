@@ -52,6 +52,43 @@ uv run worktrace gaps candidate:stable-id
 Use `worktrace --help` and each subcommand's `--help` for all commands. Human corrections are
 append-only events; `undo` writes a compensating event rather than deleting history.
 
+## Identity upgrade and repair
+
+Git self identity uses configured email aliases, never display names. Author, committer and
+co-author remain distinct roles. Existing ledgers must reconcile older actor flags before those
+flags can support personal attribution. Confirmed contributions and human decisions are preserved;
+affected history is marked for re-review.
+
+Stop other WorkTrace writers/readers before upgrading. Keep the database and its matching
+`email-hmac.key` together as a private recovery pair. `worktrace init` now makes a coherent SQLite
+backup before forward migrations and refuses to recreate a missing key for an existing database.
+It does not silently repair historical identities. Never run an older binary on the upgraded schema.
+
+```console
+uv run worktrace init
+uv run worktrace repair-identities APP_ID --dry-run
+uv run worktrace repair-identities APP_ID --apply --expected-proposal PROPOSAL_TOKEN
+uv run worktrace rebuild all APP_ID
+uv run worktrace status APP_ID
+```
+
+Review the proposed promotions, demotions, unresolved actors and affected confirmed contributions
+before applying. The proposal token returned by the dry run can guard against changed state.
+Imports refuse changed or unreconciled identity policy; staged pages cannot reclassify existing
+actors. A rebuild clears derived-state invalidation, but does not clear human re-review warnings.
+
+Legacy ledgers do not contain a key verifier. Their first repair requires an independently known
+stored actor ID and its matching configured email alias (zero-based index): add
+`--proof-actor-id ACTOR_ID --proof-alias-index INDEX` to both preview and apply. Identify the actor
+from trusted stored evidence; do not guess from a matching display name. A missing or wrong key,
+unverifiable pair, or unexpected impact on another application blocks apply. Restore the trusted
+database/key pair when continuity cannot be established; never treat zero matches as proof.
+
+Repair is offline by default. For legacy Jira/GitLab identities, explicitly add `--verify-providers`
+to verify configured accounts using their existing credentials. This reads identity endpoints only,
+does not import evidence, and never falls back to display names. Unverified provider flags remain
+pending. Corrected full-range source imports are still needed for the later discovery fixes.
+
 ## Human review UI
 
 Launch the keyboard-first, read-only evidence workstation in an interactive terminal:

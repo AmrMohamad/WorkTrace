@@ -52,7 +52,7 @@ def _self_roles(
         FROM authoritative_current_participations p
         JOIN actors a ON a.id=p.actor_id
         JOIN source_objects so ON so.id=p.source_object_id
-        WHERE so.app_id=? AND a.is_self=1
+        WHERE so.app_id=? AND a.is_self=1 AND a.identity_policy_version=1
         """,
         (app_id,),
     )

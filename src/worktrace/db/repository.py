@@ -63,8 +63,14 @@ class EvidenceRepository:
         self.redactor = redactor
 
     def ensure_apps(self, config: WorkTraceConfig) -> None:
+        from worktrace.identity import IDENTITY_POLICY_VERSION, identity_fingerprint
+
         with self.connection:
             for app in config.apps:
+                is_new = (
+                    self.connection.execute("SELECT 1 FROM apps WHERE id=?", (app.id,)).fetchone()
+                    is None
+                )
                 self.connection.execute(
                     """
                     INSERT INTO apps(id, name, market, business_type)
@@ -76,6 +82,12 @@ class EvidenceRepository:
                     """,
                     (app.id, app.name, app.market, app.business_type),
                 )
+                if is_new:
+                    self.connection.execute(
+                        "INSERT INTO app_identity_policy(app_id, version, fingerprint) "
+                        "VALUES (?, ?, ?)",
+                        (app.id, IDENTITY_POLICY_VERSION, identity_fingerprint(config)),
+                    )
 
     def create_import_session(self, app: AppConfig, date_from: date, date_to: date) -> str:
         session_id = f"import:{uuid.uuid4()}"
@@ -296,15 +308,31 @@ class EvidenceRepository:
         ):
             raise DatabaseError("redaction is required before actor persistence")
         actor_id = stable_id("actor", actor.source, actor.source_instance, external_actor_id)
+        existing = self.connection.execute(
+            "SELECT is_self, email_hash, identity_policy_version FROM actors "
+            "WHERE source=? AND source_instance=? AND external_actor_id=?",
+            (actor.source, actor.source_instance, external_actor_id),
+        ).fetchone()
+        if existing is not None and (
+            int(existing["identity_policy_version"]) != 1
+            or bool(existing["is_self"]) != actor.is_self
+            or (
+                existing["email_hash"] is not None
+                and email_hash is not None
+                and existing["email_hash"] != email_hash
+            )
+        ):
+            raise DatabaseError(
+                "identity_reconciliation_required: source pages cannot change accepted identity"
+            )
         self.connection.execute(
             """
             INSERT INTO actors(
-                id, source, source_instance, external_actor_id, display_name, email_hash, is_self
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                id, source, source_instance, external_actor_id, display_name, email_hash, is_self,
+                identity_policy_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(source, source_instance, external_actor_id) DO UPDATE SET
-                display_name=excluded.display_name,
-                email_hash=COALESCE(excluded.email_hash, actors.email_hash),
-                is_self=excluded.is_self
+                display_name=excluded.display_name
             """,
             (
                 actor_id,

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
-from worktrace.adapters.base import NormalizedRecord, SnapshotAdapter
+from worktrace.adapters.base import ActorIdentity, NormalizedRecord, SnapshotAdapter
 from worktrace.config import AppConfig
 from worktrace.db.repository import EvidenceRepository
 from worktrace.domain.enums import Completeness
@@ -56,6 +56,25 @@ def _kind(source: str, object_type: str) -> str:
     return aliases.get((source, object_type), f"{source}_{object_type}")
 
 
+def _is_self_actor(
+    source: str, object_type: str, actor: ActorIdentity, self_actor_ids: set[str]
+) -> bool:
+    if source == "git":
+        return actor.email_hash is not None and actor.email_hash in self_actor_ids
+    if source == "gitlab":
+        if actor.source_actor_id.isascii() and actor.source_actor_id.isdecimal():
+            return int(actor.source_actor_id) > 0 and actor.source_actor_id in self_actor_ids
+        # Only email-identified commit actors may use configured/verified aliases.
+        # A different provider user ID must never be overridden by its email.
+        return (
+            object_type == "merge_request_commit"
+            and actor.email_hash is not None
+            and actor.source_actor_id == actor.email_hash
+            and actor.email_hash in self_actor_ids
+        )
+    return actor.source_actor_id in self_actor_ids
+
+
 def record_to_object(
     record: NormalizedRecord,
     self_actor_ids: set[str],
@@ -63,6 +82,8 @@ def record_to_object(
     *,
     completeness: Completeness = Completeness.COMPLETE,
 ) -> NormalizedObject:
+    # Kept for existing adapter callers; names are display data, never identity evidence.
+    del self_display_names
     identity = record.identity
     payload = dict(record.payload)
     payload["_untrusted_text_fields"] = list(record.untrusted_text_fields)
@@ -97,12 +118,8 @@ def record_to_object(
                 external_actor_id=actor.source_actor_id,
                 display_name=actor.display_name or actor.username or "Unknown source actor",
                 email_hash=actor.email_hash,
-                is_self=(
-                    actor.source_actor_id in self_actor_ids
-                    or bool(
-                        actor.display_name
-                        and actor.display_name.casefold() in (self_display_names or set())
-                    )
+                is_self=_is_self_actor(
+                    identity.source_kind, identity.object_type, actor, self_actor_ids
                 ),
             ),
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import stat
 from pathlib import Path
 
@@ -72,7 +73,7 @@ def test_export_and_backup_are_mode_0600_before_content_is_written(
     export_observation: list[tuple[int, int]] = []
     backup_observation: list[tuple[int, int]] = []
     original_dump = services_module.json.dump
-    original_copy = migration_module.shutil.copyfileobj
+    original_connect = migration_module.sqlite3.connect
 
     def inspect_dump(value: object, output: object, **kwargs: object) -> None:
         descriptor = output.fileno()  # type: ignore[attr-defined]
@@ -81,15 +82,13 @@ def test_export_and_backup_are_mode_0600_before_content_is_written(
         )
         original_dump(value, output, **kwargs)  # type: ignore[arg-type]
 
-    def inspect_copy(source: object, target: object) -> None:
-        descriptor = target.fileno()  # type: ignore[attr-defined]
-        backup_observation.append(
-            (stat.S_IMODE(os.fstat(descriptor).st_mode), os.fstat(descriptor).st_size)
-        )
-        original_copy(source, target)  # type: ignore[arg-type]
+    def inspect_connect(database: str | Path, **kwargs: object) -> sqlite3.Connection:
+        if database == backup_path:
+            backup_observation.append((_mode(backup_path), backup_path.stat().st_size))
+        return original_connect(database, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(services_module.json, "dump", inspect_dump)
-    monkeypatch.setattr(migration_module.shutil, "copyfileobj", inspect_copy)
+    monkeypatch.setattr(migration_module.sqlite3, "connect", inspect_connect)
     try:
         assert export_app(connection, "sample_store", export_path) == 0
         assert backup_database(database_path, backup_path) == backup_path
