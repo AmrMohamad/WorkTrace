@@ -24,7 +24,7 @@ from worktrace.candidates.projector import project_candidate
 from worktrace.config import AppConfig, IdentityConfig, ModuleRule, WorkTraceConfig
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
-from worktrace.db.repository import EvidenceRepository
+from worktrace.db.repository import EvidenceRepository, stable_id
 from worktrace.importers.orchestrator import import_snapshot
 from worktrace.linking.builder import rebuild_references
 from worktrace.mcp_server.tools import WorkTraceTools
@@ -1381,16 +1381,18 @@ def test_production_adapters_feed_import_packet_and_mcp_authority(
         assert candidate_row is not None
         candidate_id = str(candidate_row["id"])
 
-        material_external_ids = {"10001", "101:7", "101:7:changed-paths"}
+        material_external_ids = {"10001", "101:7", "101:7:changed-paths", commit_sha}
+        material_object_ids: list[str] = []
         for row in connection.execute(
             """
             SELECT id, external_id FROM source_objects
-            WHERE app_id=? AND external_id IN ('10001', '101:7', '101:7:changed-paths')
+            WHERE app_id=? AND external_id IN (?, '10001', '101:7', '101:7:changed-paths')
             ORDER BY external_id
             """,
-            (app.id,),
+            (app.id, commit_sha),
         ):
             material_external_ids.discard(str(row["external_id"]))
+            material_object_ids.append(str(row["id"]))
             append_decision(
                 connection,
                 "add_member",
@@ -1398,7 +1400,26 @@ def test_production_adapters_feed_import_packet_and_mcp_authority(
                 {"source_object_id": str(row["id"])},
             )
         assert not material_external_ids
-        append_decision(connection, "confirm", candidate_id)
+        release_row = connection.execute(
+            "SELECT id FROM source_objects WHERE app_id=? AND source='gitlab' "
+            "AND kind='gitlab_release'",
+            (app.id,),
+        ).fetchone()
+        assert release_row is not None
+        release_id = str(release_row["id"])
+        append_decision(
+            connection,
+            "confirm_candidate",
+            candidate_id,
+            {
+                "contribution_id": stable_id("contribution", candidate_id),
+                "app_id": app.id,
+                "title": "Explicit synthetic production grouping",
+                "type": "feature",
+                "members": sorted(material_object_ids),
+                "context_members": [release_id],
+            },
+        )
 
         projected = project_candidate(connection, candidate_id)
         assert projected.status == "confirmed"

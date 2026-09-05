@@ -35,7 +35,7 @@ def test_read_snapshot_owns_and_rolls_back_on_success_and_failure(tmp_path: Path
     path = _database(tmp_path)
     connection = connect_read_only(path)
     try:
-        assert (READ_PROTOCOL_VERSION, READ_MODEL_VERSION) == (1, 1)
+        assert (READ_PROTOCOL_VERSION, READ_MODEL_VERSION) == (1, 2)
         with read_snapshot(connection):
             assert connection.in_transaction
         assert not connection.in_transaction
