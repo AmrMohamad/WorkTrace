@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from worktrace.adapters.base import ActorIdentity, NormalizedRecord, SnapshotAdapter
+from worktrace.adapters.jira import JiraAdapter
 from worktrace.config import AppConfig
 from worktrace.db.repository import EvidenceRepository
 from worktrace.domain.enums import Completeness
@@ -17,6 +18,7 @@ from worktrace.domain.models import (
     SourceIdentity,
 )
 from worktrace.errors import SourceError
+from worktrace.importers.jira_staging import jira_pages
 from worktrace.participation import canonical_role
 
 
@@ -173,7 +175,7 @@ def record_to_object(
 
 def import_snapshot(
     app: AppConfig,
-    adapter: SnapshotAdapter,
+    adapter: SnapshotAdapter | JiraAdapter,
     repository: EvidenceRepository,
     *,
     source: str,
@@ -201,6 +203,8 @@ def import_snapshot(
     }
     if scope_details:
         scope.update(scope_details)
+    if isinstance(adapter, JiraAdapter):
+        scope.update(adapter.import_scope())
     run_id = repository.start_sync_run(
         app.id,
         source,
@@ -226,7 +230,12 @@ def import_snapshot(
     if limitations or selection_events:
         selection_biased = True
     try:
-        for page in adapter.iter_pages():
+        pages_iterator = (
+            jira_pages(adapter, repository, run_id)
+            if isinstance(adapter, JiraAdapter)
+            else adapter.iter_pages()
+        )
+        for page in pages_iterator:
             if page.source_kind != source or page.source_instance != source_instance:
                 raise SourceError("adapter page escaped its configured source scope")
             if any(
@@ -313,6 +322,9 @@ def import_snapshot(
         Completeness.SELECTION_BIASED.value if selection_biased else Completeness.COMPLETE.value
     )
     repository.finish_sync_run(run_id, "complete", completeness)
+    if isinstance(adapter, JiraAdapter):
+        with repository.connection:
+            repository.connection.execute("DELETE FROM jira_import_stage WHERE run_id=?", (run_id,))
     if finish_session:
         repository.finish_import_session(
             session_id,

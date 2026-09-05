@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from worktrace.errors import ConfigurationError, ScopeViolation
 from worktrace.paths import default_config_path, default_data_directory
@@ -102,6 +103,7 @@ class WorkTraceConfig:
     identity: IdentityConfig
     apps: tuple[AppConfig, ...]
     config_path: Path
+    employment_timezone: str = "UTC"
 
     @property
     def database_path(self) -> Path:
@@ -223,6 +225,13 @@ def load_config(path: Path | None = None) -> WorkTraceConfig:
     employment_to = _date(employment.get("to"), "employment.to")
     if employment_from > employment_to:
         raise ConfigurationError("employment.from must not be after employment.to")
+    employment_timezone = employment.get("timezone", "UTC")
+    if not isinstance(employment_timezone, str):
+        raise ConfigurationError("employment.timezone must be an IANA timezone")
+    try:
+        ZoneInfo(employment_timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ConfigurationError("employment.timezone must be an IANA timezone") from exc
 
     display_name = str(identity_raw.get("display_name", "")).strip()
     if not display_name:
@@ -237,6 +246,7 @@ def load_config(path: Path | None = None) -> WorkTraceConfig:
         data_directory=directory,
         employment_from=employment_from,
         employment_to=employment_to,
+        employment_timezone=employment_timezone,
         identity=IdentityConfig(
             display_name=display_name,
             git_author_emails=_strings(

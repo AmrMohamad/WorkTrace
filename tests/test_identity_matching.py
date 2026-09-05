@@ -245,7 +245,7 @@ def test_jira_resolves_configured_account_once_before_pages() -> None:
     ) as client:
         adapter = JiraAdapter(_jira_config(), client)
         assert adapter.resolved_self_id() == "configured-account"
-        list(adapter.iter_pages())
+        list(adapter.iter_discovery_pages())
         assert adapter.resolved_self_id() == "configured-account"
     assert sum(request.url.path == "/rest/api/3/myself" for request in requests) == 1
 

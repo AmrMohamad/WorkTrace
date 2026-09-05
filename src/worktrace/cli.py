@@ -434,6 +434,7 @@ def _verified_repair_identities(
         ) as client:
             adapter = JiraAdapter(
                 JiraConfig(
+                    work_timezone=configuration.employment_timezone,
                     base_url=credentials.base_url,
                     source_instance=_source_instance(app_id, "jira", credentials.base_url),
                     app_id=app_id,
@@ -734,6 +735,7 @@ def import_jira(
         ) as client:
             adapter = JiraAdapter(
                 JiraConfig(
+                    work_timezone=configuration.employment_timezone,
                     base_url=credentials.base_url,
                     source_instance=source_instance,
                     app_id=app_id,
@@ -1086,6 +1088,7 @@ def import_all(
                         configured_app,
                         JiraAdapter(
                             JiraConfig(
+                                work_timezone=configuration.employment_timezone,
                                 base_url=jira_auth.base_url,
                                 source_instance=source_instance,
                                 app_id=app_id,

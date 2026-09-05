@@ -19,6 +19,7 @@ class ParticipationRole(StrEnum):
     """Observed roles; a role is a relationship, never an ownership claim."""
 
     AUTHOR = "author"
+    EDITOR = "editor"
     COMMITTER = "committer"
     CO_AUTHOR = "co_author"
     REVIEWER = "reviewer"

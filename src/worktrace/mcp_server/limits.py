@@ -105,6 +105,7 @@ _STABLE_IDENTIFIER_LIST_KEYS = frozenset(
         "decision_ids",
         "evidence_ids",
         "module_evidence_ids",
+        "period_evidence_ids",
         "supporting_evidence_ids",
         "title_supporting_evidence_ids",
         "unsupported_member_ids",
@@ -170,7 +171,9 @@ def redact_output(value: object, *, field_name: str | None = None) -> JsonValue:
 
 
 def _serialized_size(value: JsonValue) -> int:
-    return len(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    # Count the conservative escaped representation too: truncation markers and
+    # provider Unicode must not put an otherwise bounded response over the cap.
+    return len(json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 
 
 def _longest_string(

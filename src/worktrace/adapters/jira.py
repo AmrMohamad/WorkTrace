@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from urllib.parse import quote, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -59,6 +60,13 @@ class JiraConfig:
     max_hierarchy_depth: int = 3
     page_size: int = 100
     retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY
+    work_timezone: str = "UTC"
+
+
+@dataclass(frozen=True, slots=True)
+class JiraDiscoveryQuery:
+    reason: str
+    jql: str
 
 
 def _mapping(value: object) -> Mapping[str, object]:
@@ -114,12 +122,19 @@ class JiraAdapter:
         self._client = client
         self._redactor = Redactor(config.email_key)
         self._identity_verified = False
-        self._window_start = datetime.combine(config.date_from, time.min, tzinfo=UTC)
+        try:
+            self._work_zone = ZoneInfo(config.work_timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ConfigurationError("invalid Jira work timezone") from exc
+        self._provider_zone: ZoneInfo | None = None
+        self._window_start = datetime.combine(
+            config.date_from, time.min, tzinfo=self._work_zone
+        ).astimezone(UTC)
         self._window_end = datetime.combine(
             config.date_to + timedelta(days=1),
             time.min,
-            tzinfo=UTC,
-        )
+            tzinfo=self._work_zone,
+        ).astimezone(UTC)
 
     @staticmethod
     def _origin(url: str) -> tuple[str, str, int | None]:
@@ -141,21 +156,17 @@ class JiraAdapter:
             raise ConfigurationError("Jira credentials require HTTPS outside loopback tests")
         return parts.scheme, parts.hostname.casefold(), parts.port
 
-    def iter_pages(self) -> Iterator[NormalizedPage]:
+    def iter_discovery_pages(self) -> Iterator[NormalizedPage]:
         observed_at = observed_now()
         self._verify_identity()
-        unique_issues: dict[str, object] = {}
-        for query_index, (jql, enforce_window) in enumerate(self._discovery_queries()):
-            for cursor, next_cursor, is_last, raw_issues in self._search_pages(jql):
-                page_issues: list[object] = []
+        for query_index, query in enumerate(self._discovery_queries()):
+            for cursor, next_cursor, is_last, raw_issues in self._search_pages(query.jql):
+                records: list[NormalizedRecord] = []
                 for issue in raw_issues:
-                    issue_id, _ = self._issue_identity(issue)
-                    if enforce_window and not self._issue_in_window(issue):
-                        continue
-                    if issue_id in unique_issues:
-                        continue
-                    unique_issues[issue_id] = issue
-                    page_issues.append(issue)
+                    record = self._normalize_issue(issue, observed_at)
+                    records.append(
+                        replace(record, payload={**record.payload, "selected_by": [query.reason]})
+                    )
                 yield NormalizedPage(
                     source_kind="jira",
                     source_instance=self._config.source_instance,
@@ -165,15 +176,27 @@ class JiraAdapter:
                         f"{query_index}:{next_cursor}" if next_cursor is not None else None
                     ),
                     is_last=is_last,
-                    records=tuple(
-                        self._normalize_issue(issue, observed_at) for issue in page_issues
+                    records=tuple(records),
+                    limitations=(
+                        ("Jira calendar timezone unavailable; discovery uses expanded day bounds.",)
+                        if self._provider_zone is None
+                        else ()
                     ),
                 )
-        for issue in unique_issues.values():
-            issue_id, issue_key = self._issue_identity(issue)
-            yield from self._comment_pages(issue_id, issue_key, observed_at)
-            yield from self._changelog_pages(issue_id, issue_key, observed_at)
-        yield from self._hierarchy_pages(tuple(unique_issues.values()), observed_at)
+
+    def issue_context_pages(self, issue: NormalizedRecord) -> Iterator[NormalizedPage]:
+        issue_id = issue.identity.external_id
+        issue_key = str(issue.payload["key"])
+        observed_at = issue.observation.observed_at
+        yield from self._comment_pages(issue_id, issue_key, observed_at)
+        yield from self._changelog_pages(issue_id, issue_key, observed_at)
+
+    def import_scope(self) -> dict[str, str]:
+        return {"activity_policy_version": "1", "work_timezone": self._config.work_timezone}
+
+    @property
+    def work_window(self) -> tuple[datetime, datetime]:
+        return self._window_start, self._window_end
 
     def resolved_self_id(self) -> str:
         """Verify and return the configured account before accepting its actor policy."""
@@ -197,38 +220,43 @@ class JiraAdapter:
         if _text(document.get("accountId")) != self._config.account_id:
             raise ScopeViolation("Jira authenticated identity does not match configured account")
         self._identity_verified = True
+        zone = _text(document.get("timeZone"))
+        if zone:
+            try:
+                self._provider_zone = ZoneInfo(zone)
+            except (ZoneInfoNotFoundError, ValueError):
+                self._provider_zone = None
 
-    def _discovery_queries(self) -> tuple[tuple[str, bool], ...]:
+    def _discovery_queries(self) -> tuple[JiraDiscoveryQuery, ...]:
         quoted_projects = ", ".join(f'"{key}"' for key in self._projects)
-        exclusive_end = self._config.date_to + timedelta(days=1)
-        window = (
-            f'updated >= "{self._config.date_from.isoformat()}" '
-            f'AND updated < "{exclusive_end.isoformat()}"'
-        )
-        queries: list[tuple[str, bool]] = []
+        zone = self._provider_zone or ZoneInfo("UTC")
+        # Provider functions are day-granular. Expand a day at both edges; event
+        # timestamps, not latest issue versions, determine the local period.
+        start = (self._window_start.astimezone(zone).date() - timedelta(days=1)).isoformat()
+        end = (self._window_end.astimezone(zone).date() + timedelta(days=1)).isoformat()
+        queries: list[JiraDiscoveryQuery] = []
         if self._config.account_id is not None:
             account = f'"{self._config.account_id}"'
-            start = self._config.date_from.isoformat()
-            end = exclusive_end.isoformat()
-            participation = (
-                f'issue in updatedBy({account}, "{start}", "{end}") '
-                f"OR reporter = {account} OR creator = {account} OR assignee = {account} "
-                f'OR assignee WAS {account} DURING ("{start}", "{end}")'
-            )
-            queries.append(
+            for reason, selection in (
+                ("historical_updater", f'issue in updatedBy({account}, "{start}", "{end}")'),
+                ("historical_assignee", f'assignee WAS {account} DURING ("{start}", "{end}")'),
                 (
-                    f"project in ({quoted_projects}) AND {window} "
-                    f"AND ({participation}) ORDER BY key ASC",
-                    True,
+                    "creator_created",
+                    f'creator = {account} AND created >= "{start}" AND created < "{end}"',
+                ),
+            ):
+                queries.append(
+                    JiraDiscoveryQuery(
+                        reason, f"project in ({quoted_projects}) AND {selection} ORDER BY key ASC"
+                    )
                 )
-            )
         for offset in range(0, len(self._discovered_keys), self._config.exact_key_chunk_size):
             keys = self._discovered_keys[offset : offset + self._config.exact_key_chunk_size]
             quoted_keys = ", ".join(f'"{key}"' for key in keys)
             queries.append(
-                (
+                JiraDiscoveryQuery(
+                    "exact_key",
                     f"project in ({quoted_projects}) AND key in ({quoted_keys}) ORDER BY key ASC",
-                    False,
                 )
             )
         return tuple(queries)
@@ -274,20 +302,24 @@ class JiraAdapter:
                 break
             cursor = next_cursor
 
-    def _hierarchy_pages(
+    def hierarchy_pages(
         self,
-        discovered_issues: tuple[object, ...],
+        discovered_issues: Iterable[NormalizedRecord],
         observed_at: str,
+        known_issue: Callable[[str], bool],
     ) -> Iterator[NormalizedPage]:
-        seen_ids = {self._issue_identity(issue)[0] for issue in discovered_issues}
+        seen_ids: set[str] = set()
         queued: set[str] = set()
         queue: list[tuple[str, str | None, int]] = []
+        omitted = False
         for issue in discovered_issues:
-            parent = _mapping(_mapping(issue).get("fields")).get("parent")
-            parent_value = _mapping(parent)
+            parent_value = _mapping(issue.payload.get("parent"))
             parent_id = _identifier(parent_value.get("id"))
             target = parent_id or _text(parent_value.get("key"))
-            if target is not None and target not in seen_ids and target not in queued:
+            if target is not None and not known_issue(target) and target not in queued:
+                if len(queue) >= self._config.max_hierarchy_roots:
+                    omitted = True
+                    continue
                 queue.append((target, parent_id, 1))
                 queued.add(target)
 
@@ -325,7 +357,7 @@ class JiraAdapter:
                 continue
             document = self._response_mapping(response, "hierarchy issue")
             issue_id, issue_key = self._issue_identity(document)
-            if issue_id in seen_ids:
+            if issue_id in seen_ids or known_issue(issue_id):
                 continue
             seen_ids.add(issue_id)
             hydrated += 1
@@ -348,6 +380,17 @@ class JiraAdapter:
             ):
                 queue.append((parent_target, parent_id, depth + 1))
                 queued.add(parent_target)
+        if queue or omitted:
+            yield NormalizedPage(
+                "jira",
+                self._config.source_instance,
+                "issue_hierarchy",
+                None,
+                None,
+                True,
+                (),
+                limitations=("Jira hierarchy context limited by the configured root bound.",),
+            )
 
     def _issue_identity(self, raw_issue: object) -> tuple[str, str]:
         issue = _mapping(raw_issue)
@@ -431,7 +474,6 @@ class JiraAdapter:
             normalized = (
                 self._normalize_changelog(issue_id, issue_key, history, observed_at)
                 for history in histories
-                if self._subresource_in_window(history, ("created",), "changelog")
             )
             records = tuple(record for record in normalized if record is not None)
             next_start = self._next_offset(document, start_at, len(histories), "changelog")
@@ -492,19 +534,22 @@ class JiraAdapter:
         resource: str,
     ) -> bool:
         item = _mapping(value)
-        raw = next(
-            (_text(item.get(field)) for field in timestamp_fields if _text(item.get(field))),
-            None,
-        )
-        if raw is None:
+        values = [_text(item.get(field)) for field in timestamp_fields if _text(item.get(field))]
+        if not values:
             raise PermanentSourceError(f"Jira {resource} omitted its scope timestamp")
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            raise PermanentSourceError(f"Jira {resource} returned an invalid timestamp") from None
-        if parsed.tzinfo is None:
-            raise PermanentSourceError(f"Jira {resource} timestamp omitted its timezone")
-        return self._window_start <= parsed.astimezone(UTC) < self._window_end
+        timestamps: list[datetime] = []
+        for raw in values:
+            assert raw is not None
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                raise PermanentSourceError(
+                    f"Jira {resource} returned an invalid timestamp"
+                ) from None
+            if parsed.tzinfo is None:
+                raise PermanentSourceError(f"Jira {resource} timestamp omitted its timezone")
+            timestamps.append(parsed.astimezone(UTC))
+        return any(self._window_start <= value < self._window_end for value in timestamps)
 
     def _normalize_comment(
         self,
@@ -519,7 +564,7 @@ class JiraAdapter:
             raise PermanentSourceError("Jira comment omitted its stable identity")
         author = _mapping(comment.get("author"))
         account_id = _text(author.get("accountId"))
-        participations = (
+        participations: tuple[Participation, ...] = (
             (
                 Participation(
                     actor=actor_identity(
@@ -537,6 +582,23 @@ class JiraAdapter:
             if account_id
             else ()
         )
+        editor = _mapping(comment.get("updateAuthor"))
+        editor_id = _text(editor.get("accountId"))
+        if editor_id and comment.get("updated") != comment.get("created"):
+            participations += (
+                Participation(
+                    actor=actor_identity(
+                        source_kind="jira",
+                        source_instance=self._config.source_instance,
+                        redactor=self._redactor,
+                        provider_actor_id=editor_id,
+                        display_name=_text(editor.get("displayName")),
+                        email=_text(editor.get("emailAddress")),
+                    ),
+                    role=ParticipationRole.EDITOR,
+                    effective_from=_text(comment.get("updated")),
+                ),
+            )
         return build_record(
             source_kind="jira",
             source_instance=self._config.source_instance,
@@ -547,6 +609,12 @@ class JiraAdapter:
             source_updated_at=_text(comment.get("updated")) or _text(comment.get("created")),
             payload={
                 "id": comment_id,
+                "activity_policy_version": 1,
+                "observation_semantics": "current_source_version",
+                "creation_author_id": account_id,
+                "update_author_id": editor_id,
+                "historical_wording_unknown": comment.get("created") != comment.get("updated"),
+                "work_timezone": self._config.work_timezone,
                 "issue_id": issue_id,
                 "issue_key": issue_key,
                 "body": extract_jira_text(comment.get("body")),
@@ -652,6 +720,8 @@ class JiraAdapter:
             source_updated_at=created_at,
             payload={
                 "id": history_id,
+                "activity_policy_version": 1,
+                "observation_semantics": "current_source_version",
                 "issue_id": issue_id,
                 "issue_key": issue_key,
                 "created_at": created_at,
@@ -684,19 +754,6 @@ class JiraAdapter:
             effective_from=effective_from,
             effective_to=effective_to,
         )
-
-    def _issue_in_window(self, raw_issue: object) -> bool:
-        raw_updated = _text(_mapping(_mapping(raw_issue).get("fields")).get("updated"))
-        if raw_updated is None:
-            raise PermanentSourceError("Jira issue omitted its scope timestamp")
-        try:
-            parsed = datetime.fromisoformat(raw_updated.replace("Z", "+00:00"))
-        except ValueError:
-            raise PermanentSourceError("Jira issue returned an invalid timestamp") from None
-        if parsed.tzinfo is None:
-            raise PermanentSourceError("Jira issue timestamp omitted its timezone")
-        timestamp = parsed.astimezone(UTC)
-        return self._window_start <= timestamp < self._window_end
 
     def _normalize_issue(self, raw_issue: object, observed_at: str) -> NormalizedRecord:
         issue = _mapping(raw_issue)
@@ -789,6 +846,11 @@ class JiraAdapter:
             source_updated_at=_text(fields.get("updated")),
             payload={
                 "id": issue_id,
+                "activity_policy_version": 1,
+                "observation_semantics": "current_source_version",
+                "work_timezone": self._config.work_timezone,
+                "provider_timezone": str(self._provider_zone) if self._provider_zone else None,
+                "selection_time_precision": "expanded_calendar_days",
                 "key": key,
                 "project_key": project_key,
                 "summary": summary,

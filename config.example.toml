@@ -6,6 +6,8 @@ directory = "~/Library/Application Support/WorkTrace"
 [employment]
 from = "2024-01-01"
 to = "2026-08-26"
+# Optional IANA work calendar; omitted means UTC. Jira events are stored as UTC instants.
+timezone = "UTC"
 
 [identity]
 display_name = "Your Name"

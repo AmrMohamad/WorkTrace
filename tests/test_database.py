@@ -15,9 +15,9 @@ def test_init_and_migrations_are_idempotent(tmp_path: Path) -> None:
     database_path = tmp_path / "worktrace.sqlite3"
     connection = connect(database_path)
     try:
-        assert migrate(connection, database_path) == [1, 2, 3, 4]
+        assert migrate(connection, database_path) == [1, 2, 3, 4, 5]
         assert migrate(connection, database_path) == []
-        assert user_version(connection) == 4
+        assert user_version(connection) == 5
 
         tables = {
             str(row[0])
@@ -161,7 +161,7 @@ def test_database_readiness_is_read_only_and_distinguishes_schema_drift(
     try:
         ready = database_readiness(read_only)
         assert ready.status is DatabaseReadinessStatus.READY
-        assert ready.current_version == ready.supported_version == 4
+        assert ready.current_version == ready.supported_version == 5
     finally:
         read_only.close()
 

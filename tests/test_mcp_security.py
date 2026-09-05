@@ -23,6 +23,23 @@ from worktrace.packets.schema import PHASE4_QUESTIONS
 from worktrace.services import export_app
 
 
+def test_unicode_response_limit_counts_escaped_serialization() -> None:
+    result = enforce_total_limit({"text": "é" * 19_000})
+    for ensure_ascii in (False, True):
+        assert (
+            len(json.dumps(result, ensure_ascii=ensure_ascii, separators=(",", ":")))
+            <= MAX_RESPONSE_CHARS
+        )
+    assert result["response_truncated"] is True
+
+
+def test_period_citation_ids_are_not_redacted_as_phone_numbers() -> None:
+    identifier = "obs:123456789012345678901234"
+    assert enforce_total_limit({"period_evidence_ids": [identifier]}) == {
+        "period_evidence_ids": [identifier]
+    }
+
+
 def _config(tmp_path: Path) -> WorkTraceConfig:
     return WorkTraceConfig(
         schema_version=1,
