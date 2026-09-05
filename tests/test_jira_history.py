@@ -97,6 +97,7 @@ def invoke(config: Path, *args: str, success: bool = True) -> dict:
         assert result.exit_code == 0, f"{result.output}\n{result.exception!r}"
     else:
         assert result.exit_code != 0, result.output
+        assert result.stdout, f"{result.output}\n{result.exception!r}"
     return json.loads(result.stdout) if result.stdout else {}
 
 
@@ -295,7 +296,9 @@ def test_interrupted_discovery_retains_previous_authority_and_is_not_reused(
             assert connection.execute("SELECT COUNT(*) FROM jira_import_stage").fetchone()[0] == 1
         fixture.fail_discovery = False
         fixture.issues = [issue(3)]
-        invoke(workspace, "import", "all", "sample")
+        preview = invoke(workspace, "import", "all", "sample", success=False)
+        token = preview["sources"][0]["selector_replacement"]["proposal_token"]
+        invoke(workspace, "import", "all", "sample", "--approve-selector-replacement", token)
     with connect(config.database_path) as connection:
         assert {r["external_id"] for r in search(PacketBuilder(connection, config))["results"]} == {
             "3"
