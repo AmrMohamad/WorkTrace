@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import sys
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -32,6 +33,7 @@ from worktrace.db.authority import (
     run_is_authoritative,
 )
 from worktrace.db.connection import connect
+from worktrace.db.import_status import readiness_contract, source_readiness
 from worktrace.db.migrations import backup_database, migrate
 from worktrace.db.queries import search_evidence, source_status
 from worktrace.db.readiness import DatabaseReadinessStatus, database_readiness
@@ -46,9 +48,9 @@ from worktrace.identity import (
     prepare_identity_import,
     repair_identities,
 )
+from worktrace.importers.jira_selection import select_jira_seeds
 from worktrace.importers.orchestrator import ImportResult, import_snapshot
 from worktrace.linking.builder import rebuild_references
-from worktrace.linking.extractors import extract_jira_keys
 from worktrace.local_security import email_hmac_key
 from worktrace.normalize.redaction import Redactor
 from worktrace.paths import ensure_private_directory
@@ -613,34 +615,6 @@ def _commit_seed_scope(selection: _CommitSeedSelection) -> dict[str, JsonValue]:
     return details
 
 
-def _discovered_jira_keys(
-    repository: EvidenceRepository, configured_app: AppConfig, *, limit: int = 500
-) -> tuple[str, ...]:
-    """Derive exact in-scope Jira keys from the authoritative current ledger view."""
-
-    app_config = configured_app
-    keys: set[str] = set()
-    for row in repository.current_observations(app_config.id):
-        text = f"{row['title'] or ''}\n{row['body_text'] or ''}"
-        keys.update(extract_jira_keys(text, app_config))
-        try:
-            data = json.loads(str(row["data_json"]))
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(data, dict):
-            continue
-        pending = data.get("_pending_references", [])
-        if not isinstance(pending, list):
-            continue
-        for raw in pending:
-            if not isinstance(raw, dict) or raw.get("target_source") != "jira":
-                continue
-            key = str(raw.get("target_external_id", "")).upper()
-            if app_config.allows_jira_key(key):
-                keys.add(key)
-    return tuple(sorted(keys)[:limit])
-
-
 def _import_summary(
     result: ImportResult,
     *,
@@ -654,6 +628,368 @@ def _import_summary(
     return summary
 
 
+def _run_source_import(
+    configuration: WorkTraceConfig,
+    repository: EvidenceRepository,
+    configured_app: AppConfig,
+    source: str,
+    identifier: Path | int | None,
+    start: date,
+    end: date,
+    session_id: str,
+    *,
+    explicit_jira_keys: tuple[str, ...] = (),
+    approve_selector_replacement: str | None = None,
+    previous_results: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Establish preparation and identity before creating a real source run."""
+    app_id = configured_app.id
+    target = (
+        str(identifier)
+        if source == "gitlab"
+        else (_source_instance(app_id, source, identifier) if source == "git" else "jira")
+    )
+    reason = "identity_policy_unready"
+    started = False
+    try:
+        with ExitStack() as stack:
+            credentials = None
+            if source in {"jira", "gitlab"}:
+                reason = "credentials_missing"
+                credentials = jira_credentials() if source == "jira" else gitlab_credentials()
+                if credentials is None:
+                    raise ConfigurationError("Provider credentials are not configured")
+                reason = "identity_missing"
+                if source == "jira" and not configuration.identity.jira_account_id:
+                    raise ConfigurationError("Jira identity is required")
+                if source == "gitlab" and (
+                    configuration.identity.gitlab_user_id is None
+                    and configuration.identity.gitlab_username is None
+                ):
+                    raise ConfigurationError("GitLab identity is required")
+            reason = "identity_policy_unready"
+            key = email_hmac_key(configuration.data_directory, create=False)
+            with repository.connection:
+                prepare_identity_import(repository.connection, configuration, key, app_id)
+            scope: dict[str, JsonValue] = {}
+            counts: dict[str, int] = {}
+            own_ids = _git_self_ids(configuration, key)
+            reason = "source_configuration_invalid"
+            adapter: LocalGitAdapter | GitLabAdapter | JiraAdapter
+            if source == "git":
+                assert isinstance(identifier, Path)
+                scoped_repo = configured_app.assert_repo_scope(identifier)
+                source_instance = _source_instance(app_id, source, scoped_repo)
+                adapter = LocalGitAdapter(
+                    LocalGitConfig(
+                        repository_path=scoped_repo,
+                        allowed_root=scoped_repo,
+                        source_instance=source_instance,
+                        app_id=app_id,
+                        email_key=key,
+                        jira_project_keys=configured_app.jira_project_keys,
+                        date_from=start,
+                        date_to=end,
+                    )
+                )
+                scope["selection_reasons"] = ["configured repository read-only snapshot"]
+            elif source == "gitlab":
+                assert credentials is not None and isinstance(identifier, int)
+                source_instance = _source_instance(app_id, source, identifier)
+                seeds = _relevant_git_commit_shas(repository, app_id)
+                counts = {
+                    "relevant_local_commit_shas": len(seeds.values),
+                    "relevant_local_commit_shas_total": seeds.total_count,
+                    "relevant_local_commit_shas_dropped": seeds.dropped_count,
+                }
+                reason = "origin_invalid"
+                client = stack.enter_context(
+                    httpx.Client(
+                        base_url=credentials.base_url,
+                        headers={"PRIVATE-TOKEN": credentials.token, "Accept": "application/json"},
+                        timeout=30,
+                    )
+                )
+                gitlab_adapter = GitLabAdapter(
+                    GitLabConfig(
+                        base_url=credentials.base_url,
+                        source_instance=source_instance,
+                        app_id=app_id,
+                        project_id=identifier,
+                        email_key=key,
+                        date_from=start,
+                        date_to=end,
+                        jira_project_keys=configured_app.jira_project_keys,
+                        user_id=configuration.identity.gitlab_user_id,
+                        username=configuration.identity.gitlab_username,
+                        production_environments=configured_app.production_environments,
+                        relevant_commit_shas=seeds.values,
+                    ),
+                    client,
+                )
+                reason = "identity_unverified"
+                own_ids = gitlab_adapter.resolved_self_ids(own_ids)
+                adapter = gitlab_adapter
+                scope = {
+                    **_commit_seed_scope(seeds),
+                    "selection_reasons": [
+                        "configured identity authored/assigned/reviewed merge requests",
+                        "current self-authored/coauthored local commits",
+                    ],
+                }
+            else:
+                assert credentials is not None
+                selection = select_jira_seeds(
+                    repository,
+                    configured_app,
+                    configuration=configuration,
+                    explicit_keys=explicit_jira_keys,
+                )
+                counts = {"exact_jira_keys": len(selection.keys)}
+                source_instance = _source_instance(app_id, source, credentials.base_url)
+                reason = "origin_invalid"
+                # This branch has JiraCredentials; keep the union's narrowing explicit.
+                jira_auth = jira_credentials()
+                assert jira_auth is not None
+                client = stack.enter_context(
+                    httpx.Client(
+                        base_url=jira_auth.base_url,
+                        auth=(jira_auth.email, jira_auth.token),
+                        headers={"Accept": "application/json"},
+                        timeout=30,
+                    )
+                )
+                jira_adapter = JiraAdapter(
+                    JiraConfig(
+                        work_timezone=configuration.employment_timezone,
+                        base_url=jira_auth.base_url,
+                        source_instance=source_instance,
+                        app_id=app_id,
+                        project_keys=configured_app.jira_project_keys,
+                        email_key=key,
+                        date_from=start,
+                        date_to=end,
+                        account_id=configuration.identity.jira_account_id,
+                        discovered_issue_keys=selection.keys,
+                    ),
+                    client,
+                )
+                reason = "identity_unverified"
+                own_ids = {jira_adapter.resolved_self_id()}
+                adapter = jira_adapter
+                scope = {
+                    "selection_policy_version": 3,
+                    "exact_jira_key_count": len(selection.keys),
+                    "jira_seed_selection": cast(JsonValue, selection.as_dict()),
+                    "limitations": selection.as_dict()["limitations"],
+                    "selection_reasons": [
+                        "configured identity participation",
+                        "selected exact-key roots",
+                    ],
+                    "known_selection_bias": "Deleted or inaccessible activity may be unavailable.",
+                }
+            if source in {"jira", "gitlab"}:
+                retained = source_readiness(repository.connection, app_id)
+                upstream: list[dict[str, object]] = []
+                for item in previous_results or []:
+                    previous_source = str(item.get("source"))
+                    if previous_source not in ({"git", "gitlab"} if source == "jira" else {"git"}):
+                        continue
+                    if item.get("status") == "complete":
+                        continue
+                    expected_instance = item.get("source_instance") or (
+                        item.get("target")
+                        if previous_source == "git"
+                        else _source_instance(app_id, "gitlab", item.get("target"))
+                    )
+                    known = retained.get(previous_source, {}).get(
+                        "last_authoritative_snapshots", []
+                    )
+                    snapshots = (
+                        [
+                            snapshot
+                            for snapshot in known
+                            if isinstance(snapshot, dict)
+                            and snapshot.get("source_instance") == expected_instance
+                        ]
+                        if isinstance(known, list)
+                        else []
+                    )
+                    upstream.append(
+                        {
+                            "source": previous_source,
+                            "run_id": item.get("run_id"),
+                            "status": item.get("status"),
+                            "snapshots": snapshots,
+                            "input_authority": "previous_authority"
+                            if snapshots
+                            else "no_authoritative_input",
+                        }
+                    )
+                scope["seed_input_authority"] = (
+                    cast(JsonValue, upstream) if upstream else "current_authority"
+                )
+                if upstream:
+                    previous_limitations = scope.get("limitations", [])
+                    scope["limitations"] = [
+                        *(previous_limitations if isinstance(previous_limitations, list) else []),
+                        "An upstream import did not complete; discovery uses only explicitly "
+                        "retained authority where available.",
+                    ]
+            started = True
+            if source == "jira":
+                result = import_snapshot(
+                    configured_app,
+                    adapter,
+                    repository,
+                    source=source,
+                    source_instance=source_instance,
+                    date_from=start,
+                    date_to=end,
+                    self_actor_ids=own_ids,
+                    import_session_id=session_id,
+                    finish_session=False,
+                    scope_details=scope,
+                    configuration=configuration,
+                    expected_selector_replacement=approve_selector_replacement,
+                )
+            else:
+                result = import_snapshot(
+                    configured_app,
+                    adapter,
+                    repository,
+                    source=source,
+                    source_instance=source_instance,
+                    date_from=start,
+                    date_to=end,
+                    self_actor_ids=own_ids,
+                    import_session_id=session_id,
+                    finish_session=False,
+                    scope_details=scope,
+                )
+        return {
+            **_import_summary(result, discovery_counts=counts),
+            "source": source,
+            "target": target,
+            "source_instance": source_instance,
+            **({"jira_seed_selection": scope["jira_seed_selection"]} if source == "jira" else {}),
+            "seed_input_authority": scope.get("seed_input_authority"),
+            "preflight": {"stage": "preflight", "status": "ready", "reason": None},
+            "requested_scope": {
+                "app_id": app_id,
+                "source": source,
+                "date_from": start.isoformat(),
+                "date_to": end.isoformat(),
+            },
+            **readiness_contract(
+                repository.connection,
+                app_id,
+                source,
+                result.status,
+                result.completeness,
+                source_instance=source_instance,
+            ),
+        }
+    except (WorkTraceError, httpx.HTTPError, ValueError) as exc:
+        if started:
+            raise
+        # Provider exception text can include credentials or private URLs; persist a category only.
+        if isinstance(exc, httpx.HTTPError):
+            reason = "provider_unavailable"
+        return {
+            "session_id": session_id,
+            "source": source,
+            "target": target,
+            "source_instance": None,
+            "stage": "preflight",
+            "status": "not_started",
+            "reason": reason,
+            "completeness": "unknown",
+            "preflight": {"stage": "preflight", "status": "not_started", "reason": reason},
+            "requested_scope": {
+                "app_id": app_id,
+                "source": source,
+                "date_from": start.isoformat(),
+                "date_to": end.isoformat(),
+            },
+            **readiness_contract(repository.connection, app_id, source, "not_started", "unknown"),
+        }
+
+
+def _finish_source_session(
+    repository: EvidenceRepository,
+    session_id: str,
+    results: list[dict[str, object]],
+    *,
+    derived_current: bool = False,
+) -> str:
+    complete = all(item["status"] == "complete" for item in results)
+    overall = (
+        "complete"
+        if complete
+        else "partial"
+        if any(item["status"] == "complete" for item in results)
+        else "failed"
+    )
+    for item in results:
+        item["derived_data"] = "current" if derived_current else "requires_rebuild"
+        if derived_current and item["coverage"] == "no-known-omissions":
+            item["agent_review"] = "available"
+    repository.finish_import_session(
+        session_id, overall, {"sources": cast(list[JsonValue], results)}
+    )
+    return overall
+
+
+def _import_one(
+    app_id: str,
+    source: str,
+    identifier: Path | int | None,
+    date_from: str | None,
+    date_to: str | None,
+    config: Path | None,
+    *,
+    jira_keys: tuple[str, ...] = (),
+    approve_selector_replacement: str | None = None,
+) -> None:
+    configuration, connection, repository = _open(config)
+    session_id: str | None = None
+    try:
+        start, end = _window(configuration, date_from, date_to)
+        configured_app = configuration.app(app_id)
+        _assert_no_scope_contraction(repository, app_id, start, end)
+        if source == "gitlab" and not configured_app.allows_gitlab_project(cast(int, identifier)):
+            raise WorkTraceError("GitLab project is not configured for this app")
+        session_id = repository.create_import_session(configured_app, start, end)
+        result = _run_source_import(
+            configuration,
+            repository,
+            configured_app,
+            source,
+            identifier,
+            start,
+            end,
+            session_id,
+            explicit_jira_keys=jira_keys,
+            approve_selector_replacement=approve_selector_replacement,
+        )
+        _finish_source_session(repository, session_id, [result])
+        _emit(result)
+        if result["status"] != "complete":
+            raise typer.Exit(2)
+    except typer.Exit:
+        raise
+    except Exception:
+        if session_id is not None:
+            connection.rollback()
+            repository.finish_import_session(
+                session_id, "failed", {"error": "source_execution_failed"}
+            )
+        raise
+    finally:
+        connection.close()
+
+
 @import_app.command("git")
 def import_git(
     app_id: str,
@@ -662,49 +998,7 @@ def import_git(
     date_to: DateArgument = None,
     config: ConfigOption = None,
 ) -> None:
-    configuration, connection, repository = _open(config)
-    try:
-        start, end = _window(configuration, date_from, date_to)
-        configured_app = configuration.app(app_id)
-        _assert_no_scope_contraction(repository, app_id, start, end)
-        scoped_repo = configured_app.assert_repo_scope(repo)
-        source_instance = _source_instance(app_id, "git", scoped_repo)
-        key = email_hmac_key(configuration.data_directory, create=False)
-        with connection:
-            prepare_identity_import(connection, configuration, key, app_id)
-        adapter = LocalGitAdapter(
-            LocalGitConfig(
-                repository_path=scoped_repo,
-                allowed_root=scoped_repo,
-                source_instance=source_instance,
-                app_id=app_id,
-                email_key=key,
-                jira_project_keys=configured_app.jira_project_keys,
-                date_from=start,
-                date_to=end,
-            )
-        )
-        result = import_snapshot(
-            configured_app,
-            adapter,
-            repository,
-            source="git",
-            source_instance=source_instance,
-            date_from=start,
-            date_to=end,
-            self_actor_ids=_git_self_ids(configuration, key),
-            scope_details={"selection_reasons": ["configured repository read-only snapshot"]},
-        )
-        _emit(
-            _import_summary(
-                result,
-                discovery_reasons=("configured repository read-only snapshot",),
-            )
-        )
-        if result.status != "complete":
-            raise typer.Exit(2)
-    finally:
-        connection.close()
+    _import_one(app_id, "git", repo, date_from, date_to, config)
 
 
 @import_app.command("jira")
@@ -713,79 +1007,21 @@ def import_jira(
     date_from: DateArgument = None,
     date_to: DateArgument = None,
     config: ConfigOption = None,
+    jira_key: Annotated[list[str] | None, typer.Option("--jira-key")] = None,
+    approve_selector_replacement: Annotated[
+        str | None, typer.Option("--approve-selector-replacement")
+    ] = None,
 ) -> None:
-    configuration, connection, repository = _open(config)
-    try:
-        start, end = _window(configuration, date_from, date_to)
-        configured_app = configuration.app(app_id)
-        _assert_no_scope_contraction(repository, app_id, start, end)
-        credentials = jira_credentials()
-        if credentials is None:
-            raise WorkTraceError("Jira credentials are not configured")
-        key = email_hmac_key(configuration.data_directory, create=False)
-        source_instance = _source_instance(app_id, "jira", credentials.base_url)
-        with connection:
-            prepare_identity_import(connection, configuration, key, app_id)
-        discovered_keys = _discovered_jira_keys(repository, configured_app)
-        with httpx.Client(
-            base_url=credentials.base_url,
-            auth=(credentials.email, credentials.token),
-            headers={"Accept": "application/json"},
-            timeout=30,
-        ) as client:
-            adapter = JiraAdapter(
-                JiraConfig(
-                    work_timezone=configuration.employment_timezone,
-                    base_url=credentials.base_url,
-                    source_instance=source_instance,
-                    app_id=app_id,
-                    project_keys=configured_app.jira_project_keys,
-                    email_key=key,
-                    date_from=start,
-                    date_to=end,
-                    account_id=configuration.identity.jira_account_id,
-                    discovered_issue_keys=discovered_keys,
-                ),
-                client,
-            )
-            result = import_snapshot(
-                configured_app,
-                adapter,
-                repository,
-                source="jira",
-                source_instance=source_instance,
-                date_from=start,
-                date_to=end,
-                self_actor_ids=(
-                    {configuration.identity.jira_account_id}
-                    if configuration.identity.jira_account_id
-                    else set()
-                ),
-                scope_details={
-                    "exact_jira_key_count": len(discovered_keys),
-                    "selection_reasons": [
-                        "configured identity participation",
-                        "current ledger exact-key references",
-                    ],
-                    "known_selection_bias": (
-                        "comment-only participation may not be discoverable by provider search"
-                    ),
-                },
-            )
-        _emit(
-            _import_summary(
-                result,
-                discovery_counts={"exact_jira_keys": len(discovered_keys)},
-                discovery_reasons=(
-                    "configured identity participation",
-                    "current ledger exact-key references",
-                ),
-            )
-        )
-        if result.status != "complete":
-            raise typer.Exit(2)
-    finally:
-        connection.close()
+    _import_one(
+        app_id,
+        "jira",
+        None,
+        date_from,
+        date_to,
+        config,
+        jira_keys=tuple(jira_key or ()),
+        approve_selector_replacement=approve_selector_replacement,
+    )
 
 
 @import_app.command("gitlab")
@@ -796,84 +1032,7 @@ def import_gitlab(
     date_to: DateArgument = None,
     config: ConfigOption = None,
 ) -> None:
-    configuration, connection, repository = _open(config)
-    try:
-        start, end = _window(configuration, date_from, date_to)
-        configured_app = configuration.app(app_id)
-        _assert_no_scope_contraction(repository, app_id, start, end)
-        if not configured_app.allows_gitlab_project(project_id):
-            raise WorkTraceError("GitLab project is not configured for this app")
-        credentials = gitlab_credentials()
-        if credentials is None:
-            raise WorkTraceError("GitLab credentials are not configured")
-        if (
-            configuration.identity.gitlab_user_id is None
-            and configuration.identity.gitlab_username is None
-        ):
-            raise WorkTraceError("GitLab identity is required for user-scoped discovery")
-        key = email_hmac_key(configuration.data_directory, create=False)
-        commit_seeds = _relevant_git_commit_shas(repository, app_id)
-        with connection:
-            prepare_identity_import(connection, configuration, key, app_id)
-        with httpx.Client(
-            base_url=credentials.base_url,
-            headers={"PRIVATE-TOKEN": credentials.token, "Accept": "application/json"},
-            timeout=30,
-        ) as client:
-            source_instance = _source_instance(app_id, "gitlab", project_id)
-            adapter = GitLabAdapter(
-                GitLabConfig(
-                    base_url=credentials.base_url,
-                    source_instance=source_instance,
-                    app_id=app_id,
-                    project_id=project_id,
-                    email_key=key,
-                    date_from=start,
-                    date_to=end,
-                    jira_project_keys=configured_app.jira_project_keys,
-                    user_id=configuration.identity.gitlab_user_id,
-                    username=configuration.identity.gitlab_username,
-                    production_environments=configured_app.production_environments,
-                    relevant_commit_shas=commit_seeds.values,
-                ),
-                client,
-            )
-            own_ids = adapter.resolved_self_ids(_git_self_ids(configuration, key))
-            result = import_snapshot(
-                configured_app,
-                adapter,
-                repository,
-                source="gitlab",
-                source_instance=source_instance,
-                date_from=start,
-                date_to=end,
-                self_actor_ids=own_ids,
-                scope_details={
-                    **_commit_seed_scope(commit_seeds),
-                    "selection_reasons": [
-                        "configured identity authored/assigned/reviewed merge requests",
-                        "current self-authored/coauthored local commits",
-                    ],
-                },
-            )
-        _emit(
-            _import_summary(
-                result,
-                discovery_counts={
-                    "relevant_local_commit_shas": len(commit_seeds.values),
-                    "relevant_local_commit_shas_total": commit_seeds.total_count,
-                    "relevant_local_commit_shas_dropped": commit_seeds.dropped_count,
-                },
-                discovery_reasons=(
-                    "configured identity authored/assigned/reviewed merge requests",
-                    "current self-authored/coauthored local commits",
-                ),
-            )
-        )
-        if result.status != "complete":
-            raise typer.Exit(2)
-    finally:
-        connection.close()
+    _import_one(app_id, "gitlab", project_id, date_from, date_to, config)
 
 
 @import_app.command("all")
@@ -882,275 +1041,56 @@ def import_all(
     date_from: DateArgument = None,
     date_to: DateArgument = None,
     config: ConfigOption = None,
+    jira_key: Annotated[list[str] | None, typer.Option("--jira-key")] = None,
+    approve_selector_replacement: Annotated[
+        str | None, typer.Option("--approve-selector-replacement")
+    ] = None,
 ) -> None:
-    """Import every configured source and report partial sources explicitly."""
+    """Import configured sources independently, retaining each preparation result."""
     configuration, connection, repository = _open(config)
-    start, end = _window(configuration, date_from, date_to)
-    configured_app = configuration.app(app_id)
-    _assert_no_scope_contraction(repository, app_id, start, end)
-    try:
-        key = email_hmac_key(configuration.data_directory, create=False)
-        with connection:
-            prepare_identity_import(connection, configuration, key, app_id)
-    except BaseException:
-        connection.close()
-        raise
-    session_id = repository.create_import_session(configured_app, start, end)
+    session_id: str | None = None
     results: list[dict[str, object]] = []
     try:
-        key = email_hmac_key(configuration.data_directory, create=False)
-        for repo_path in configured_app.repo_paths:
-            source_instance = _source_instance(app_id, "git", repo_path)
-            adapter = LocalGitAdapter(
-                LocalGitConfig(
-                    repository_path=repo_path,
-                    allowed_root=repo_path,
-                    source_instance=source_instance,
-                    app_id=app_id,
-                    email_key=key,
-                    jira_project_keys=configured_app.jira_project_keys,
-                    date_from=start,
-                    date_to=end,
-                )
-            )
-            result = import_snapshot(
-                configured_app,
-                adapter,
-                repository,
-                source="git",
-                source_instance=source_instance,
-                date_from=start,
-                date_to=end,
-                self_actor_ids=_git_self_ids(configuration, key),
-                import_session_id=session_id,
-                finish_session=False,
-                scope_details={"selection_reasons": ["configured repository read-only snapshot"]},
-            )
+        start, end = _window(configuration, date_from, date_to)
+        configured_app = configuration.app(app_id)
+        _assert_no_scope_contraction(repository, app_id, start, end)
+        session_id = repository.create_import_session(configured_app, start, end)
+        sources: list[tuple[str, Path | int | None]] = [
+            *(("git", repo) for repo in configured_app.repo_paths),
+            *(("gitlab", project) for project in configured_app.gitlab_project_ids),
+            *([("jira", None)] if configured_app.jira_project_keys else []),
+        ]
+        for source, identifier in sources:
             results.append(
-                _import_summary(
-                    result,
-                    discovery_reasons=("configured repository read-only snapshot",),
+                _run_source_import(
+                    configuration,
+                    repository,
+                    configured_app,
+                    source,
+                    identifier,
+                    start,
+                    end,
+                    session_id,
+                    explicit_jira_keys=tuple(jira_key or ()),
+                    approve_selector_replacement=approve_selector_replacement,
+                    previous_results=results,
                 )
             )
-
-        commit_seeds = _relevant_git_commit_shas(repository, app_id)
-        gitlab_auth = gitlab_credentials()
-        gitlab_identity_configured = (
-            configuration.identity.gitlab_user_id is not None
-            or configuration.identity.gitlab_username is not None
-        )
-        for project_id in configured_app.gitlab_project_ids:
-            source_instance = _source_instance(app_id, "gitlab", project_id)
-            if gitlab_auth is None or not gitlab_identity_configured:
-                failure = (
-                    "GitLab credentials are not configured"
-                    if gitlab_auth is None
-                    else "GitLab identity is required for user-scoped discovery"
+            # Keep preparation audit durable even if a later source or rebuild is interrupted.
+            with connection:
+                connection.execute(
+                    "UPDATE import_sessions SET summary_json=? WHERE id=?",
+                    (json.dumps({"sources": results}, sort_keys=True), session_id),
                 )
-                run_id = repository.start_sync_run(
-                    app_id,
-                    "gitlab",
-                    source_instance,
-                    {
-                        "project_id": project_id,
-                        "selection_policy_version": 2,
-                        "date_from": start.isoformat(),
-                        "date_to": end.isoformat(),
-                    },
-                    session_id,
-                )
-                repository.finish_sync_run(
-                    run_id,
-                    "failed",
-                    "source_unavailable",
-                    failure,
-                )
-                results.append(
-                    {
-                        "run_id": run_id,
-                        "source": "gitlab",
-                        "project_id": project_id,
-                        "status": "source_unavailable",
-                        "completeness": "partial",
-                        "discovery_counts": {
-                            "relevant_local_commit_shas": len(commit_seeds.values),
-                            "relevant_local_commit_shas_total": commit_seeds.total_count,
-                            "relevant_local_commit_shas_dropped": commit_seeds.dropped_count,
-                        },
-                        "discovery_reasons": [
-                            "configured identity authored/assigned/reviewed merge requests",
-                            "current self-authored/coauthored local commits",
-                        ],
-                    }
-                )
-                continue
-            with httpx.Client(
-                base_url=gitlab_auth.base_url,
-                headers={"PRIVATE-TOKEN": gitlab_auth.token, "Accept": "application/json"},
-                timeout=30,
-            ) as client:
-                gitlab_adapter = GitLabAdapter(
-                    GitLabConfig(
-                        base_url=gitlab_auth.base_url,
-                        source_instance=source_instance,
-                        app_id=app_id,
-                        project_id=project_id,
-                        email_key=key,
-                        date_from=start,
-                        date_to=end,
-                        jira_project_keys=configured_app.jira_project_keys,
-                        user_id=configuration.identity.gitlab_user_id,
-                        username=configuration.identity.gitlab_username,
-                        production_environments=configured_app.production_environments,
-                        relevant_commit_shas=commit_seeds.values,
-                    ),
-                    client,
-                )
-                own_ids = gitlab_adapter.resolved_self_ids(_git_self_ids(configuration, key))
-                result = import_snapshot(
-                    configured_app,
-                    gitlab_adapter,
-                    repository,
-                    source="gitlab",
-                    source_instance=source_instance,
-                    date_from=start,
-                    date_to=end,
-                    self_actor_ids=own_ids,
-                    import_session_id=session_id,
-                    finish_session=False,
-                    scope_details={
-                        **_commit_seed_scope(commit_seeds),
-                        "selection_reasons": [
-                            "configured identity authored/assigned/reviewed merge requests",
-                            "current self-authored/coauthored local commits",
-                        ],
-                    },
-                )
-                results.append(
-                    _import_summary(
-                        result,
-                        discovery_counts={
-                            "relevant_local_commit_shas": len(commit_seeds.values),
-                            "relevant_local_commit_shas_total": commit_seeds.total_count,
-                            "relevant_local_commit_shas_dropped": commit_seeds.dropped_count,
-                        },
-                        discovery_reasons=(
-                            "configured identity authored/assigned/reviewed merge requests",
-                            "current self-authored/coauthored local commits",
-                        ),
-                    )
-                )
-
-        discovered_keys = _discovered_jira_keys(repository, configured_app)
-        jira_auth = jira_credentials()
-        if configured_app.jira_project_keys:
-            if jira_auth is None:
-                run_id = repository.start_sync_run(
-                    app_id,
-                    "jira",
-                    _source_instance(app_id, "jira", "configured"),
-                    {
-                        "project_keys": list(configured_app.jira_project_keys),
-                        "selection_policy_version": 2,
-                        "date_from": start.isoformat(),
-                        "date_to": end.isoformat(),
-                    },
-                    session_id,
-                )
-                repository.finish_sync_run(
-                    run_id,
-                    "failed",
-                    "source_unavailable",
-                    "Jira credentials are not configured",
-                )
-                results.append(
-                    {
-                        "run_id": run_id,
-                        "source": "jira",
-                        "status": "source_unavailable",
-                        "completeness": "partial",
-                        "discovery_counts": {"exact_jira_keys": len(discovered_keys)},
-                        "discovery_reasons": [
-                            "configured identity participation",
-                            "current ledger exact-key references",
-                        ],
-                    }
-                )
-            else:
-                source_instance = _source_instance(app_id, "jira", jira_auth.base_url)
-                with httpx.Client(
-                    base_url=jira_auth.base_url,
-                    auth=(jira_auth.email, jira_auth.token),
-                    headers={"Accept": "application/json"},
-                    timeout=30,
-                ) as client:
-                    result = import_snapshot(
-                        configured_app,
-                        JiraAdapter(
-                            JiraConfig(
-                                work_timezone=configuration.employment_timezone,
-                                base_url=jira_auth.base_url,
-                                source_instance=source_instance,
-                                app_id=app_id,
-                                project_keys=configured_app.jira_project_keys,
-                                email_key=key,
-                                date_from=start,
-                                date_to=end,
-                                account_id=configuration.identity.jira_account_id,
-                                discovered_issue_keys=discovered_keys,
-                            ),
-                            client,
-                        ),
-                        repository,
-                        source="jira",
-                        source_instance=source_instance,
-                        date_from=start,
-                        date_to=end,
-                        self_actor_ids=(
-                            {configuration.identity.jira_account_id}
-                            if configuration.identity.jira_account_id
-                            else set()
-                        ),
-                        import_session_id=session_id,
-                        finish_session=False,
-                        scope_details={
-                            "exact_jira_key_count": len(discovered_keys),
-                            "selection_reasons": [
-                                "configured identity participation",
-                                "current ledger exact-key references",
-                            ],
-                            "known_selection_bias": (
-                                "comment-only participation may not be discoverable by provider "
-                                "search"
-                            ),
-                        },
-                    )
-                    results.append(
-                        _import_summary(
-                            result,
-                            discovery_counts={"exact_jira_keys": len(discovered_keys)},
-                            discovery_reasons=(
-                                "configured identity participation",
-                                "current ledger exact-key references",
-                            ),
-                        )
-                    )
-
-        reference_count = rebuild_references(configured_app, repository)
-        candidate_count = rebuild_candidates(app_id, repository)
-        with connection:
-            finish_identity_rebuild(connection, configuration, app_id)
-        complete = all(result.get("status") == "complete" for result in results)
-        overall = "complete" if complete else "partial"
-        repository.finish_import_session(
-            session_id,
-            overall,
-            {
-                "sources": cast(list[JsonValue], results),
-                "complete_sources": sum(r.get("status") == "complete" for r in results),
-                "reference_count": reference_count,
-                "candidate_count": candidate_count,
-            },
+        derived_current = bool(identity_policy_status(connection, configuration, app_id)["valid"])
+        reference_count = candidate_count = 0
+        if derived_current:
+            reference_count = rebuild_references(configured_app, repository)
+            candidate_count = rebuild_candidates(app_id, repository)
+            with connection:
+                finish_identity_rebuild(connection, configuration, app_id)
+        overall = _finish_source_session(
+            repository, session_id, results, derived_current=derived_current
         )
         _emit(
             {
@@ -1161,19 +1101,20 @@ def import_all(
                 "candidate_count": candidate_count,
             }
         )
-        if not complete:
+        if overall != "complete":
             raise typer.Exit(2)
     except typer.Exit:
         raise
-    except Exception as exc:
-        repository.finish_import_session(
-            session_id,
-            "partial",
-            {
-                "sources": cast(list[JsonValue], results),
-                "error": (str(exc)[:500] or type(exc).__name__),
-            },
-        )
+    except Exception:
+        if session_id is not None:
+            connection.rollback()
+            repository.finish_import_session(
+                session_id,
+                "partial"
+                if any(item.get("status") == "complete" for item in results)
+                else "failed",
+                {"sources": cast(list[JsonValue], results), "error": "source_or_rebuild_failed"},
+            )
         raise
     finally:
         connection.close()

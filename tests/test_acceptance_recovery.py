@@ -574,6 +574,9 @@ def test_import_all_uses_git_then_gitlab_then_jira_discovery(
         def resolved_self_ids(self, configured_email_hashes: set[str]) -> set[str]:
             return {"7", *configured_email_hashes}
 
+        def resolved_self_id(self) -> str:
+            return "account-7"
+
         def iter_pages(self) -> Iterator[NormalizedPage]:
             yield NormalizedPage(
                 source_kind=self.source,

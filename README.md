@@ -122,6 +122,34 @@ uv run worktrace status APP_ID
 `import all` rebuilds references and candidates; separate source imports require an explicit
 `worktrace rebuild all APP_ID`. The six-tool MCP contract and cursor encoding are unchanged.
 
+## Discovery coverage and selector upgrades
+
+Jira exact-key discovery uses exact personal participation, canonically confirmed contributions,
+and explicit `--jira-key DEMO-42` inputs. Related collaborator/branch records remain context;
+Git ancestry is not a discovery traversal. All selected keys use existing provider chunks, with
+discovered/selected/omitted counts, policy and supporting observation IDs. Confirmed historical
+records can seed recovery, explicitly labelled as historical rather than current evidence.
+
+Jira selector v3 requires the full configured interval. If a replacement would remove current
+records, the import remains nonauthoritative and reports removed object IDs, affected confirmed
+contributions and a `proposal_token`. Review that impact before authorizing a repeat:
+
+```console
+uv run worktrace import all APP_ID --approve-selector-replacement PROPOSAL_TOKEN
+```
+
+The token binds the previous observations, proposed membership and confirmed contribution state;
+changed impact requires a new preview. Observations and human decisions are never deleted by this
+upgrade. Old selectors remain explicitly labelled until a successful approved replacement.
+
+Missing credentials, invalid origins and unverified identities are session preflight failures,
+not new provider source instances. `status` exposes current preparation separately from retained
+authoritative snapshots; a later successful attempt clears current failure without deleting its
+audit. Execution, coverage, snapshot activation, derived readiness and review availability are
+separate facts. Successful execution does not mean every historical record was recoverable.
+Provider/HMAC secrets and hostile Git overrides are stripped from local Git subprocesses; this
+reduces credential exposure but is not a process sandbox.
+
 ## Human review UI
 
 Launch the keyboard-first, read-only evidence workstation in an interactive terminal:

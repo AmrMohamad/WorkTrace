@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import subprocess
 from collections.abc import Iterator, Sequence
@@ -21,6 +20,7 @@ from worktrace.adapters.base import (
     ReferenceStrength,
 )
 from worktrace.errors import ConfigurationError, PermanentSourceError, ScopeViolation
+from worktrace.git_environment import local_git_environment
 from worktrace.normalize import (
     Redactor,
     actor_identity,
@@ -84,25 +84,13 @@ class LocalGitAdapter:
     def _run_git_bytes(self, args: Sequence[str]) -> bytes:
         if not args or args[0] not in _READ_ONLY_COMMANDS:
             raise PermanentSourceError("Attempted unsupported Git operation")
-        environment = os.environ.copy()
-        for variable in (
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_COMMON_DIR",
-            "GIT_CONFIG",
-            "GIT_CONFIG_COUNT",
-            "GIT_DIR",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_WORK_TREE",
-        ):
-            environment.pop(variable, None)
-        environment["GIT_OPTIONAL_LOCKS"] = "0"
-        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
+        if args[0] == "show":
+            args = ("show", "--no-ext-diff", "--no-textconv", *args[1:])
         try:
             result = subprocess.run(
                 ["git", "--no-optional-locks", "-C", str(self._repo), *args],
                 cwd=self._repo,
-                env=environment,
+                env=local_git_environment(),
                 check=False,
                 capture_output=True,
                 timeout=self._config.command_timeout_seconds,

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from worktrace.adapters.base import ActorIdentity, NormalizedRecord, SnapshotAdapter
 from worktrace.adapters.jira import JiraAdapter
-from worktrace.config import AppConfig
+from worktrace.config import AppConfig, WorkTraceConfig
 from worktrace.db.repository import EvidenceRepository
 from worktrace.domain.enums import Completeness
 from worktrace.domain.models import (
@@ -18,6 +19,7 @@ from worktrace.domain.models import (
     SourceIdentity,
 )
 from worktrace.errors import SourceError
+from worktrace.importers.jira_selection import selector_replacement_proposal
 from worktrace.importers.jira_staging import jira_pages
 from worktrace.participation import canonical_role
 
@@ -33,6 +35,8 @@ class ImportResult:
     completeness: str = Completeness.COMPLETE.value
     limitations: tuple[str, ...] = ()
     selection_events: tuple[dict[str, JsonValue], ...] = field(default_factory=tuple)
+    selector_replacement: dict[str, JsonValue] | None = None
+    jira_key_retrieval: dict[str, JsonValue] | None = None
 
 
 def _timestamp(value: str | None) -> datetime | None:
@@ -187,6 +191,8 @@ def import_snapshot(
     import_session_id: str | None = None,
     finish_session: bool = True,
     scope_details: dict[str, JsonValue] | None = None,
+    configuration: WorkTraceConfig | None = None,
+    expected_selector_replacement: str | None = None,
 ) -> ImportResult:
     """Persist a full snapshot one page per transaction.
 
@@ -195,6 +201,14 @@ def import_snapshot(
     """
     if date_from > date_to:
         raise ValueError("date_from must not be after date_to")
+    guarded_selector = (
+        source == "jira" and (scope_details or {}).get("selection_policy_version") == 3
+    )
+    if guarded_selector and (
+        configuration is None
+        or (date_from, date_to) != (configuration.employment_from, configuration.employment_to)
+    ):
+        raise SourceError("Jira selector v3 requires the full configured work interval")
     session_id = import_session_id or repository.create_import_session(app, date_from, date_to)
     scope: dict[str, JsonValue] = {
         "date_from": date_from.isoformat(),
@@ -318,10 +332,103 @@ def import_snapshot(
             limitations=tuple(limitations),
             selection_events=tuple(selection_events),
         )
+    key_retrieval: dict[str, JsonValue] | None = None
+    if guarded_selector:
+        selected_keys: set[str] = set()
+        seed_selection = scope.get("jira_seed_selection")
+        if isinstance(seed_selection, dict):
+            seeds = seed_selection.get("seeds", [])
+            if isinstance(seeds, list):
+                selected_keys = {
+                    str(seed["key"]) for seed in seeds if isinstance(seed, dict) and "key" in seed
+                }
+        observed_keys = {
+            str(row[0])
+            for row in repository.connection.execute(
+                "SELECT json_extract(data_json, '$.key') FROM observations WHERE sync_run_id=?",
+                (run_id,),
+            )
+            if row[0] is not None
+        }
+        missing_keys = sorted(selected_keys - observed_keys)
+        key_retrieval = {
+            "requested_count": len(selected_keys),
+            "observed_count": len(selected_keys & observed_keys),
+            "unreturned_count": len(missing_keys),
+            "unreturned_keys": list[JsonValue](missing_keys),
+        }
+        if missing_keys:
+            limitations.append(
+                f"Jira search did not return {len(missing_keys)} selected keys; "
+                "deletion or absence of work is not established."
+            )
+            selection_biased = True
+        with repository.connection:
+            row = repository.connection.execute(
+                "SELECT progress_json FROM sync_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            key_progress = json.loads(str(row[0]))
+            key_progress["jira_key_retrieval"] = key_retrieval
+            key_progress["limitations"] = list(limitations)
+            repository.connection.execute(
+                "UPDATE sync_runs SET progress_json=? WHERE id=?",
+                (json.dumps(key_progress), run_id),
+            )
     completeness = (
         Completeness.SELECTION_BIASED.value if selection_biased else Completeness.COMPLETE.value
     )
-    repository.finish_sync_run(run_id, "complete", completeness)
+    proposal = None
+    # Page persistence is complete. Release its read cursor snapshot before
+    # acquiring the writer lock for the proposal-check/activation transaction.
+    repository.connection.commit()
+    with repository.connection:
+        if guarded_selector:
+            assert configuration is not None
+            repository.connection.execute(
+                "UPDATE apps SET read_revision=read_revision WHERE id=?", (app.id,)
+            )
+            proposal = selector_replacement_proposal(
+                repository, configuration, app.id, source_instance, run_id
+            )
+            if proposal is not None and proposal["proposal_token"] != expected_selector_replacement:
+                row = repository.connection.execute(
+                    "SELECT progress_json FROM sync_runs WHERE id=?", (run_id,)
+                ).fetchone()
+                progress_value = json.loads(str(row[0]))
+                progress_value["selector_replacement"] = proposal
+                repository.connection.execute(
+                    "UPDATE sync_runs SET progress_json=? WHERE id=?",
+                    (json.dumps(progress_value), run_id),
+                )
+                message = "selector_replacement_requires_approval"
+                repository.finish_sync_run(run_id, "failed", Completeness.PARTIAL.value, message)
+                if finish_session:
+                    repository.finish_import_session(
+                        session_id,
+                        "partial",
+                        {
+                            "source": source,
+                            "selector_replacement": proposal,
+                            "snapshot": "previous_retained",
+                        },
+                    )
+                return ImportResult(
+                    session_id,
+                    run_id,
+                    "partial",
+                    pages,
+                    records,
+                    message,
+                    completeness=Completeness.PARTIAL.value,
+                    limitations=tuple(limitations),
+                    selection_events=tuple(selection_events),
+                    selector_replacement=proposal,
+                    jira_key_retrieval=key_retrieval,
+                )
+            if proposal is not None:
+                proposal["requires_approval"] = False
+                proposal["approved"] = True
+        repository.finish_sync_run(run_id, "complete", completeness)
     if isinstance(adapter, JiraAdapter):
         with repository.connection:
             repository.connection.execute("DELETE FROM jira_import_stage WHERE run_id=?", (run_id,))
@@ -340,4 +447,6 @@ def import_snapshot(
         completeness=completeness,
         limitations=tuple(limitations),
         selection_events=tuple(selection_events),
+        selector_replacement=proposal,
+        jira_key_retrieval=key_retrieval,
     )

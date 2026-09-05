@@ -35,6 +35,7 @@ from worktrace.db.authority import (
     run_is_authoritative,
     selection_policy_version,
 )
+from worktrace.db.import_status import legacy_preflight_ids, source_readiness
 from worktrace.domain.enums import ClaimStatus, ObservationType
 from worktrace.errors import NotFound, ScopeViolation
 from worktrace.identity import identity_policy_status
@@ -480,18 +481,21 @@ class PacketBuilder:
 
     def source_status(self, app_id: str) -> dict[str, object]:
         app = self._app(app_id)
+        readiness = source_readiness(self.connection, app_id)
+        legacy = legacy_preflight_ids(self.connection, app_id)
+        exclude = f"AND id NOT IN ({','.join('?' for _ in legacy)})" if legacy else ""
         rows = list(
             self.connection.execute(
-                """
+                f"""
                 SELECT * FROM (
                     SELECT sr.*, ROW_NUMBER() OVER (
                         PARTITION BY source, source_instance
                         ORDER BY COALESCE(completed_at, started_at) DESC, id DESC
                     ) AS position
-                    FROM sync_runs sr WHERE app_id=?
+                    FROM sync_runs sr WHERE app_id=? {exclude}
                 ) WHERE position=1 ORDER BY source, source_instance
                 """,
-                (app_id,),
+                (app_id, *sorted(legacy)),
             )
         )
         expected: set[str] = set()
@@ -503,10 +507,12 @@ class PacketBuilder:
             expected.add("gitlab")
         grouped: dict[str, list[sqlite3.Row]] = {}
         for row in rows:
+            if str(row["id"]) in legacy:
+                continue
             grouped.setdefault(str(row["source"]), []).append(row)
         result: dict[str, object] = {}
         now = datetime.now(UTC)
-        for source in sorted(expected | set(grouped)):
+        for source in sorted(expected | set(grouped) | set(readiness)):
             source_rows = grouped.get(source, [])
             instances: list[dict[str, object]] = []
             for row in source_rows:
@@ -547,6 +553,11 @@ class PacketBuilder:
                     else []
                 )
                 complete = authoritative and completeness_is_full_scope(str(row["completeness"]))
+                if source == "jira" and selection_version != 3:
+                    limitations.append(
+                        "Jira discovery uses legacy selector policy; "
+                        "full configured-range reimport required."
+                    )
                 instances.append(
                     {
                         "source_instance": str(row["source_instance"]),
@@ -564,6 +575,7 @@ class PacketBuilder:
                     }
                 )
             result[source] = {
+                **readiness.get(source, {}),
                 "complete": bool(instances) and all(bool(item["complete"]) for item in instances),
                 "stale": not instances or any(bool(item["stale"]) for item in instances),
                 "instances": instances,
