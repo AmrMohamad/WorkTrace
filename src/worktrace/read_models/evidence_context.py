@@ -54,27 +54,69 @@ def _source_instances(app: AppConfig, source: str) -> frozenset[str]:
     return frozenset()
 
 
-def _metadata_identifiers(external_id: str, metadata: Mapping[str, object]) -> set[str]:
-    result = {external_id}
-    for key in (
-        "key",
-        "issue_key",
-        "project_key",
-        "parent_key",
-        "parent_issue_key",
-        "parent_identifier",
-    ):
-        value = metadata.get(key)
-        if isinstance(value, str) and value:
-            result.add(value)
-    return result
+_JIRA_ROOT_KINDS = frozenset({"jira_issue"})
+_JIRA_SUBRESOURCE_KINDS = frozenset(
+    {"issue_comment", "issue_changelog", "jira_comment", "jira_changelog"}
+)
+
+
+def _configured_jira_issue_key(app: AppConfig, value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(_JIRA_ISSUE_KEY.fullmatch(value.upper()))
+        and app.allows_jira_key(value.upper())
+    )
+
+
+def _jira_root_in_scope(app: AppConfig, external_id: str, metadata: Mapping[str, object]) -> bool:
+    """Validate a root issue from its own identity, never its parent metadata."""
+
+    key = metadata.get("key")
+    if key is not None:
+        return _configured_jira_issue_key(app, key)
+    issue_key = metadata.get("issue_key")
+    if issue_key is not None:
+        return _configured_jira_issue_key(app, issue_key)
+    # Some older normalized root records kept only the textual Jira key as the
+    # external identifier.  Numeric Jira IDs cannot establish project scope.
+    return _configured_jira_issue_key(app, external_id)
+
+
+def _jira_parent_binding_in_scope(
+    connection: sqlite3.Connection,
+    app: AppConfig,
+    *,
+    source_instance: str,
+    issue_id: object,
+) -> bool:
+    if not isinstance(issue_id, str) or not issue_id:
+        return False
+    row = connection.execute(
+        f"""
+        WITH {authoritative_current_observation_ctes()}
+        SELECT parent.external_id,
+               {_scope_metadata_json("current", "parent")} AS metadata_json
+        FROM source_objects parent
+        LEFT JOIN authoritative_current_observations current
+          ON current.source_object_id=parent.id
+        WHERE parent.app_id=? AND parent.source='jira'
+          AND parent.source_instance=? AND parent.kind='jira_issue'
+          AND parent.external_id=?
+        """,
+        (app.id, source_instance, issue_id),
+    ).fetchone()
+    return row is not None and _jira_root_in_scope(
+        app, str(row["external_id"]), _json_object(row["metadata_json"])
+    )
 
 
 def _object_in_scope(
     app: AppConfig,
     *,
+    connection: sqlite3.Connection,
     source: str,
     source_instance: str,
+    kind: str,
     external_id: str,
     metadata_json: object,
 ) -> bool:
@@ -99,12 +141,20 @@ def _object_in_scope(
             return int(project_id) in app.gitlab_project_ids
         return False
     if source == "jira":
-        # A comment/changelog/subresource can be scoped by an exact parent
-        # issue key.  Never infer scope from a URL or a substring.
-        return any(
-            bool(_JIRA_ISSUE_KEY.fullmatch(identifier.upper()))
-            and app.allows_jira_key(identifier.upper())
-            for identifier in _metadata_identifiers(external_id, metadata)
+        if kind in _JIRA_ROOT_KINDS:
+            return _jira_root_in_scope(app, external_id, metadata)
+        if kind not in _JIRA_SUBRESOURCE_KINDS:
+            return False
+        owning_key = metadata.get("issue_key")
+        if owning_key is not None:
+            return _configured_jira_issue_key(app, owning_key)
+        # A parent key is only a fallback for an actual Jira subresource with
+        # no own issue identity and an exact stored parent-object binding.
+        return _jira_parent_binding_in_scope(
+            connection,
+            app,
+            source_instance=source_instance,
+            issue_id=metadata.get("issue_id"),
         )
     return False
 
@@ -138,6 +188,7 @@ def _scope_metadata_json(current_alias: str, object_alias: str) -> str:
         "parent_key",
         "parent_issue_key",
         "parent_identifier",
+        "issue_id",
         "project_id",
     )
     current_fields = ", ".join(
@@ -216,8 +267,10 @@ def describe_object(builder: PacketBuilder, app_id: str, object_id: str) -> dict
         raise NotFound("source object not found")
     if not _object_in_scope(
         app,
+        connection=builder.connection,
         source=str(row["source"]),
         source_instance=str(row["source_instance"]),
+        kind=str(row["kind"]),
         external_id=str(row["external_id"]),
         metadata_json=row["metadata_json"],
     ):
@@ -395,17 +448,23 @@ def _endpoint(row: sqlite3.Row, prefix: str, object_id: str) -> dict[str, object
     }
 
 
-def _reference_is_allowed(app: AppConfig, row: sqlite3.Row) -> bool:
+def _reference_is_allowed(
+    app: AppConfig, connection: sqlite3.Connection, row: sqlite3.Row
+) -> bool:
     if not _object_in_scope(
         app,
+        connection=connection,
         source=str(row["from_source"]),
         source_instance=str(row["from_source_instance"]),
+        kind=str(row["from_kind"]),
         external_id=str(row["from_external_id"]),
         metadata_json=row["from_metadata_json"],
     ) or not _object_in_scope(
         app,
+        connection=connection,
         source=str(row["to_source"]),
         source_instance=str(row["to_source_instance"]),
+        kind=str(row["to_kind"]),
         external_id=str(row["to_external_id"]),
         metadata_json=row["to_metadata_json"],
     ):
@@ -488,7 +547,7 @@ def scan_relations(
     )
 
     def project(row: sqlite3.Row) -> dict[str, object] | None:
-        if not _reference_is_allowed(app, row):
+        if not _reference_is_allowed(app, builder.connection, row):
             return None
         from_id, to_id = str(row["from_object_id"]), str(row["to_object_id"])
         relationship_type = str(row["relationship_type"])

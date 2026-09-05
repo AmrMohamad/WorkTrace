@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -8,10 +9,14 @@ from tests.test_mapped_references import _app, _object, _worktrace_config
 from tests.test_mcp_security import _mcp_state
 from worktrace.candidates.builder import GENERATOR_VERSION
 from worktrace.candidates.decisions import append_decision, undo_decision
+from worktrace.config import AppConfig, IdentityConfig, WorkTraceConfig
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
 from worktrace.db.repository import EvidenceRepository, source_instance_id
+from worktrace.domain.enums import Completeness
+from worktrace.domain.models import NormalizedObject, SourceIdentity
 from worktrace.errors import ScopeViolation
+from worktrace.mcp_server.tools import WorkTraceTools
 from worktrace.packets.builder import PacketBuilder
 from worktrace.read_models.evidence_context import (
     _decision_mentions_object,
@@ -20,6 +25,135 @@ from worktrace.read_models.evidence_context import (
     scan_memberships,
     scan_relations,
 )
+
+
+def _jira_context_tools(
+    tmp_path: Path,
+) -> tuple[WorkTraceTools, dict[str, str], Path]:
+    database = tmp_path / "jira-context.sqlite3"
+    app = AppConfig(
+        id="sample_jira",
+        name="Sample Jira",
+        market="",
+        business_type="fixture",
+        jira_project_keys=("DEMO",),
+        gitlab_project_ids=(),
+        repo_paths=(),
+        jira_key_patterns=(),
+        production_environments=(),
+        release_tag_patterns=(),
+        ignored_paths=(),
+    )
+    config = WorkTraceConfig(
+        schema_version=1,
+        data_directory=tmp_path,
+        employment_from=date(2024, 1, 1),
+        employment_to=date(2026, 12, 31),
+        identity=IdentityConfig("Fixture", (), (), None, None, None),
+        apps=(app,),
+        config_path=tmp_path / "jira.toml",
+    )
+    connection = connect(database)
+    try:
+        migrate(connection, database)
+        repository = EvidenceRepository(connection)
+        repository.ensure_apps(config)
+        instance = "jira-fixture"
+        run = repository.start_sync_run(
+            app.id,
+            "jira",
+            instance,
+            {"mode": "fixture", "selection_policy_version": 2},
+        )
+
+        def record(kind: str, external_id: str, data: dict[str, object]) -> NormalizedObject:
+            return NormalizedObject(
+                identity=SourceIdentity("jira", instance, kind, external_id),
+                app_id=app.id,
+                title=external_id,
+                body_text=None,
+                source_updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+                actors=(),
+                participations=(),
+                pending_references=(),
+                data=data,  # type: ignore[arg-type]
+                completeness=Completeness.COMPLETE,
+            )
+
+        repository.store_page(
+            run,
+            [
+                record("jira_issue", "100", {"key": "DEMO-1"}),
+                record(
+                    "jira_issue",
+                    "200",
+                    {"key": "OTHER-1", "parent_key": "DEMO-1"},
+                ),
+                record("jira_issue", "DEMO-9", {}),
+                record(
+                    "issue_comment",
+                    "100:out",
+                    {"issue_id": "100", "issue_key": "DEMO-1"},
+                ),
+                record(
+                    "issue_changelog",
+                    "100:in",
+                    {"issue_id": "100", "issue_key": "DEMO-1"},
+                ),
+                record(
+                    "issue_comment",
+                    "100:conflict",
+                    {
+                        "issue_id": "100",
+                        "issue_key": "OTHER-1",
+                        "parent_key": "DEMO-1",
+                    },
+                ),
+                record(
+                    "issue_changelog",
+                    "100:fallback",
+                    {"issue_id": "100", "parent_key": "DEMO-1"},
+                ),
+                record(
+                    "issue_comment",
+                    "999:missing",
+                    {"issue_id": "999", "parent_key": "DEMO-1"},
+                ),
+            ],
+        )
+        repository.finish_sync_run(run, "complete", "complete_for_scope")
+        objects = {
+            str(row["external_id"]): str(row["id"])
+            for row in connection.execute("SELECT id, external_id FROM source_objects")
+        }
+        observations = {
+            str(row["source_object_id"]): str(row["id"])
+            for row in connection.execute("SELECT id, source_object_id FROM observations")
+        }
+        references = (
+            ("ref:jira-out", objects["100"], objects["100:out"]),
+            ("ref:jira-in", objects["100:in"], objects["100"]),
+            ("ref:jira-conflict-out", objects["100"], objects["100:conflict"]),
+            ("ref:jira-conflict-in", objects["100:conflict"], objects["100"]),
+            ("ref:jira-fallback", objects["100"], objects["100:fallback"]),
+            ("ref:jira-missing", objects["100"], objects["999:missing"]),
+        )
+        connection.executemany(
+            """
+            INSERT INTO "references"(
+                id, app_id, from_object_id, to_object_id, relationship_type,
+                extraction_method, supporting_observation_id, derived
+            ) VALUES (?, 'sample_jira', ?, ?, 'jira_comment_issue', 'fixture', ?, 1)
+            """,
+            [
+                (reference_id, from_id, to_id, observations[from_id])
+                for reference_id, from_id, to_id in references
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return WorkTraceTools(config=config, database_path=database), objects, database
 
 
 def test_context_requires_a_scoped_source_object_and_keeps_endpoint_availability_separate(
@@ -68,6 +202,32 @@ def test_context_requires_a_scoped_source_object_and_keeps_endpoint_availability
                 "observed_at": None,
             },
         }
+
+
+def test_public_context_uses_jira_owning_identity_before_parent_metadata(
+    tmp_path: Path,
+) -> None:
+    tools, objects, _ = _jira_context_tools(tmp_path)
+
+    # A root issue must not borrow an in-scope parent key when its own key is
+    # foreign, and the legacy textual external-key fallback remains bounded.
+    with pytest.raises(ScopeViolation, match="outside current configured source scope"):
+        tools.get_evidence_context(app_id="sample_jira", object_id=objects["200"])
+    legacy = tools.get_evidence_context(app_id="sample_jira", object_id=objects["DEMO-9"])
+    assert legacy["object"]["object_id"] == objects["DEMO-9"]
+
+    context = tools.get_evidence_context(app_id="sample_jira", object_id=objects["100"])
+    relation_ids = {item["reference_id"] for item in context["relations"]["items"]}
+    # Explicit owning issue_key supports both directions.  A subresource can
+    # fall back only through the exact same-source parent ID binding.
+    assert {"ref:jira-out", "ref:jira-in", "ref:jira-fallback"} <= relation_ids
+    # A foreign explicit issue_key and a missing parent binding both fail
+    # closed even when source-controlled parent_key says DEMO-1.
+    assert not {
+        "ref:jira-conflict-out",
+        "ref:jira-conflict-in",
+        "ref:jira-missing",
+    } & relation_ids
 
 
 def test_confirmed_rowless_context_membership_survives_legacy_generated_state(
