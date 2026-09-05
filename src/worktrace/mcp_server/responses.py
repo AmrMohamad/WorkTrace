@@ -114,6 +114,18 @@ def _minimal_item(item: dict[str, object]) -> dict[str, object]:
         "chunk_count",
     }
     result = {key: value for key, value in item.items() if key in retained}
+    for key, value in tuple(result.items()):
+        if isinstance(value, str) and key not in {
+            "reference_id",
+            "from_object_id",
+            "to_object_id",
+            "object_id",
+            "candidate_id",
+            "contribution_id",
+        }:
+            result[key] = value[:192]
+            if len(value) > 192:
+                result[f"{key}_truncated"] = True
     for key in ("title", "text"):
         if isinstance(item.get(key), str):
             value = str(item[key])
@@ -127,6 +139,47 @@ def _minimal_item(item: dict[str, object]) -> dict[str, object]:
     result["has_limitations"] = bool(
         item.get("limitations") or item.get("warnings") or item.get("title_limitations")
     )
+    result["item_compacted"] = True
+    return result
+
+
+def _minimal_context_item(item: dict[str, object]) -> dict[str, object]:
+    retained = {
+        "reference_id",
+        "direction",
+        "from_object_id",
+        "to_object_id",
+        "relationship_type",
+        "relationship_interpretation",
+        "extraction_method",
+        "exact_value",
+        "supporting_observation_id",
+        "from_endpoint",
+        "to_endpoint",
+        "object_id",
+        "candidate_id",
+        "contribution_id",
+        "role",
+        "basis",
+        "status",
+        "evidence_state",
+        "citations",
+        "citations_truncated",
+        "limitations",
+    }
+    result = {key: value for key, value in item.items() if key in retained}
+    for key, value in tuple(result.items()):
+        if isinstance(value, str) and key not in {
+            "reference_id",
+            "from_object_id",
+            "to_object_id",
+            "object_id",
+            "candidate_id",
+            "contribution_id",
+        }:
+            result[key] = value[:192]
+            if len(value) > 192:
+                result[f"{key}_truncated"] = True
     result["item_compacted"] = True
     return result
 
@@ -175,6 +228,117 @@ def admit_page(
         result = trial
         if len(items) == limit:
             break
+    return result if serialized_size(result) <= MAX_RESPONSE_CHARS else _error(result)
+
+
+def _unrequested_context_stream() -> dict[str, object]:
+    return {"requested": False, "items": [], "next_cursor": None, "complete": None}
+
+
+def admit_context(
+    envelope: dict[str, object],
+    *,
+    relation_rows: Iterable[ScannedRow] | None,
+    membership_rows: Iterable[ScannedRow] | None,
+    limit: int,
+    relation_initial: dict[str, str] | None,
+    membership_initial: dict[str, str] | None,
+    relation_cursor: CursorFactory,
+    membership_cursor: CursorFactory,
+) -> dict[str, object]:
+    """Round-robin two independent streams without advancing an unsent item."""
+    result = _clean(envelope)
+    streams: dict[str, dict[str, object]] = {
+        "relations": _unrequested_context_stream(),
+        "memberships": _unrequested_context_stream(),
+    }
+    sources = {
+        "relations": (
+            iter(relation_rows) if relation_rows is not None else None,
+            relation_initial,
+            relation_cursor,
+        ),
+        "memberships": (
+            iter(membership_rows) if membership_rows is not None else None,
+            membership_initial,
+            membership_cursor,
+        ),
+    }
+    for name, (rows, initial, factory) in sources.items():
+        if rows is not None:
+            streams[name] = {
+                "requested": True,
+                "items": [],
+                "next_cursor": factory(initial or {"phase": "start", "key": "-"}),
+                "complete": False,
+            }
+    result.update(streams)
+    # Cursor reservation keeps a blocked stream restartable after the other advances.
+    if serialized_size(result) + 4096 > MAX_RESPONSE_CHARS:
+        result = _small_envelope(result)
+        result.update(streams)
+    accepted: dict[str, dict[str, str] | None] = {
+        "relations": relation_initial,
+        "memberships": membership_initial,
+    }
+    exhausted = {name: rows is None for name, (rows, _, _) in sources.items()}
+    seen = {"relations": False, "memberships": False}
+    while sum(len(cast(list[object], streams[name]["items"])) for name in streams) < 20:
+        moved = False
+        for name in ("relations", "memberships"):
+            rows, _, factory = sources[name]
+            if (
+                rows is None
+                or exhausted[name]
+                or len(cast(list[object], streams[name]["items"])) >= limit
+            ):
+                continue
+            try:
+                position, raw, has_more = next(rows)
+            except StopIteration:
+                exhausted[name] = True
+                if not seen[name] or streams[name]["next_cursor"] is None:
+                    streams[name]["complete"] = True
+                    streams[name]["next_cursor"] = None
+                continue
+            moved = True
+            seen[name] = True
+            if raw is None:
+                accepted[name] = position
+                streams[name]["next_cursor"] = factory(position) if has_more else None
+                streams[name]["complete"] = not has_more
+                continue
+            item = _clean(raw)
+            next_cursor = factory(position) if has_more else None
+            trial = dict(result)
+            trial_streams = dict(streams)
+            trial_stream = dict(streams[name])
+            trial_stream["items"] = [*cast(list[object], trial_stream["items"]), item]
+            trial_stream["next_cursor"] = next_cursor
+            trial_stream["complete"] = not has_more
+            trial_streams[name] = trial_stream
+            trial.update(trial_streams)
+            if serialized_size(trial) > MAX_RESPONSE_CHARS:
+                compact = _minimal_context_item(item)
+                trial_stream["items"] = [*cast(list[object], streams[name]["items"]), compact]
+                if serialized_size(trial) > MAX_RESPONSE_CHARS:
+                    # Do not consume this row: the old cursor remains intact.
+                    exhausted[name] = True
+                    continue
+            streams[name] = trial_stream
+            result = trial
+            accepted[name] = position
+        if not moved:
+            break
+    for name, (rows, _, factory) in sources.items():
+        if rows is not None and streams[name]["complete"] is False:
+            accepted_position = accepted[name]
+            streams[name]["next_cursor"] = (
+                factory(accepted_position)
+                if accepted_position is not None
+                else streams[name]["next_cursor"]
+            )
+    result.update(streams)
     return result if serialized_size(result) <= MAX_RESPONSE_CHARS else _error(result)
 
 

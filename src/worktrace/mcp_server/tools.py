@@ -24,7 +24,7 @@ from worktrace.mcp_server.protocol import (
     fingerprint,
     view_token,
 )
-from worktrace.mcp_server.responses import admit_page, bounded_response, shape_packet
+from worktrace.mcp_server.responses import admit_context, admit_page, bounded_response, shape_packet
 from worktrace.mcp_server.schemas import app_id as validate_app_id
 from worktrace.mcp_server.schemas import (
     bounded_limit,
@@ -38,6 +38,12 @@ from worktrace.mcp_server.schemas import source_types as validate_source_types
 from worktrace.packets.builder import PacketBuilder
 from worktrace.packets.schema import PHASE4_QUESTIONS
 from worktrace.read_models.agent_pages import scan_candidates, scan_evidence
+from worktrace.read_models.evidence_context import (
+    context_readiness,
+    describe_object,
+    scan_memberships,
+    scan_relations,
+)
 
 
 def _protocol_result[**P](
@@ -69,7 +75,7 @@ def _ascii_lower(value: str | None) -> str | None:
 
 
 class WorkTraceTools:
-    """Six SQLite-only operations with short snapshots and bound continuations."""
+    """Seven SQLite-only operations with short snapshots and bound continuations."""
 
     def __init__(
         self,
@@ -350,6 +356,116 @@ class WorkTraceTools:
                     view=view,
                     filters=filters,
                     position=p,
+                ),
+            )
+
+    @_protocol_result
+    def get_evidence_context(
+        self,
+        *,
+        app_id: str,
+        object_id: str,
+        relation_cursor: str | None = None,
+        membership_cursor: str | None = None,
+        limit: int = 10,
+        expected_view_token: str | None = None,
+    ) -> dict[str, object]:
+        app_id, object_id, limit = (
+            validate_app_id(app_id),
+            stable_id(object_id, "object_id"),
+            bounded_limit(limit),
+        )
+        if len(object_id) > 256:
+            raise ScopeViolation("object_id is limited to 256 characters")
+        object_binding = fingerprint({"app_id": app_id, "object_id": object_id})
+        filters = fingerprint({"object_id": object_id})
+        with self._builder() as builder:
+            object_description = describe_object(builder, app_id, object_id)
+            meta = self._metadata(builder, app_id, expected_view_token)
+            view = str(meta["view_token"])
+            relation = decode_cursor(
+                relation_cursor,
+                collection="context_relations",
+                app_id=app_id,
+                view=view,
+                filters=filters,
+                object_fingerprint=object_binding,
+            )
+            membership = decode_cursor(
+                membership_cursor,
+                collection="context_memberships",
+                app_id=app_id,
+                view=view,
+                filters=filters,
+                object_fingerprint=object_binding,
+            )
+            relation_position = cast(dict[str, str], relation["position"]) if relation else None
+            membership_position = (
+                cast(dict[str, str], membership["position"]) if membership else None
+            )
+            relation_rows = (
+                scan_relations(
+                    builder,
+                    app_id,
+                    object_id,
+                    after=(
+                        relation_position["key"]
+                        if relation_position and relation_position["phase"] == "after"
+                        else None
+                    ),
+                )
+                if relation is not None or membership is None
+                else None
+            )
+            if membership is not None or relation is None:
+                generation, membership_rows = scan_memberships(
+                    builder,
+                    app_id,
+                    object_id,
+                    after=(
+                        membership_position["key"]
+                        if membership_position and membership_position["phase"] == "after"
+                        else None
+                    ),
+                )
+            else:
+                generation, membership_rows = None, None
+            if membership is not None and membership["generation"] != generation:
+                raise ProtocolError(
+                    "evidence_changed",
+                    "Membership generation changed; restart the investigation.",
+                    view_token=view,
+                )
+
+            def cursor(
+                collection: str,
+                position: dict[str, str] | None,
+                generation_token: str | None = None,
+            ) -> str:
+                return encode_cursor(
+                    collection=collection,
+                    app_id=app_id,
+                    view=view,
+                    filters=filters,
+                    object_fingerprint=object_binding,
+                    generation=generation_token,
+                    position=position or {"phase": "start", "key": "-"},
+                )
+
+            return admit_context(
+                {
+                    **self._page_envelope(builder, meta, None, None),
+                    "object": object_description,
+                    "context_readiness": context_readiness(builder, app_id),
+                },
+                relation_rows=relation_rows,
+                membership_rows=membership_rows,
+                limit=limit,
+                relation_initial=relation_position,
+                membership_initial=membership_position,
+                relation_cursor=lambda position: cursor("context_relations", position),
+                membership_cursor=lambda position: cursor(
+                    "context_memberships", position, generation
                 ),
             )
 

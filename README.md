@@ -120,7 +120,7 @@ uv run worktrace status APP_ID
 ```
 
 `import all` rebuilds references and candidates; separate source imports require an explicit
-`worktrace rebuild all APP_ID`. The six-tool MCP contract and cursor encoding are unchanged.
+`worktrace rebuild all APP_ID`. MCP cursors remain opaque and view-bound.
 
 ## Discovery coverage and selector upgrades
 
@@ -189,11 +189,33 @@ without dropping any of the 30 question IDs/statuses or support/contradiction pr
 detail with either `section` (the canonical section name) or `question_id`, then follow
 `detail_cursor`, always carrying `expected_view_token`. Detail entries include stable citation
 IDs and ordered answer/limitation chunks. An explicit size error never advances continuation.
-The TUI keeps its existing navigation and cursor contract; no seventh tool is introduced.
+The TUI keeps its existing navigation and cursor contract.
 
-`worktrace serve-mcp` exposes exactly six bounded, read-only tools over stdio. See
+`worktrace serve-mcp` exposes exactly seven bounded, read-only tools over stdio. `get_evidence_context`
+explains one configured source object through independently paged references and effective memberships;
+it never recursively expands a graph. See
 [`docs/codex-mcp.example.toml`](docs/codex-mcp.example.toml). The server accepts configured app and
 stable evidence/candidate IDs, never filesystem paths or SQL.
+
+`get_evidence_context` starts both `relations` and `memberships` streams when both cursors are
+omitted. To continue only one, send only its cursor; the other is `requested=false`, with
+`items=[]`, `next_cursor=null`, and `complete=null` rather than an empty traversal. Each stream
+scans at most 200 raw rows; one response returns at most 20 items across both streams and shares
+the 20,000-character budget. `complete` describes traversal only: source completeness, identity
+readiness, and availability remain separate coverage facts.
+
+Optional cross-provider SHA links require an explicit correspondence in the owning app:
+
+```toml
+[[apps.gitlab_repository_mappings]]
+repo_path = "/absolute/path/to/your/repository"
+gitlab_project_id = 12345
+```
+
+Without that mapping, matching SHA text creates no Git-to-GitLab relationship. A mapped link is
+explain-only evidence, never ownership or a grouping decision. After an upgrade or mapping change,
+run `worktrace rebuild all APP_ID`; legacy context-role decisions remain inspectable but require
+re-review when canonical membership changes.
 
 ## Verification
 

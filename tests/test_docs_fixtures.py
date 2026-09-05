@@ -16,6 +16,7 @@ MCP_TOOLS = {
     "list_evidence_gaps",
     "search_evidence",
     "get_evidence_excerpt",
+    "get_evidence_context",
 }
 
 

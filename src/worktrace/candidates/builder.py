@@ -18,7 +18,7 @@ from worktrace.participation import (
     supports_category,
 )
 
-GENERATOR_VERSION = "4"
+GENERATOR_VERSION = "5"
 MAX_DEPTH = 3
 MAX_MEMBERS = 200
 MAX_CONTEXT = 50

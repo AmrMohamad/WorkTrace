@@ -188,7 +188,7 @@ def _mcp_state(tmp_path: Path) -> tuple[Path, WorkTraceConfig, WorkTraceTools]:
     return database_path, config, WorkTraceTools(config=config, database_path=database_path)
 
 
-def test_server_registers_exactly_six_read_only_closed_world_tools() -> None:
+def test_server_registers_exactly_seven_read_only_closed_world_tools() -> None:
     server = build_mcp_server()
     registered = asyncio.run(server.list_tools())
 
@@ -199,6 +199,7 @@ def test_server_registers_exactly_six_read_only_closed_world_tools() -> None:
         "list_evidence_gaps",
         "search_evidence",
         "get_evidence_excerpt",
+        "get_evidence_context",
     ]
     assert all(tool.annotations is not None for tool in registered)
     assert all(tool.annotations.read_only_hint is True for tool in registered)

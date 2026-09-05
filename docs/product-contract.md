@@ -68,7 +68,7 @@ The authorized v0.1 boundary is:
 - one local SQLite evidence ledger;
 - local Git, Jira Cloud REST v3, and GitLab REST v4 adapters;
 - a CLI that owns every write;
-- a SQLite-only, read-only MCP server with six bounded tools; and
+- a SQLite-only, read-only MCP server with seven bounded tools; and
 - explicit app, project, source-instance, and repository mappings.
 
 The following are out of scope: a cloud backend, web UI, daemon, ORM, embeddings, vector database, embedded LLM, automatic Git fetch, arbitrary filesystem or SQL access through MCP, automatic ownership or impact classification, productivity scoring, and multi-user use.
@@ -81,15 +81,15 @@ writing, and personal career inventory. It is not an employee-evaluation, promot
 seniority, or productivity surface.
 
 This interface does not change the mutation boundary. The CLI continues to own every write, and
-MCP continues to expose exactly six bounded read-only tools. The TUI constructs only a narrow
+MCP continues to expose exactly seven bounded read-only tools. The TUI constructs only a narrow
 read-only workspace over short-lived SQLite URI `mode=ro` connections with
 `PRAGMA query_only = ON`. It receives no provider, credential, network, importer, decision,
 migration, maintenance, export, backup, purge, or configuration-editing capability.
 
 The TUI reuses the packet builder as the canonical claim projection and adds a separate
 generation-bound candidate query for human paging. It does not invoke CLI subprocesses, parse CLI
-JSON, or call MCP internally. MCP's existing schemas, limits, and opaque `offset:` cursor remain
-unchanged.
+JSON, or call MCP internally. MCP's existing schemas and limits remain unchanged; MCP continuations
+are opaque, view-bound cursors and the TUI keeps its separate cursor contract.
 
 The initial executable workflow is limited to application selection, honest latest-attempt source
 status, bounded candidate browsing, contribution review, all canonical Phase 4 questions and gaps,

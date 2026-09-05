@@ -19,6 +19,7 @@ enabled_tools = [
     "list_evidence_gaps",
     "search_evidence",
     "get_evidence_excerpt",
+    "get_evidence_context",
 ]
 
 default_tools_approval_mode = "auto"

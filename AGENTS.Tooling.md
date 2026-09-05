@@ -15,7 +15,7 @@ Load for Python, CLI, SQLite, adapters, subprocesses, configuration, imports, pa
 ## Read-only human TUI
 
 - The first `worktrace ui` release is structurally read-only. Construct only `ReadOnlyWorkspace`; do not expose provider clients, HTTP/network access, importers, decisions, migrations, maintenance, configuration editing, exports, backups, purge, or a write-capable SQLite connection.
-- Do not call WorkTrace CLI commands as subprocesses, parse CLI JSON as an internal API, or call MCP from the TUI. Keep all six MCP tools and their response limits; MCP uses versioned, view-bound cursors while TUI cursor shapes remain unchanged.
+- Do not call WorkTrace CLI commands as subprocesses, parse CLI JSON as an internal API, or call MCP from the TUI. Keep all seven MCP tools and their response limits; MCP uses versioned, view-bound cursors while TUI cursor shapes remain unchanged.
 - Create every TUI SQLite connection inside its Textual worker with URI `mode=ro`, `PRAGMA query_only=ON`, and a 500 ms busy timeout. Close it in `finally`; never retain a connection while the user is idle or move it across threads.
 - Reuse the shared generation-bound candidate query with caller-owned read snapshots. Preserve TUI command/cursor shapes and scan bounds. Do not add an index without measured evidence.
 - Before importing Textual, scrub the provider credential/HMAC variables and Textual control variables listed in the approved technical design. The TUI never migrates an older database; direct the user to the CLI and reject newer unsupported schemas.

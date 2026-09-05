@@ -37,7 +37,7 @@ from worktrace.db.import_status import readiness_contract, source_readiness
 from worktrace.db.migrations import backup_database, migrate
 from worktrace.db.queries import search_evidence, source_status
 from worktrace.db.readiness import DatabaseReadinessStatus, database_readiness
-from worktrace.db.repository import EvidenceRepository, stable_id
+from worktrace.db.repository import EvidenceRepository, source_instance_id, stable_id
 from worktrace.doctor import run_doctor
 from worktrace.domain.models import JsonValue
 from worktrace.errors import ConfigurationError, WorkTraceError
@@ -53,6 +53,7 @@ from worktrace.importers.orchestrator import ImportResult, import_snapshot
 from worktrace.linking.builder import rebuild_references
 from worktrace.local_security import email_hmac_key
 from worktrace.normalize.redaction import Redactor
+from worktrace.packets.builder import PacketBuilder
 from worktrace.paths import ensure_private_directory
 from worktrace.services import add_manual_evidence, export_app
 
@@ -249,10 +250,6 @@ def _assert_no_scope_contraction(
             )
 
 
-def _source_instance(app_id: str, source: str, identifier: object) -> str:
-    return stable_id("source", app_id, source, identifier)
-
-
 def _open(
     config_path: Path | None = None,
 ) -> tuple[WorkTraceConfig, sqlite3.Connection, EvidenceRepository]:
@@ -438,7 +435,7 @@ def _verified_repair_identities(
                 JiraConfig(
                     work_timezone=configuration.employment_timezone,
                     base_url=credentials.base_url,
-                    source_instance=_source_instance(app_id, "jira", credentials.base_url),
+                    source_instance=source_instance_id(app_id, "jira", credentials.base_url),
                     app_id=app_id,
                     project_keys=selected.jira_project_keys,
                     account_id=configuration.identity.jira_account_id,
@@ -461,7 +458,7 @@ def _verified_repair_identities(
             gitlab_adapter = GitLabAdapter(
                 GitLabConfig(
                     base_url=credentials_gitlab.base_url,
-                    source_instance=_source_instance(
+                    source_instance=source_instance_id(
                         app_id, "gitlab", selected.gitlab_project_ids[0]
                     ),
                     app_id=app_id,
@@ -647,7 +644,7 @@ def _run_source_import(
     target = (
         str(identifier)
         if source == "gitlab"
-        else (_source_instance(app_id, source, identifier) if source == "git" else "jira")
+        else (source_instance_id(app_id, source, identifier) if source == "git" else "jira")
     )
     reason = "identity_policy_unready"
     started = False
@@ -679,7 +676,7 @@ def _run_source_import(
             if source == "git":
                 assert isinstance(identifier, Path)
                 scoped_repo = configured_app.assert_repo_scope(identifier)
-                source_instance = _source_instance(app_id, source, scoped_repo)
+                source_instance = source_instance_id(app_id, source, scoped_repo)
                 adapter = LocalGitAdapter(
                     LocalGitConfig(
                         repository_path=scoped_repo,
@@ -695,7 +692,7 @@ def _run_source_import(
                 scope["selection_reasons"] = ["configured repository read-only snapshot"]
             elif source == "gitlab":
                 assert credentials is not None and isinstance(identifier, int)
-                source_instance = _source_instance(app_id, source, identifier)
+                source_instance = source_instance_id(app_id, source, identifier)
                 seeds = _relevant_git_commit_shas(repository, app_id)
                 counts = {
                     "relevant_local_commit_shas": len(seeds.values),
@@ -746,7 +743,7 @@ def _run_source_import(
                     explicit_keys=explicit_jira_keys,
                 )
                 counts = {"exact_jira_keys": len(selection.keys)}
-                source_instance = _source_instance(app_id, source, credentials.base_url)
+                source_instance = source_instance_id(app_id, source, credentials.base_url)
                 reason = "origin_invalid"
                 # This branch has JiraCredentials; keep the union's narrowing explicit.
                 jira_auth = jira_credentials()
@@ -800,7 +797,7 @@ def _run_source_import(
                     expected_instance = item.get("source_instance") or (
                         item.get("target")
                         if previous_source == "git"
-                        else _source_instance(app_id, "gitlab", item.get("target"))
+                        else source_instance_id(app_id, "gitlab", item.get("target"))
                     )
                     known = retained.get(previous_source, {}).get(
                         "last_authoritative_snapshots", []
@@ -1246,29 +1243,38 @@ def remove_member(candidate_id: str, source_object_id: str, config: ConfigOption
 
 @app.command()
 def merge(candidate_id: str, other_candidate_ids: list[str], config: ConfigOption = None) -> None:
-    _, connection, _ = _open(config)
+    configuration, connection, _ = _open(config)
     try:
-        views = [
-            project_candidate(connection, value) for value in [candidate_id, *other_candidate_ids]
+        requested_ids = [candidate_id, *other_candidate_ids]
+        builder = PacketBuilder(connection, configuration)
+        views = [builder.resolve_contribution(value) for value in requested_ids]
+        canonical_ids = [
+            view.candidate_id if isinstance(view.candidate_id, str) and view.candidate_id else value
+            for value, view in zip(requested_ids, views, strict=True)
         ]
+        if len(set(canonical_ids)) < 2:
+            raise WorkTraceError("merge requires at least two distinct effective contributions")
         app_ids = {view.app_id for view in views}
         if len(app_ids) != 1:
             raise WorkTraceError("merged candidates must belong to one app")
-        member_ids = sorted(
-            {str(member["source_object_id"]) for view in views for member in view.members}
-        )
-        contribution_id = stable_id("contribution", candidate_id, *sorted(other_candidate_ids))
+        material_ids = set().union(*(view.member_ids for view in views))
+        context_ids = set().union(*(view.context_ids for view in views)) - material_ids
+        # The creation snapshot records every effective member; role is carried
+        # separately by context_members so a later projector need not infer it.
+        member_ids = sorted(material_ids) + sorted(context_ids)
+        contribution_id = stable_id("contribution", *sorted(canonical_ids))
         decision_id = append_decision(
             connection,
             "merge_contributions",
-            candidate_id,
+            canonical_ids[0],
             {
                 "contribution_id": contribution_id,
-                "candidate_ids": other_candidate_ids,
+                "candidate_ids": canonical_ids[1:],
                 "app_id": views[0].app_id,
                 "title": views[0].title,
                 "type": views[0].contribution_type,
-                "members": member_ids,
+                "members": sorted(set(member_ids) | context_ids),
+                "context_members": sorted(context_ids),
             },
         )
         _emit({"decision_id": decision_id, "contribution_id": contribution_id})
@@ -1280,18 +1286,42 @@ def merge(candidate_id: str, other_candidate_ids: list[str], config: ConfigOptio
 def split(
     candidate_id: str, keep_source_object_ids: list[str], config: ConfigOption = None
 ) -> None:
-    candidate = candidate_id
-    contribution_id = stable_id("contribution", candidate, *sorted(keep_source_object_ids))
-    _decision(
-        "split_contribution",
-        candidate,
-        {
-            "contribution_id": contribution_id,
-            "keep_source_object_ids": keep_source_object_ids,
-            "members": keep_source_object_ids,
-        },
-        config,
-    )
+    configuration, connection, _ = _open(config)
+    try:
+        view = PacketBuilder(connection, configuration).resolve_contribution(candidate_id)
+        canonical_id = (
+            view.candidate_id
+            if isinstance(view.candidate_id, str) and view.candidate_id
+            else candidate_id
+        )
+        keep_ids = set(keep_source_object_ids)
+        effective_ids = view.member_ids | view.context_ids
+        if not keep_ids:
+            raise WorkTraceError(
+                "split requires a nonempty subset of effective contribution members"
+            )
+        if not keep_ids <= effective_ids:
+            raise WorkTraceError("split members must belong to the effective contribution")
+        material_ids = view.member_ids & keep_ids
+        context_ids = (view.context_ids & keep_ids) - material_ids
+        contribution_id = stable_id("contribution", canonical_id, *sorted(keep_ids))
+        decision_id = append_decision(
+            connection,
+            "split_contribution",
+            canonical_id,
+            {
+                "contribution_id": contribution_id,
+                "app_id": view.app_id,
+                "title": view.title,
+                "type": view.contribution_type,
+                "keep_source_object_ids": sorted(keep_ids),
+                "members": sorted(material_ids | context_ids),
+                "context_members": sorted(context_ids),
+            },
+        )
+        _emit({"decision_id": decision_id, "contribution_id": contribution_id})
+    finally:
+        connection.close()
 
 
 @app.command()

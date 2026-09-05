@@ -360,7 +360,14 @@ class PacketBuilder:
             title_source_object_id=projected.metadata_source_object_id,
         )
 
-    def _resolve_contribution(self, identifier: str) -> ContributionView:
+    def resolve_contribution(self, identifier: str) -> ContributionView:
+        """Return the canonical effective contribution view for an identifier.
+
+        This is the supported read interface for consumers which need the
+        decision-projected material and context membership sets.  In
+        particular, callers must not replay decision events or substitute
+        generated candidate membership for this result.
+        """
         lineage = (
             self._decision_projection.resolve_lineage(identifier)
             if self._decision_projection is not None
@@ -516,6 +523,11 @@ class PacketBuilder:
                 )
         self._app(state.app_id)
         return state
+
+    def _resolve_contribution(self, identifier: str) -> ContributionView:
+        """Compatibility alias for pre-context internal callers."""
+
+        return self.resolve_contribution(identifier)
 
     def _record_for_object(self, object_id: str, context_only: bool) -> EvidenceRecord | None:
         if self._authority_context is not None:
@@ -2089,13 +2101,51 @@ class PacketBuilder:
         reference = self.connection.execute(
             f"""
             WITH {authoritative_current_reference_ctes()}
-            SELECT * FROM authoritative_current_references WHERE id=?
+            SELECT reference.*, from_object.source AS from_source,
+                   from_object.source_instance AS from_source_instance,
+                   from_object.kind AS from_kind,
+                   from_object.external_id AS from_external_id,
+                   to_object.source AS to_source,
+                   to_object.source_instance AS to_source_instance,
+                   to_object.kind AS to_kind,
+                   to_object.external_id AS to_external_id
+            FROM authoritative_current_references reference
+            JOIN source_objects from_object ON from_object.id=reference.from_object_id
+            JOIN source_objects to_object ON to_object.id=reference.to_object_id
+            WHERE reference.id=?
             """,
             (evidence_id,),
         ).fetchone()
         if reference is not None:
+            reference_fields = dict(reference)
             app_id = str(reference["app_id"])
             self._app(app_id)
+            if str(reference["relationship_type"]) == "mapped_commit_sha":
+                try:
+                    from worktrace.linking.mappings import reference_mapping_allowed
+                except ImportError:
+                    raise NotFound(f"evidence not found: {evidence_id}") from None
+                if not reference_mapping_allowed(
+                    self.config.app(app_id),
+                    reference_fields,
+                    {
+                        "id": reference["from_object_id"],
+                        "app_id": app_id,
+                        "source": reference["from_source"],
+                        "source_instance": reference["from_source_instance"],
+                        "kind": reference["from_kind"],
+                        "external_id": reference["from_external_id"],
+                    },
+                    {
+                        "id": reference["to_object_id"],
+                        "app_id": app_id,
+                        "source": reference["to_source"],
+                        "source_instance": reference["to_source_instance"],
+                        "kind": reference["to_kind"],
+                        "external_id": reference["to_external_id"],
+                    },
+                ):
+                    raise NotFound(f"evidence not found: {evidence_id}")
             return {
                 "evidence_id": evidence_id,
                 "app_id": app_id,
