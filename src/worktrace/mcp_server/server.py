@@ -15,7 +15,11 @@ productivity, or seniority from activity records. Keep Git author and committer 
 Distinguish implemented, merged, release-associated, deployed, released to users, currently
 enabled, and measurably successful. Every material statement must cite returned evidence IDs
 or be marked unknown. Always include contradictions and incomplete-source warnings. The server
-cannot import sources or modify decisions."""
+cannot import sources or modify decisions. Capture view_token and pass expected_view_token
+on related calls; evidence_changed requires a refreshed investigation. Short or empty pages
+can have continuations. Never discard a next_cursor merely because a page is empty.
+Oversized Phase 4 packets retain all questions; use section/question_id and detail_cursor
+on build_phase4_packet to retrieve omitted detail. Legacy offset cursors require restart."""
 
 _PROVIDER_CREDENTIALS = (
     "WORKTRACE_JIRA_BASE_URL",
@@ -56,6 +60,7 @@ def build_mcp_server(
         date_to: str | None = None,
         limit: int = 20,
         cursor: str | None = None,
+        expected_view_token: str | None = None,
     ) -> dict[str, object]:
         """List bounded deterministic candidates in one configured application."""
 
@@ -65,25 +70,48 @@ def build_mcp_server(
             date_to=date_to,
             limit=limit,
             cursor=cursor,
+            expected_view_token=expected_view_token,
         )
 
     @server.tool(annotations=_READ_ONLY_ANNOTATIONS, structured_output=True)
-    def get_contribution_summary(contribution_id: str) -> dict[str, object]:
+    def get_contribution_summary(
+        contribution_id: str, expected_view_token: str | None = None
+    ) -> dict[str, object]:
         """Return evidence members, participation, release rungs, and contradictions."""
 
-        return service.get_contribution_summary(contribution_id=contribution_id)
+        return service.get_contribution_summary(
+            contribution_id=contribution_id, expected_view_token=expected_view_token
+        )
 
     @server.tool(annotations=_READ_ONLY_ANNOTATIONS, structured_output=True)
-    def build_phase4_packet(contribution_id: str) -> dict[str, object]:
+    def build_phase4_packet(
+        contribution_id: str,
+        expected_view_token: str | None = None,
+        section: str | None = None,
+        question_id: str | None = None,
+        detail_cursor: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, object]:
         """Build an evidence-linked Phase 4 worksheet without drafting unknown claims."""
 
-        return service.build_phase4_packet(contribution_id=contribution_id)
+        return service.build_phase4_packet(
+            contribution_id=contribution_id,
+            expected_view_token=expected_view_token,
+            section=section,
+            question_id=question_id,
+            detail_cursor=detail_cursor,
+            limit=limit,
+        )
 
     @server.tool(annotations=_READ_ONLY_ANNOTATIONS, structured_output=True)
-    def list_evidence_gaps(contribution_id: str) -> dict[str, object]:
+    def list_evidence_gaps(
+        contribution_id: str, expected_view_token: str | None = None
+    ) -> dict[str, object]:
         """Return unresolved questions, contradictions, and bounded follow-up suggestions."""
 
-        return service.list_evidence_gaps(contribution_id=contribution_id)
+        return service.list_evidence_gaps(
+            contribution_id=contribution_id, expected_view_token=expected_view_token
+        )
 
     @server.tool(annotations=_READ_ONLY_ANNOTATIONS, structured_output=True)
     def search_evidence(
@@ -96,6 +124,7 @@ def build_mcp_server(
         date_to: str | None = None,
         limit: int = 20,
         cursor: str | None = None,
+        expected_view_token: str | None = None,
     ) -> dict[str, object]:
         """Search redacted current evidence inside one configured application."""
 
@@ -109,18 +138,21 @@ def build_mcp_server(
             date_to=date_to,
             limit=limit,
             cursor=cursor,
+            expected_view_token=expected_view_token,
         )
 
     @server.tool(annotations=_READ_ONLY_ANNOTATIONS, structured_output=True)
     def get_evidence_excerpt(
         evidence_id: str,
         max_chars: int = DEFAULT_EXCERPT_CHARS,
+        expected_view_token: str | None = None,
     ) -> dict[str, object]:
         """Return one explicitly requested, redacted, untrusted source excerpt."""
 
         return service.get_evidence_excerpt(
             evidence_id=evidence_id,
             max_chars=max_chars,
+            expected_view_token=expected_view_token,
         )
 
     return server

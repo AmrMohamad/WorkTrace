@@ -72,13 +72,15 @@ def test_populated_v2_upgrade_preserves_ids_and_seeds_baseline(tmp_path: Path) -
         )
         connection.commit()
 
-        assert migrate(connection, database_path) == [3, 4, 5]
-        assert user_version(connection) == 5
+        assert migrate(connection, database_path) == [3, 4, 5, 6]
+        assert user_version(connection) == 6
         assert connection.execute("SELECT id FROM source_objects").fetchone()[0] == "obj:stable"
         assert connection.execute("SELECT id FROM observations").fetchone()[0] == "obs:stable"
         assert (
             connection.execute("SELECT id FROM human_decisions").fetchone()[0] == "decision:stable"
         )
+        assert connection.execute("SELECT read_revision FROM apps").fetchone()[0] == 1
+        assert connection.execute("SELECT version FROM agent_read_protocol").fetchone()[0] == 1
         event = connection.execute(
             "SELECT state, reason, sync_run_id FROM source_object_availability_events"
         ).fetchone()

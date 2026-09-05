@@ -6,18 +6,20 @@ from pathlib import Path
 
 import pytest
 
+import worktrace.db.migrations as migrations_module
 from worktrace.db.connection import connect, connect_read_only
 from worktrace.db.migrations import migrate, user_version
 from worktrace.db.readiness import DatabaseReadinessStatus, database_readiness
+from worktrace.errors import DatabaseError
 
 
 def test_init_and_migrations_are_idempotent(tmp_path: Path) -> None:
     database_path = tmp_path / "worktrace.sqlite3"
     connection = connect(database_path)
     try:
-        assert migrate(connection, database_path) == [1, 2, 3, 4, 5]
+        assert migrate(connection, database_path) == [1, 2, 3, 4, 5, 6]
         assert migrate(connection, database_path) == []
-        assert user_version(connection) == 5
+        assert user_version(connection) == 6
 
         tables = {
             str(row[0])
@@ -40,6 +42,21 @@ def test_init_and_migrations_are_idempotent(tmp_path: Path) -> None:
         } <= tables
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA trusted_schema").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_schema_five_binary_refuses_a_schema_six_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "worktrace.sqlite3"
+    connection = connect(database_path)
+    try:
+        migrate(connection, database_path)
+        packaged = migrations_module.migrations()
+        monkeypatch.setattr(migrations_module, "migrations", lambda: packaged[:5])
+        with pytest.raises(DatabaseError, match="newer"):
+            migrations_module.migrate(connection, database_path)
     finally:
         connection.close()
 
@@ -161,7 +178,7 @@ def test_database_readiness_is_read_only_and_distinguishes_schema_drift(
     try:
         ready = database_readiness(read_only)
         assert ready.status is DatabaseReadinessStatus.READY
-        assert ready.current_version == ready.supported_version == 5
+        assert ready.current_version == ready.supported_version == 6
     finally:
         read_only.close()
 

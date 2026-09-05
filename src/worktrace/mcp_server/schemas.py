@@ -9,7 +9,6 @@ from worktrace.errors import ScopeViolation
 _STABLE_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,127}(?::[A-Za-z0-9._-]{1,128})*$")
 _APP_ID = re.compile(r"^[a-z0-9][a-z0-9_]{0,127}$")
 _ALLOWED_SOURCES = frozenset({"git", "jira", "gitlab", "manual"})
-_CURSOR = re.compile(r"^offset:([0-9]{1,9})$")
 
 
 def stable_id(value: str, field: str) -> str:
@@ -77,18 +76,3 @@ def optional_filter(value: str | None, field: str) -> str | None:
     if not normalized or len(normalized) > 200 or "\x00" in normalized:
         raise ScopeViolation(f"{field} is invalid")
     return normalized
-
-
-def decode_cursor(value: str | None) -> int:
-    if value is None:
-        return 0
-    match = _CURSOR.fullmatch(value)
-    if not match:
-        raise ScopeViolation("cursor is invalid")
-    return int(match.group(1))
-
-
-def encode_cursor(offset: object) -> str | None:
-    if not isinstance(offset, int) or offset < 0:
-        return None
-    return f"offset:{offset}"

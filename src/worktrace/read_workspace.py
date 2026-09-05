@@ -118,17 +118,10 @@ class ReadOnlyWorkspace:
 
     @contextmanager
     def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
-        with self._connection() as connection:
-            connection.execute("BEGIN")
-            try:
-                yield connection
-            except BaseException:
-                if connection.in_transaction:
-                    connection.execute("ROLLBACK")
-                raise
-            else:
-                if connection.in_transaction:
-                    connection.execute("COMMIT")
+        from worktrace.db.read_state import read_snapshot
+
+        with self._connection() as connection, read_snapshot(connection):
+            yield connection
 
     def applications(self) -> tuple[ApplicationSummary, ...]:
         with self._connection():

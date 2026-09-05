@@ -1077,11 +1077,9 @@ def import_all(
                 )
             )
             # Keep preparation audit durable even if a later source or rebuild is interrupted.
-            with connection:
-                connection.execute(
-                    "UPDATE import_sessions SET summary_json=? WHERE id=?",
-                    (json.dumps({"sources": results}, sort_keys=True), session_id),
-                )
+            repository.update_import_session_progress(
+                session_id, {"sources": cast(list[JsonValue], results)}
+            )
         derived_current = bool(identity_policy_status(connection, configuration, app_id)["valid"])
         reference_count = candidate_count = 0
         if derived_current:

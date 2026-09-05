@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from worktrace.config import AppConfig
+from worktrace.db.read_state import mark_read_states_changed
 from worktrace.db.repository import EvidenceRepository, stable_id
 from worktrace.linking.extractors import extract_commit_shas, extract_jira_keys, extract_mr_iids
 
@@ -178,6 +179,7 @@ def rebuild_references(app: AppConfig, repository: EvidenceRepository) -> int:
                         "source_metadata",
                         external_id,
                     )
+        mark_read_states_changed(connection, [app.id])
 
     row = connection.execute(
         'SELECT COUNT(*) AS count FROM "references" WHERE app_id=?', (app.id,)

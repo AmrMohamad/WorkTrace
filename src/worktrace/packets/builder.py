@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from worktrace.candidates.decisions import (
     CREATION_ACTIONS,
+    _build_decision_projection_context,
     _DecisionProjectionContext,
     compensating_decision_ids,
     decision_lineages,
@@ -131,6 +132,37 @@ class _AuthorityEvidenceContext:
     current_observations: Mapping[str, sqlite3.Row]
     evidence_records: Mapping[str, EvidenceRecord]
     participation_rows_by_observation: Mapping[str, tuple[sqlite3.Row, ...]]
+    metadata_only: bool = False
+
+
+def _activity_metadata_json(column: str) -> str:
+    """Return the bounded activity fields needed by list/search projections.
+
+    Page reads need dated-activity semantics, but not a source body or arbitrary
+    adapter payload.  Keep this projection deliberately narrow; detailed packet
+    construction continues to hydrate the complete observation below.
+    """
+
+    fields = (
+        "assignment_intervals",
+        "assigned_at",
+        "authored_at",
+        "boundary_context",
+        "closed_at",
+        "committed_at",
+        "created_at",
+        "event_at",
+        "finished_at",
+        "issue_id",
+        "merged_at",
+        "occurred_at",
+        "released_at",
+        "updated_at",
+    )
+    pairs = ", ".join(
+        f"'{field}', json_extract({column}.data_json, '$.{field}')" for field in fields
+    )
+    return f"json_object({pairs})"
 
 
 def _evidence_record_from_row(
@@ -176,14 +208,30 @@ def _evidence_record_from_row(
 def _build_authority_evidence_context(
     connection: sqlite3.Connection,
     app_id: str,
+    *,
+    metadata_only: bool = False,
 ) -> _AuthorityEvidenceContext:
+    observation_fields = (
+        "current.*"
+        if not metadata_only
+        else f"""
+            current.id, current.source_object_id, current.sync_run_id,
+            current.source_updated_at, current.fetched_at, current.payload_hash,
+            substr(current.title, 1, {_MAX_DECISION_VALUE_CHARS}) AS title,
+            NULL AS body_text,
+            {_activity_metadata_json("current")} AS data_json,
+            current.completeness, current.adapter_version, current.normalization_version,
+            current.redaction_version
+        """
+    )
     rows = list(
         connection.execute(
             f"""
             /* worktrace_page_authority_evidence_context */
             WITH {authoritative_current_observation_ctes()},
                  {authoritative_availability_event_ctes()}
-            SELECT current.*, so.app_id, so.source, so.source_instance, so.kind, so.external_id,
+            SELECT {observation_fields},
+                so.app_id, so.source, so.source_instance, so.kind, so.external_id,
                 so.availability, so.availability_reason, so.availability_observed_at,
                 (
                     SELECT event.id
@@ -218,7 +266,17 @@ def _build_authority_evidence_context(
         participation_rows_by_observation=MappingProxyType(
             {key: tuple(value) for key, value in participation_by_observation.items()}
         ),
+        metadata_only=metadata_only,
     )
+
+
+def _build_page_authority_evidence_context(
+    connection: sqlite3.Connection,
+    app_id: str,
+) -> _AuthorityEvidenceContext:
+    """Build the canonical list/search context without payload or body hydration."""
+
+    return _build_authority_evidence_context(connection, app_id, metadata_only=True)
 
 
 class PacketBuilder:
@@ -236,6 +294,31 @@ class PacketBuilder:
         self.config = config
         self._decision_projection = decision_context
         self._authority_context = authority_context
+
+    def page_projection_builder(self, app_id: str) -> PacketBuilder:
+        """Return a canonical builder suitable for bounded list/search scans.
+
+        Decision resolution remains global and canonical, while the authority
+        projection purposefully contains only list/search metadata.  The full
+        packet builder never calls this method, so detailed packet reads retain
+        their complete record contract.
+        """
+
+        self._app(app_id)
+        decision_context = self._decision_projection or _build_decision_projection_context(
+            self.connection
+        )
+        authority_context = self._authority_context
+        if authority_context is None or not authority_context.metadata_only:
+            authority_context = _build_page_authority_evidence_context(self.connection, app_id)
+        elif authority_context.app_id != app_id:
+            raise ScopeViolation("authority context belongs to another application")
+        return PacketBuilder(
+            self.connection,
+            self.config,
+            decision_context=decision_context,
+            authority_context=authority_context,
+        )
 
     def _app(self, app_id: str) -> AppConfig:
         return self.config.app(app_id)

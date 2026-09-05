@@ -139,6 +139,10 @@ def _redact_string(value: str) -> str:
 
 
 def _is_structured_identifier(value: str, field_name: str | None) -> bool:
+    if field_name in {"view_token", "expected_view_token"}:
+        return re.fullmatch(r"view:1:[0-9a-f]{64}", value) is not None
+    if field_name in {"cursor", "next_cursor", "detail_cursor"}:
+        return len(value) <= 2048 and re.fullmatch(r"wtc1:[A-Za-z0-9_-]+", value) is not None
     if field_name is None or _STABLE_IDENTIFIER.fullmatch(value) is None:
         return False
     key = field_name.casefold()
