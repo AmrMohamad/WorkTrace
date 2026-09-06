@@ -584,6 +584,21 @@ def _decision_mentions_object(action: str, payload: Mapping[str, object], object
     return False
 
 
+def _page_context_builder(builder: PacketBuilder, app_id: str) -> PacketBuilder:
+    """Reuse an already scoped metadata-only page context without changing its contract."""
+
+    builder.config.app(app_id)
+    authority_context = builder._authority_context
+    if (
+        builder._decision_projection is not None
+        and authority_context is not None
+        and authority_context.metadata_only
+        and authority_context.app_id == app_id
+    ):
+        return builder
+    return builder.page_projection_builder(app_id)
+
+
 def membership_locator_ids(builder: PacketBuilder, app_id: str, object_id: str) -> set[str]:
     """Find generated and decision-backed membership locators for one object.
 
@@ -602,7 +617,7 @@ def membership_locator_ids(builder: PacketBuilder, app_id: str, object_id: str) 
             (app_id, object_id),
         )
     }
-    context_builder = builder.page_projection_builder(app_id)
+    context_builder = _page_context_builder(builder, app_id)
     context = context_builder._decision_projection
     assert context is not None
     for decision in context.active_decisions:
@@ -616,7 +631,7 @@ def membership_locator_ids(builder: PacketBuilder, app_id: str, object_id: str) 
 def lineage_identity(
     builder: PacketBuilder, app_id: str, identifier: str
 ) -> tuple[str, str | None, str, bool]:
-    context_builder = builder.page_projection_builder(app_id)
+    context_builder = _page_context_builder(builder, app_id)
     context = context_builder._decision_projection
     assert context is not None
     lineage = context.resolve_lineage(identifier, app_id=app_id)
@@ -660,7 +675,7 @@ def canonical_membership_locators(
 ) -> tuple[CanonicalMembershipLocator, ...]:
     """Return deterministic, alias-deduplicated canonical membership groups."""
 
-    context_builder = builder.page_projection_builder(app_id)
+    context_builder = _page_context_builder(builder, app_id)
     by_key: dict[str, CanonicalMembershipLocator] = {}
     for identifier in sorted(membership_locator_ids(context_builder, app_id, object_id)):
         try:
@@ -716,7 +731,7 @@ def resolve_canonical_group(
 
     if legacy_generated and not locator.confirmed:
         return None
-    context_builder = builder.page_projection_builder(app_id)
+    context_builder = _page_context_builder(builder, app_id)
     try:
         return context_builder.resolve_contribution(locator.identifier)
     except (NotFound, ScopeViolation):
@@ -732,7 +747,7 @@ def project_canonical_membership(
 ) -> dict[str, object] | None:
     """Apply one already-resolved group to one evidence object without resolving again."""
 
-    context_builder = builder.page_projection_builder(app_id)
+    context_builder = _page_context_builder(builder, app_id)
     object_description = describe_object(context_builder, app_id, object_id)
     object_has_current = object_description["current_observation_id"] is not None
     role = (

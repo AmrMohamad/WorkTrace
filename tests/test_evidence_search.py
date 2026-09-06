@@ -10,10 +10,12 @@ import pytest
 import worktrace.read_models.evidence_search as evidence_search_module
 from tests.public_workflow_support import PublicWorkflowFixture
 from tests.test_packets_golden import _packet_state
+from tests.tui_support import add_visible_candidate_page
 from worktrace.candidates.decisions import append_decision
 from worktrace.config import load_config
 from worktrace.db.connection import connect, connect_read_only
 from worktrace.packets.builder import PacketBuilder
+from worktrace.read_models import evidence_context as evidence_context_module
 from worktrace.read_models.evidence_search import (
     CandidateLink,
     CanonicalMembershipLocator,
@@ -91,6 +93,57 @@ def test_normalize_evidence_search_filters_trims_optionals_and_is_frozen() -> No
     assert blank_optionals.module_text is None
     assert blank_optionals.date_from is None
     assert blank_optionals.date_to is None
+
+
+def test_evidence_search_reuses_prepared_page_context_without_changing_page_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection, _, config, _ = _packet_state(tmp_path)
+    add_visible_candidate_page(connection, count=30)
+    connection.close()
+    workspace = ReadOnlyWorkspace(config)
+    filters = normalize_evidence_search_filters("Synthetic")
+    baseline = workspace.search_evidence("sample_store", filters)
+
+    original = PacketBuilder.page_projection_builder
+    calls = 0
+
+    def counted(self: PacketBuilder, app_id: str) -> PacketBuilder:
+        nonlocal calls
+        calls += 1
+        return original(self, app_id)
+
+    monkeypatch.setattr(PacketBuilder, "page_projection_builder", counted)
+    actual = workspace.search_evidence("sample_store", filters)
+
+    assert calls == 1
+    assert actual.items == baseline.items
+    assert [item.links for item in actual.items] == [item.links for item in baseline.items]
+    assert [item.link_completeness for item in actual.items] == [
+        item.link_completeness for item in baseline.items
+    ]
+    assert [item.period_limitations for item in actual.items] == [
+        item.period_limitations for item in baseline.items
+    ]
+    assert [[link.limitations for link in item.links] for item in actual.items] == [
+        [link.limitations for link in item.links] for item in baseline.items
+    ]
+    assert actual.diagnostics == baseline.diagnostics
+    assert actual.diagnostics.returned_results <= 20
+    assert actual.diagnostics.scanned_rows <= 200
+    assert actual.diagnostics.projection_attempts <= 50
+    assert all(len(item.links) <= 5 for item in actual.items)
+
+
+def test_page_context_builder_falls_back_when_context_is_not_prepared(tmp_path: Path) -> None:
+    connection, _, config, _ = _packet_state(tmp_path)
+    try:
+        builder = PacketBuilder(connection, config)
+        prepared = evidence_context_module._page_context_builder(builder, "sample_store")
+    finally:
+        connection.close()
+
+    assert prepared is not builder
 
 
 @pytest.mark.parametrize(
