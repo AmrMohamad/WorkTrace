@@ -2,7 +2,11 @@
 
 ## Status
 
-Proposed for the Phase 4 v2 prerequisite on 2026-08-30.
+**Accepted.** The Phase 4 v2 correction was implemented and merged in
+[PR #14](https://github.com/AmrMohamad/WorkTrace/pull/14) on 2026-08-30.
+
+The six-tool and `offset:` descriptions below are the historical compatibility constraints of that
+correction. See **Current MCP supersession** for the installed contract.
 
 ## Context
 
@@ -112,8 +116,8 @@ limitations
    remain `date_from` and `date_to`. Gaps remain a separately derived response rather than a packet
    field.
 8. Update CLI packet output, the MCP packet response, documentation, fixtures, golden tests, and
-   contract tests in one PR. CLI command shapes, all six MCP tool schemas, their limits, and MCP's
-   opaque `offset:` cursor do not change.
+   contract tests in one PR. At this correction's baseline, CLI command shapes, all six MCP tool
+   schemas, their limits, and MCP's opaque `offset:` cursor did not change.
 9. Do not migrate SQLite. No Phase 4 packet or question ID is persisted as ledger state.
    Packet schema version 2 is independent of the existing configuration schema version.
 
@@ -143,8 +147,18 @@ must be justified by that observed consumer and must not alter persisted evidenc
 - Review-only evidence does not support `action.coordination`.
 - Every non-null material answer retains stable evidence citations; unknown and unresolved answers
   remain null.
-- CLI and MCP golden fixtures update atomically while MCP continues to expose exactly six tools and
-  its existing cursor behavior.
+- CLI and MCP golden fixtures updated atomically while the then-current six-tool MCP surface and
+  cursor behavior remained unchanged.
+
+## Current MCP supersession
+
+[AgDR-0007](AgDR-0007-agent-evidence-workflow-migration.md), delivered through slices D and E in
+[PR #36](https://github.com/AmrMohamad/WorkTrace/pull/36) and
+[PR #37](https://github.com/AmrMohamad/WorkTrace/pull/37), supersedes only this record's original
+six-tool and unchanged-`offset:` MCP compatibility statements. The current server has seven bounded
+read-only tools and `wtc1:` candidate/evidence cursors; a legacy `offset:` cursor reports that an
+upgrade/restart is required. This does not alter Phase 4 v2's 30-question schema, packet envelope,
+or evidence authority rules.
 
 ## Artifacts
 

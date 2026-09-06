@@ -2,12 +2,17 @@
 
 ## Status
 
-Proposed for WorkTrace's first human interface on 2026-08-30.
+**Accepted.** The design record merged in [PR #13](https://github.com/AmrMohamad/WorkTrace/pull/13)
+on 2026-08-30 and its read-only TUI vertical slice merged in
+[PR #16](https://github.com/AmrMohamad/WorkTrace/pull/16) on 2026-08-31.
+
+The six-tool and `offset:` descriptions below are the historical contract at the time of this
+decision. See **Current MCP supersession** for the installed contract.
 
 ## Context
 
-WorkTrace exposes automation through a JSON-oriented Typer CLI and agent reads through six bounded
-MCP tools. A human reviewing years of evidence must currently connect candidates, participation,
+At the time of this decision, WorkTrace exposed automation through a JSON-oriented Typer CLI and
+agent reads through six bounded MCP tools. A human reviewing years of evidence must currently connect candidates, participation,
 delivery states, Phase 4 questions, gaps, and excerpts across separate JSON responses. The approved
 PRD requires one keyboard-first terminal journey without weakening the product's existing authority
 model: the CLI owns every write and MCP remains SQLite-only and read-only.
@@ -43,8 +48,8 @@ approved terminal workflow while preserving CLI and MCP authority boundaries.
    receives no provider adapter, HTTP client, importer, decision writer, migration operation,
    maintenance operation, export, backup, purge, configuration editor, or write connection.
 5. The TUI neither invokes the CLI nor calls MCP internally. `PacketBuilder` remains the canonical
-   claim projection. `WorkTraceTools`, its six schemas, its response limits, and its `offset:`
-   cursor remain unchanged.
+   claim projection. At this decision's baseline, `WorkTraceTools`, its six schemas, its response
+   limits, and its `offset:` cursor remained unchanged.
 6. The TUI gets a separate generation-bound, scan-bounded candidate query. Its cursor contains a
    token derived from app ID, generation timestamp, and generator version plus the last raw
    candidate ID scanned. It does not contain a candidate count and does not require a new index.
@@ -93,6 +98,16 @@ approved terminal workflow while preserving CLI and MCP authority boundaries.
   database watching, writer locks, backup redesign, and WAL reconciliation remain outside this
   authority decision.
 
+## Current MCP supersession
+
+[AgDR-0007](AgDR-0007-agent-evidence-workflow-migration.md), delivered through slices D and E in
+[PR #36](https://github.com/AmrMohamad/WorkTrace/pull/36) and
+[PR #37](https://github.com/AmrMohamad/WorkTrace/pull/37), supersedes only this record's original
+six-tool and unchanged-`offset:` MCP statements. The installed MCP server now exposes seven bounded
+read-only tools and its candidate/evidence traversals use `wtc1:` cursors bound to their view and
+filters; legacy `offset:` cursors require an upgrade/restart. The TUI's separate cursor and all
+read-only, literal-rendering, clipboard, and worker protections in this decision remain in force.
+
 ## Reversal triggers
 
 Revisit if Textual 8.x cannot provide the verified keyboard, worker, packaging, 80x24, or terminal
@@ -118,7 +133,7 @@ recovery, and cancellation; it must not silently broaden this record.
   unchanged and never invokes `copy_to_clipboard`, while the validated-ID action copies the exact
   ID once.
 - An isolated wheel smoke proves the dependency, entry point, and TCSS resource are installed.
-- Existing CLI and six-tool MCP regression suites remain green.
+- Existing CLI and current seven-tool MCP regression suites remain green.
 
 ## Artifacts
 

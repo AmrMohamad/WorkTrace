@@ -1,6 +1,6 @@
 # Technical Design: WorkTrace Read-Only Human TUI
 
-**Status**: In Review
+**Status**: Accepted and implemented for the original read-only review journey
 
 **Author**: Hisham (Tech Lead)
 
@@ -9,6 +9,11 @@
 **PRD**: [WorkTrace Read-Only Human TUI](../prds/worktrace-read-only-human-tui.md)
 
 **Tracking**: [#8](https://github.com/AmrMohamad/WorkTrace/issues/8)
+
+**Delivery**: The design merged in [PR #13](https://github.com/AmrMohamad/WorkTrace/pull/13) and
+the complete original vertical slice merged in [PR #16](https://github.com/AmrMohamad/WorkTrace/pull/16).
+The #22 evidence-search addendum below is an accepted implementation contract, not a statement that
+search has shipped.
 
 ## Overview
 
@@ -20,9 +25,10 @@ structurally read-only: it receives configuration and short-lived query-only SQL
 but no provider, network, write, migration, maintenance, export, backup, purge, or configuration
 editing capability.
 
-The executable TUI is delivered only after the Phase 4 v2 packet correction and a separate
-generation-bound candidate query. Existing CLI commands and all six MCP tools, including MCP's
-opaque `offset:` cursors, remain unchanged.
+The executable TUI was delivered after the Phase 4 v2 packet correction and a separate
+generation-bound candidate query. At that original baseline, existing CLI commands and all six MCP
+tools, including MCP's opaque `offset:` cursors, remained unchanged. The current MCP contract is
+recorded below.
 
 ### Goals
 
@@ -41,7 +47,7 @@ opaque `offset:` cursors, remain unchanged.
 - Jira, GitLab, local Git, HTTP, socket, background synchronization, database watching, or daemon
   access from the TUI.
 - Calling WorkTrace CLI commands as subprocesses, parsing CLI JSON, or calling MCP internally.
-- Changing the MCP tool count, schemas, bounds, response envelope, or `offset:` cursor.
+- Changing the current MCP tool count, schemas, bounds, response envelope, or `wtc1:` cursor.
 - Persistent UI preferences, a generic service framework, or a new materialized candidate index.
 - General evidence-body, packet, title, error, URL, or screenshot capture actions.
 
@@ -51,8 +57,18 @@ opaque `offset:` cursors, remain unchanged.
   capability-enforced, read-only runtime boundary.
 - [AgDR-0006](../agdr/AgDR-0006-phase4-v2-packet-compatibility.md) defines the deliberate Phase 4
   v2 packet correction that must merge before the TUI.
+- [AgDR-0007](../agdr/AgDR-0007-agent-evidence-workflow-migration.md) supersedes the original
+  six-tool/`offset:` MCP constraint without changing the TUI's separate read-only authority.
 - The approved PRD owns the user journey and interaction requirements. This document owns the
   implementation boundaries and delivery sequence.
+
+### Current MCP contract
+
+The shipped MCP server now exposes seven bounded, read-only tools. Its candidate and evidence
+traversals use `wtc1:` cursors bound to application, collection, filters, view, and continuation
+position; a legacy `offset:` cursor reports an upgrade/restart requirement. This design's original
+six-tool language remains historical context only. The TUI neither invokes the CLI nor calls MCP,
+and #22 does not change MCP schemas, limits, or cursor formats.
 
 ## Architecture
 
@@ -61,7 +77,7 @@ opaque `offset:` cursors, remain unchanged.
 ```mermaid
 flowchart LR
     CLI[Typer CLI\nall mutations and existing reads]
-    MCP[MCP adapter\nsix bounded read tools]
+    MCP[MCP adapter\nseven bounded read tools]
     TUI[Textual TUI\nhuman read-only review]
     WORKSPACE[ReadOnlyWorkspace]
     PAGE[TUI candidate page query]
@@ -434,6 +450,64 @@ UI state remains in memory and contains only the current app, screen, selected s
 page, cursor history, request IDs, and compact-mode choice. It does not persist evidence, drafts,
 credentials, URLs, or preferences.
 
+## Evidence discovery addendum — [#22](https://github.com/AmrMohamad/WorkTrace/issues/22) implementation contract, not implemented
+
+`ReadOnlyWorkspace.search_evidence()` will return frozen page, result, link, and TUI-search-cursor
+DTOs. Each completed page retains successfully submitted parameters, returned results,
+continuation, read revision/read-model version, readiness, and link limitations. A result carries
+stable observation/object IDs, source/kind, bounded title/period metadata, and canonical links. The
+cursor binds app, submitted filters, revision, read-model version, and the final scanned
+freshness/observation-ID key. It is a separate TUI type: neither candidate-browser nor MCP cursor
+formats change. The screen renders a result table, a separate selected-result canonical-link list,
+and literal status text for submitted filters, page state, and link-coverage limitations.
+
+The caller validates the required query (trimmed, 1–500 characters, no NUL), optional source
+(`git`, `jira`, `gitlab`, or `manual`), optional module text (trimmed, 1–200 characters, no NUL),
+inclusive ISO dates, and date order before starting a worker. One worker-local `mode=ro`,
+`query_only`, 500-ms-busy-timeout SQLite snapshot covers scope, cursor/revision validation, current
+evidence selection, canonical enrichment, readiness, and limitations; it closes before the DTO
+returns to the event loop. Changing filters starts at the first key; a changed revision invalidates
+the traversal.
+
+The implementation reuses the existing scanner: no more than 200 raw current-observation rows are
+scanned, at most 20 eligible results are returned, and order is freshness then observation ID. It
+keeps the scanner's literal, case-insensitive title/body/data search and literal module-data match;
+module text is neither classification nor ranking. Activity dates, rather than fetch/freshness
+dates, decide inclusion. Undated evidence is included without date filters and excluded with them,
+with that exclusion reported. A continuation can follow a short or empty result page.
+
+Canonical enrichment reuses the membership/lineage interpretation: locate generated/exact accepted
+decision candidates, resolve aliases, deduplicate canonical identities, and project only effective
+material/context members. At most 50 **distinct canonical projections** are attempted over the
+whole page, including attempts yielding no effective link. Allocate that budget across results;
+reuse a projection only within this snapshot; cap one result at five links. Projection exhaustion or
+the display cap marks coverage incomplete without inventing a total, differentiating complete no-link,
+partial verified-link, and incomplete no-link outcomes. It adds neither an index nor a persistent
+cache. The 50 count is canonical projection work only, while broader authority and decision-context
+costs remain separately measurable. `contribution_review()` must resolve a canonical, in-scope
+confirmed contribution and build its packet in the same snapshot even when no generated candidate
+remains; confirmed status comes from active lineage while applicable generated-candidate statuses
+remain preserved; removed, ignored, or out-of-scope targets return recoverable errors.
+
+`/` from a settled candidate browser pushes the search screen and focuses query. The explicit Search
+action/Enter from form fields starts work; Tab moves form, results, and link list; Enter opens an
+excerpt for a result or contribution review for a link. Back/review and Back/search restore the
+same selected search/candidate contexts, global Return reveals the original candidate instance, and
+application switching uses stack normalization. The state model separately stores drafts, submitted
+filters, displayed page/selection, committed cursor history, and pending request. Only the matching
+successful request commits state; paging is ignored while pending, as are stale/closed/other-app
+responses. `n`/`p` next/previous actions work only outside editable focus and against this committed
+history; a matching successful response changes the page and its history together. Ordinary errors
+retain the displayed page. Invalidation clears selectable rows and links,
+restarts once, then exposes a recoverable empty Retry state if that restart fails. Compact form
+scrolling at 80x24 and more rows at 120x40 preserve this behavior; editable fields retain printable
+keys as text.
+
+The existing literal terminal rendering and `ALLOW_SELECT = False` policy applies to filters,
+status, links, errors, and modal content. Search exposes evidence only through the bounded excerpt
+modal and stable IDs only through the validated explicit copy action. It introduces no provider,
+subprocess, write, configuration, export, history, or refresh capability.
+
 ## Packaging
 
 The complete TUI PR adds `textual>=8.2.8,<9` and updates `uv.lock`. It explicitly includes
@@ -483,7 +557,8 @@ in an incomplete shell PR.
 - Every non-null material answer retains stable evidence citations; unknown and unresolved answers
   remain null.
 - CLI packet output and MCP packet output expose v2 while command and tool schemas remain stable.
-- MCP continues to accept and return its existing opaque `offset:` cursor.
+- At the original packet-correction baseline, MCP continued to accept and return its existing opaque
+  `offset:` cursor; the current MCP cursor contract is documented above.
 
 ### Candidate query
 

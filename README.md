@@ -45,8 +45,8 @@ grouping decisions, canonical packet interpretation, and safe upgrade—see
 separately authorized live-provider and private-ledger operations.
 
 ```console
-uv run worktrace import git sample_store_b2c /configured/repository 2024-01-01 2024-12-31
-uv run worktrace import all sample_store_b2c 2024-01-01 2024-12-31
+uv run worktrace import git sample_store_b2c /configured/repository
+uv run worktrace import all sample_store_b2c
 uv run worktrace status sample_store_b2c
 uv run worktrace rebuild all sample_store_b2c
 uv run worktrace candidates list sample_store_b2c
@@ -54,8 +54,11 @@ uv run worktrace packet candidate:stable-id
 uv run worktrace gaps candidate:stable-id
 ```
 
-Use `worktrace --help` and each subcommand's `--help` for all commands. Human corrections are
-append-only events; `undo` writes a compensating event rather than deleting history.
+Use `worktrace --help` and each subcommand's `--help` for all commands. These import commands use
+the complete configured employment interval. Supplying dates is allowed only when they exactly match
+that configured interval; a partial range is rejected because it could replace authoritative
+evidence with a narrower scope. Human corrections are append-only events; `undo` writes a
+compensating event rather than deleting history.
 
 ## Identity upgrade and repair
 
