@@ -297,6 +297,7 @@ def scan_evidence(
     date_from: str | None,
     date_to: str | None,
     after: tuple[str, str] | None = None,
+    page_builder: PacketBuilder | None = None,
 ) -> Iterator[ScannedRow]:
     """Yield at most 200 evidence-search rows in freshness/id keyset order."""
 
@@ -327,15 +328,15 @@ def scan_evidence(
                 limit=1,
             )
         )
-    page_builder: PacketBuilder | None = None
+    projection_builder = page_builder
 
     def project(row: sqlite3.Row) -> dict[str, object] | None:
-        nonlocal page_builder
-        if page_builder is None:
-            page_builder = _page_builder(builder, app_id, diagnostics)
+        nonlocal projection_builder
+        if projection_builder is None:
+            projection_builder = _page_builder(builder, app_id, diagnostics)
         diagnostics.hydrated_body_bytes += len(str(row["page_text"]).encode("utf-8"))
         record = _evidence_record_from_row(row, context_only=False)
-        period = page_builder._activity_period([record])
+        period = projection_builder._activity_period([record])
         if not period.matches(date_from, date_to, builder.config.employment_timezone):
             return None
         return {

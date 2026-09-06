@@ -6,6 +6,7 @@ from textual.message import Message
 
 from worktrace.errors import DatabaseError, NotFound, ScopeViolation
 from worktrace.read_models.candidates import CandidateGenerationChanged, CandidatePage
+from worktrace.read_models.evidence_search import EvidenceSearchInvalidated, EvidenceSearchPage
 from worktrace.read_workspace import (
     ApplicationSummary,
     ContributionReview,
@@ -18,6 +19,7 @@ from worktrace.read_workspace import (
 class FailureKind(StrEnum):
     BUSY = "busy"
     GENERATION_CHANGED = "generation_changed"
+    EVIDENCE_CHANGED = "evidence_changed"
     NOT_FOUND = "not_found"
     OUT_OF_SCOPE = "out_of_scope"
     UPGRADE_REQUIRED = "upgrade_required"
@@ -31,6 +33,8 @@ def failure_kind(error: Exception) -> FailureKind:
         return FailureKind.BUSY
     if isinstance(error, CandidateGenerationChanged):
         return FailureKind.GENERATION_CHANGED
+    if isinstance(error, EvidenceSearchInvalidated):
+        return FailureKind.EVIDENCE_CHANGED
     if isinstance(error, NotFound):
         return FailureKind.NOT_FOUND
     if isinstance(error, ScopeViolation):
@@ -60,6 +64,13 @@ class SourceStatusLoaded(Message):
 
 class CandidatePageLoaded(Message):
     def __init__(self, request_id: int, page: CandidatePage) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.page = page
+
+
+class EvidenceSearchPageLoaded(Message):
+    def __init__(self, request_id: int, page: EvidenceSearchPage) -> None:
         super().__init__()
         self.request_id = request_id
         self.page = page

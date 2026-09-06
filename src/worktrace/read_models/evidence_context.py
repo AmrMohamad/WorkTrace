@@ -26,6 +26,7 @@ from worktrace.db.authority import (
 from worktrace.db.repository import source_instance_id
 from worktrace.errors import NotFound, ScopeViolation
 from worktrace.packets.builder import PacketBuilder
+from worktrace.packets.models import ContributionView
 from worktrace.read_models.candidates import _active_generation
 
 MAX_CONTEXT_SCAN_BUDGET = 200
@@ -583,7 +584,12 @@ def _decision_mentions_object(action: str, payload: Mapping[str, object], object
     return False
 
 
-def _membership_locator_ids(builder: PacketBuilder, app_id: str, object_id: str) -> set[str]:
+def membership_locator_ids(builder: PacketBuilder, app_id: str, object_id: str) -> set[str]:
+    """Find generated and decision-backed membership locators for one object.
+
+    This intentionally does not resolve a contribution.  Callers which need
+    several objects can deduplicate aliases before paying for any projection.
+    """
     result = {
         str(row["candidate_id"])
         for row in builder.connection.execute(
@@ -607,7 +613,7 @@ def _membership_locator_ids(builder: PacketBuilder, app_id: str, object_id: str)
     return result
 
 
-def _lineage_identity(
+def lineage_identity(
     builder: PacketBuilder, app_id: str, identifier: str
 ) -> tuple[str, str | None, str, bool]:
     context_builder = builder.page_projection_builder(app_id)
@@ -638,6 +644,134 @@ def _lineage_identity(
     return contribution_id, contribution_id, lineage.canonical_candidate_id, True
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalMembershipLocator:
+    """One canonical group reachable from an object's membership locator."""
+
+    key: str
+    identifier: str
+    contribution_id: str | None
+    candidate_id: str
+    confirmed: bool
+
+
+def canonical_membership_locators(
+    builder: PacketBuilder, app_id: str, object_id: str
+) -> tuple[CanonicalMembershipLocator, ...]:
+    """Return deterministic, alias-deduplicated canonical membership groups."""
+
+    context_builder = builder.page_projection_builder(app_id)
+    by_key: dict[str, CanonicalMembershipLocator] = {}
+    for identifier in sorted(membership_locator_ids(context_builder, app_id, object_id)):
+        try:
+            key, contribution_id, candidate_id, confirmed = lineage_identity(
+                context_builder, app_id, identifier
+            )
+        except ScopeViolation:
+            continue
+        locator = CanonicalMembershipLocator(
+            key=key,
+            identifier=identifier,
+            contribution_id=contribution_id,
+            candidate_id=candidate_id,
+            confirmed=confirmed,
+        )
+        existing = by_key.get(key)
+        if existing is None or (locator.confirmed and not existing.confirmed):
+            by_key[key] = locator
+    return tuple(by_key[key] for key in sorted(by_key))
+
+
+def resolve_canonical_membership(
+    builder: PacketBuilder,
+    app_id: str,
+    object_id: str,
+    locator: CanonicalMembershipLocator,
+    *,
+    legacy_generated: bool,
+) -> dict[str, object] | None:
+    """Resolve one group to an effective membership, if it remains applicable.
+
+    One invocation is one canonical projection attempt.  It deliberately
+    returns ``None`` for a disappeared, ignored, unsupported, or nonmatching
+    locator so callers can account for that work without inventing a link.
+    """
+
+    contribution = resolve_canonical_group(
+        builder, app_id, locator, legacy_generated=legacy_generated
+    )
+    if contribution is None:
+        return None
+    return project_canonical_membership(builder, app_id, object_id, locator, contribution)
+
+
+def resolve_canonical_group(
+    builder: PacketBuilder,
+    app_id: str,
+    locator: CanonicalMembershipLocator,
+    *,
+    legacy_generated: bool,
+) -> ContributionView | None:
+    """Resolve one canonical group once, independent of the object being displayed."""
+
+    if legacy_generated and not locator.confirmed:
+        return None
+    context_builder = builder.page_projection_builder(app_id)
+    try:
+        return context_builder.resolve_contribution(locator.identifier)
+    except (NotFound, ScopeViolation):
+        return None
+
+
+def project_canonical_membership(
+    builder: PacketBuilder,
+    app_id: str,
+    object_id: str,
+    locator: CanonicalMembershipLocator,
+    contribution: ContributionView,
+) -> dict[str, object] | None:
+    """Apply one already-resolved group to one evidence object without resolving again."""
+
+    context_builder = builder.page_projection_builder(app_id)
+    object_description = describe_object(context_builder, app_id, object_id)
+    object_has_current = object_description["current_observation_id"] is not None
+    role = (
+        "material"
+        if object_id in contribution.member_ids
+        else "context"
+        if object_id in contribution.context_ids
+        else None
+    )
+    if role is None:
+        return None
+    citations = sorted(contribution.decision_evidence_ids) if locator.confirmed else []
+    if not citations and object_has_current:
+        citations = [str(object_description["current_observation_id"])]
+    raw_limitations = object_description["limitations"]
+    limitations = list(raw_limitations) if isinstance(raw_limitations, list) else []
+    generation = _active_generation(builder.connection, app_id)
+    legacy_generated = generation is not None and generation.generator_version != GENERATOR_VERSION
+    if legacy_generated and locator.confirmed:
+        limitations.append(
+            "Generated locator coverage is legacy; this row persists because "
+            "a human-confirmed decision lineage remains effective."
+        )
+    return {
+        "object_id": object_id,
+        "candidate_id": locator.candidate_id,
+        "contribution_id": locator.contribution_id,
+        "role": role,
+        "basis": "confirmed" if locator.confirmed else "suggestion",
+        "status": "confirmed" if locator.confirmed else "suggestion",
+        "evidence_state": (
+            "authoritative_current" if object_has_current else "current_evidence_unavailable"
+        ),
+        "citations": citations[:20],
+        "citations_truncated": len(citations) > 20,
+        "limitations": limitations,
+    }
+
+
 def scan_memberships(
     builder: PacketBuilder,
     app_id: str,
@@ -652,25 +786,11 @@ def scan_memberships(
     generation_token = generation.token if generation is not None else None
     legacy_generated = generation is not None and generation.generator_version != GENERATOR_VERSION
     context_builder = builder.page_projection_builder(app_id)
-    locator_ids = _membership_locator_ids(context_builder, app_id, object_id)
-    by_key: dict[str, tuple[str, str | None, str, bool]] = {}
-    for identifier in sorted(locator_ids):
-        try:
-            key, contribution_id, candidate_id, confirmed = _lineage_identity(
-                context_builder, app_id, identifier
-            )
-        except ScopeViolation:
-            continue
-        existing = by_key.get(key)
-        if existing is None or (confirmed and not existing[3]):
-            by_key[key] = (identifier, contribution_id, candidate_id, confirmed)
-
-    object_description = describe_object(context_builder, app_id, object_id)
-    object_has_current = object_description["current_observation_id"] is not None
-    entries = [(key, *value) for key, value in sorted(by_key.items()) if key > (after or "")][
+    locators = canonical_membership_locators(context_builder, app_id, object_id)
+    entries = [locator for locator in locators if locator.key > (after or "")][
         :MAX_CONTEXT_SCAN_BUDGET
     ]
-    has_more = len([key for key in by_key if key > (after or "")]) > len(entries)
+    has_more = len([locator for locator in locators if locator.key > (after or "")]) > len(entries)
 
     class _MembershipRows(Iterator[ScannedRow]):
         def __init__(self) -> None:
@@ -679,55 +799,17 @@ def scan_memberships(
         def __next__(self) -> ScannedRow:
             if self.index >= len(entries):
                 raise StopIteration
-            key, identifier, contribution_id, candidate_id, confirmed = entries[self.index]
+            locator = entries[self.index]
             self.index += 1
-            item: dict[str, object] | None = None
-            # Old generated rows are not newly validated by an upgrade.  A
-            # human-confirmed lineage remains inspectable despite that gap.
-            if not (legacy_generated and not confirmed):
-                try:
-                    contribution = context_builder.resolve_contribution(identifier)
-                except (NotFound, ScopeViolation):
-                    contribution = None
-                if contribution is not None:
-                    role = (
-                        "material"
-                        if object_id in contribution.member_ids
-                        else "context"
-                        if object_id in contribution.context_ids
-                        else None
-                    )
-                    if role is not None:
-                        citations = sorted(contribution.decision_evidence_ids) if confirmed else []
-                        if not citations and object_has_current:
-                            citations = [str(object_description["current_observation_id"])]
-                        raw_limitations = object_description["limitations"]
-                        limitations = (
-                            list(raw_limitations) if isinstance(raw_limitations, list) else []
-                        )
-                        if legacy_generated and confirmed:
-                            limitations.append(
-                                "Generated locator coverage is legacy; this row persists because "
-                                "a human-confirmed decision lineage remains effective."
-                            )
-                        item = {
-                            "object_id": object_id,
-                            "candidate_id": candidate_id,
-                            "contribution_id": contribution_id,
-                            "role": role,
-                            "basis": "confirmed" if confirmed else "suggestion",
-                            "status": "confirmed" if confirmed else "suggestion",
-                            "evidence_state": (
-                                "authoritative_current"
-                                if object_has_current
-                                else "current_evidence_unavailable"
-                            ),
-                            "citations": citations[:20],
-                            "citations_truncated": len(citations) > 20,
-                            "limitations": limitations,
-                        }
+            item = resolve_canonical_membership(
+                context_builder,
+                app_id,
+                object_id,
+                locator,
+                legacy_generated=legacy_generated,
+            )
             return (
-                {"phase": "after", "key": key},
+                {"phase": "after", "key": locator.key},
                 item,
                 self.index < len(entries) or has_more,
             )

@@ -111,6 +111,7 @@ class CandidateScreen(WorkTraceScreen):
         Binding("n", "next_page", "Next page"),
         Binding("p", "previous_page", "Previous page"),
         Binding("r", "refresh", "Refresh"),
+        Binding("/", "open_evidence_search", "Search evidence"),
         Binding("a", "app.switch_application", "Switch app"),
         Binding("y", "app.copy_selected_id", "Copy ID"),
         Binding("q,escape", "app.quit", "Quit"),
@@ -166,6 +167,14 @@ class CandidateScreen(WorkTraceScreen):
         self.query_one("#candidate-message", Static).update("Refreshing read-only data…")
         self._load_source_status()
         self._begin_page_load(None, "restart")
+
+    def action_open_evidence_search(self) -> None:
+        if self._page_load_in_flight():
+            self.app.notify(
+                "Wait for candidate paging to settle before searching evidence.", markup=False
+            )
+            return
+        cast("WorkTraceApp", self.app).open_evidence_search(self.application.app_id)
 
     def action_cursor_down(self) -> None:
         focused = self.focused

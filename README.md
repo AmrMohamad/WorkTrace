@@ -170,8 +170,15 @@ uv run worktrace ui --app sample_store_b2c --candidate candidate:stable-id
 
 The UI reviews source-attempt status, bounded candidate pages, contribution evidence,
 participation, seven independent delivery states, Phase 4 questions and gaps, and bounded source
-excerpts. It does not import evidence, contact providers, write decisions, rebuild data, or perform
-maintenance; those operations remain explicit CLI commands.
+excerpts. From a settled candidate page, press `/` to open evidence search. Enter a literal query
+and optional source, module text, and activity-date filters, then press Enter or Search. Result
+Enter opens a bounded excerpt; contribution-link Enter opens its review; `n`/`p` page only outside
+an editable field. A short or empty evidence page may still continue, and incomplete canonical
+links explicitly report the projection-budget or display-cap limitation.
+
+The UI does not import evidence, contact providers, write decisions, rebuild data, or perform
+maintenance; those operations remain explicit CLI commands. TUI evidence continuations are local
+and separate from candidate-browser and MCP cursor formats.
 
 ## MCP
 
@@ -197,7 +204,8 @@ without dropping any of the 30 question IDs/statuses or support/contradiction pr
 detail with either `section` (the canonical section name) or `question_id`, then follow
 `detail_cursor`, always carrying `expected_view_token`. Detail entries include stable citation
 IDs and ordered answer/limitation chunks. An explicit size error never advances continuation.
-The TUI keeps its existing navigation and cursor contract.
+The TUI candidate browser keeps its existing navigation and cursor contract; evidence search uses
+its own in-memory continuation and does not alter MCP cursors.
 
 `worktrace serve-mcp` exposes exactly seven bounded, read-only tools over stdio. `get_evidence_context`
 explains one configured source object through independently paged references and effective memberships;

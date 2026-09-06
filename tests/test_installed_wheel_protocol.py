@@ -188,6 +188,45 @@ gitlab_project_ids = []
     assert str(observed["stylesheet_text"])
 
 
+def test_installed_wheel_runs_headless_imported_evidence_search_outside_checkout(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    checkout = Path(__file__).resolve().parents[1]
+    python, _prefix, working_directory = _wheel_environment(tmp_path, checkout)
+    fixture = PublicWorkflowFixture.create(tmp_path / "search-fixture", monkeypatch)
+    import_fixture(fixture)
+    result = subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import json; from pathlib import Path; from worktrace.config import load_config; "
+                "from worktrace.read_models.evidence_search import "
+                "normalize_evidence_search_filters; "
+                "from worktrace.read_workspace import ReadOnlyWorkspace; "
+                f"workspace=ReadOnlyWorkspace(load_config(Path({str(fixture.config_path)!r}))); "
+                "page=workspace.search_evidence('sample', "
+                "normalize_evidence_search_filters('DEMO-1 context')); "
+                "link=next(link for item in page.items for link in item.links); "
+                "review=workspace.contribution_review('sample', link.identifier); "
+                "print(json.dumps({'items': len(page.items), 'link': link.identifier, "
+                "'status': review.status}))"
+            ),
+        ],
+        check=False,
+        cwd=working_directory,
+        env=_installed_environment(),
+        capture_output=True,
+        text=True,
+        timeout=_INSTALLED_COMMAND_TIMEOUT_SECONDS,
+    )
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert int(observed["items"]) > 0
+    assert str(observed["link"]).startswith("candidate:")
+    assert observed["status"] == "candidate"
+
+
 @pytest.mark.asyncio
 async def test_installed_wheel_stdio_protocol_uses_site_packages_outside_checkout(
     tmp_path: Path, monkeypatch: Any
