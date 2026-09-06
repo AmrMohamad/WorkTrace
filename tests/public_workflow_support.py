@@ -77,8 +77,8 @@ class PublicWorkflowFixture:
         *,
         bulk_keys: int = 0,
         jira_issues: dict[str, dict[str, object]] | None = None,
-        jira_comments: list[dict[str, object]] | None = None,
-        jira_changelog: list[dict[str, object]] | None = None,
+        jira_comments: dict[str, list[dict[str, object]]] | None = None,
+        jira_changelog: dict[str, list[dict[str, object]]] | None = None,
         dense_context: bool = False,
     ) -> PublicWorkflowFixture:
         for key in list(os.environ):
@@ -164,6 +164,7 @@ gitlab_project_ids = []
         monkeypatch.setenv("WORKTRACE_JIRA_BASE_URL", "https://jira.fixture")
         monkeypatch.setenv("WORKTRACE_JIRA_EMAIL", "fixture@example.test")
         monkeypatch.setenv("WORKTRACE_JIRA_API_TOKEN", "fixture-token")
+        available = jira_issues or {"DEMO-1": _issue("10001", "DEMO-1", "Later edited issue")}
 
         def handler(request: httpx.Request) -> httpx.Response:
             fixture.jira_requests.append(f"{request.method} {request.url.path}")
@@ -173,41 +174,67 @@ gitlab_project_ids = []
                 raw = json.loads(request.content)
                 jql = str(raw.get("jql", ""))
                 fixture.jira_jql.append(jql)
-                keys = sorted(set(re.findall(r'"(DEMO-[0-9]+)"', jql)))
-                available = jira_issues or {
-                    "DEMO-1": _issue("10001", "DEMO-1", "Later edited issue")
-                }
+                if 'project in ("DEMO")' not in jql:
+                    raise AssertionError(f"unexpected Jira project scope: {jql}")
+                if "key in" in jql:
+                    reason = "exact_key"
+                    keys = sorted(set(re.findall(r'"(DEMO-[0-9]+)"', jql)))
+                    issues = [available[key] for key in keys if key in available]
+                elif "updatedBy" in jql:
+                    reason = "historical_updater"
+                    issues = []
+                elif "assignee WAS" in jql:
+                    reason = "historical_assignee"
+                    issues = []
+                elif "creator =" in jql:
+                    reason = "creator_created"
+                    issues = []
+                else:
+                    raise AssertionError(f"unrecognized Jira discovery query: {jql}")
+                if reason != "exact_key":
+                    if (
+                        "self-jira" not in jql
+                        or '"2025-12-31"' not in jql
+                        or '"2027-01-02"' not in jql
+                    ):
+                        raise AssertionError(f"invalid historical scope: {jql}")
+                    issues = []
+                    for issue in available.values():
+                        selected_by = issue.get("_workflow_selected_by", [])
+                        if isinstance(selected_by, list) and reason in selected_by:
+                            issues.append(issue)
                 return httpx.Response(
                     200,
-                    json={
-                        "issues": (
-                            [available[key] for key in keys if key in available]
-                            if keys
-                            else list(available.values())
-                        ),
-                        "isLast": True,
-                    },
+                    json={"issues": issues, "isLast": True},
                     request=request,
                 )
             if request.url.path.endswith("/comment"):
+                issue_id = request.url.path.rsplit("/", 2)[-2]
+                if issue_id not in {str(value["id"]) for value in available.values()}:
+                    raise AssertionError(f"unknown Jira comment issue: {issue_id}")
+                comments = (jira_comments or {}).get(issue_id, [])
                 return httpx.Response(
                     200,
                     json={
                         "startAt": 0,
                         "maxResults": 100,
-                        "comments": jira_comments or [],
-                        "total": len(jira_comments or []),
+                        "comments": comments,
+                        "total": len(comments),
                     },
                     request=request,
                 )
             if request.url.path.endswith("/changelog"):
+                issue_id = request.url.path.rsplit("/", 2)[-2]
+                if issue_id not in {str(value["id"]) for value in available.values()}:
+                    raise AssertionError(f"unknown Jira changelog issue: {issue_id}")
+                changelog = (jira_changelog or {}).get(issue_id, [])
                 return httpx.Response(
                     200,
                     json={
                         "startAt": 0,
                         "maxResults": 100,
-                        "total": len(jira_changelog or []),
-                        "values": jira_changelog or [],
+                        "total": len(changelog),
+                        "values": changelog,
                         "isLast": True,
                     },
                     request=request,

@@ -143,6 +143,7 @@ def test_actual_cli_approval_commands_reject_invalid_followups(
 
 def test_imported_no_code_jira_history_stays_unknown(tmp_path: Path, monkeypatch: Any) -> None:
     no_code = _issue("10009", "DEMO-9", "No-code investigation")
+    no_code["_workflow_selected_by"] = ["historical_assignee"]
     no_code["fields"]["updated"] = "2027-01-02T12:00:00Z"  # type: ignore[index]
     comment: dict[str, object] = {
         "id": "40001",
@@ -156,23 +157,25 @@ def test_imported_no_code_jira_history_stays_unknown(tmp_path: Path, monkeypatch
         tmp_path,
         monkeypatch,
         jira_issues={"DEMO-1": _issue("10001", "DEMO-1", "Later edited issue"), "DEMO-9": no_code},
-        jira_comments=[comment],
-        jira_changelog=[
-            {
-                "id": "50001",
-                "created": "2026-06-01T12:00:00Z",
-                "author": {"accountId": "colleague", "displayName": "Fixture Engineer"},
-                "items": [
-                    {
-                        "field": "assignee",
-                        "from": "former",
-                        "fromString": "Former",
-                        "to": "self-jira",
-                        "toString": "Renamed Engineer",
-                    }
-                ],
-            }
-        ],
+        jira_comments={"10009": [comment]},
+        jira_changelog={
+            "10009": [
+                {
+                    "id": "50001",
+                    "created": "2026-06-01T12:00:00Z",
+                    "author": {"accountId": "colleague", "displayName": "Fixture Engineer"},
+                    "items": [
+                        {
+                            "field": "assignee",
+                            "from": "former",
+                            "fromString": "Former",
+                            "to": "self-jira",
+                            "toString": "Renamed Engineer",
+                        }
+                    ],
+                }
+            ]
+        },
     )
     assert fixture.invoke("init").exit_code == 0
     assert fixture.invoke("import", "all", "sample").exit_code == 0
@@ -223,7 +226,9 @@ def test_imported_comment_history_and_git_identity_roles(tmp_path: Path, monkeyp
         "updateAuthor": {"accountId": "colleague", "displayName": "Fixture Engineer"},
         "body": {"type": "doc", "content": []},
     }
-    fixture = PublicWorkflowFixture.create(tmp_path, monkeypatch, jira_comments=[comment])
+    fixture = PublicWorkflowFixture.create(
+        tmp_path, monkeypatch, jira_comments={"10001": [comment]}
+    )
     assert fixture.invoke("init").exit_code == 0
     assert fixture.invoke("import", "all", "sample").exit_code == 0
     configuration = load_config(fixture.config_path)
@@ -262,6 +267,7 @@ def test_undated_historical_jira_is_visible_only_without_date_filter(
     fields = undated["fields"]
     assert isinstance(fields, dict)
     fields.update({"created": None, "updated": None, "resolutiondate": None})
+    undated["_workflow_selected_by"] = ["historical_updater"]
     fixture = PublicWorkflowFixture.create(
         tmp_path,
         monkeypatch,
