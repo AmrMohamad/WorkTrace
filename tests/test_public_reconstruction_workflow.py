@@ -349,3 +349,31 @@ def test_jira_subresources_page_per_issue_without_duplicate_imports(
         )
     finally:
         connection.close()
+
+
+def test_failed_jira_hydration_retains_prior_authority(tmp_path: Path, monkeypatch: Any) -> None:
+    issue = _issue("10001", "DEMO-1", "Version A retained")
+    failures: dict[tuple[str, str], int] = {}
+    fixture = PublicWorkflowFixture.create(
+        tmp_path, monkeypatch, jira_issues={"DEMO-1": issue}, jira_failures=failures
+    )
+    assert fixture.invoke("init").exit_code == 0
+    assert fixture.invoke("import", "all", "sample").exit_code == 0
+    issue["fields"]["summary"] = "Version B partial"  # type: ignore[index]
+    failures[("changelog", "10001")] = 500
+    failed = fixture.invoke("import", "all", "sample")
+    assert failed.exit_code != 0
+    retained = fixture.tools.search_evidence(app_id="sample", query="Version A retained", limit=10)
+    assert retained["results"]
+    assert (
+        fixture.tools.search_evidence(app_id="sample", query="Version B partial", limit=10)[
+            "results"
+        ]
+        == []
+    )
+    failures.clear()
+    retried = fixture.invoke("import", "all", "sample")
+    assert retried.exit_code == 0, retried.output
+    assert fixture.tools.search_evidence(app_id="sample", query="Version B partial", limit=10)[
+        "results"
+    ]

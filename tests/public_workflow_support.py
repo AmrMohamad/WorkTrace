@@ -58,6 +58,7 @@ class PublicWorkflowFixture:
     runner: CliRunner
     jira_requests: list[str] = field(default_factory=list)
     jira_jql: list[str] = field(default_factory=list)
+    jira_failures: dict[tuple[str, str], int] = field(default_factory=dict)
     commits: dict[str, str] = field(default_factory=dict)
     dense_object_query: str = "Later edited issue"
     dense_issue_key: str = "DEMO-1"
@@ -157,11 +158,13 @@ gitlab_project_ids = []
 """,
             encoding="utf-8",
         )
+        failures = jira_failures if jira_failures is not None else {}
         fixture = cls(
             config,
             repository,
             CliRunner(),
             commits={"first": first, "second": second, "other": other},
+            jira_failures=failures,
         )
         monkeypatch.setenv("WORKTRACE_JIRA_BASE_URL", "https://jira.fixture")
         monkeypatch.setenv("WORKTRACE_JIRA_EMAIL", "fixture@example.test")
@@ -216,10 +219,8 @@ gitlab_project_ids = []
                 issue_id = request.url.path.rsplit("/", 2)[-2]
                 if issue_id not in {str(value["id"]) for value in available.values()}:
                     raise AssertionError(f"unknown Jira comment issue: {issue_id}")
-                if ("comment", issue_id) in (jira_failures or {}):
-                    return httpx.Response(
-                        (jira_failures or {})[("comment", issue_id)], request=request
-                    )
+                if ("comment", issue_id) in failures:
+                    return httpx.Response(failures[("comment", issue_id)], request=request)
                 comments = (jira_comments or {}).get(issue_id, [])
                 start = int(request.url.params.get("startAt", "0"))
                 page = comments[start : start + subresource_page_size]
@@ -237,10 +238,8 @@ gitlab_project_ids = []
                 issue_id = request.url.path.rsplit("/", 2)[-2]
                 if issue_id not in {str(value["id"]) for value in available.values()}:
                     raise AssertionError(f"unknown Jira changelog issue: {issue_id}")
-                if ("changelog", issue_id) in (jira_failures or {}):
-                    return httpx.Response(
-                        (jira_failures or {})[("changelog", issue_id)], request=request
-                    )
+                if ("changelog", issue_id) in failures:
+                    return httpx.Response(failures[("changelog", issue_id)], request=request)
                 changelog = (jira_changelog or {}).get(issue_id, [])
                 start = int(request.url.params.get("startAt", "0"))
                 page = changelog[start : start + subresource_page_size]
@@ -257,8 +256,11 @@ gitlab_project_ids = []
                 )
             raise AssertionError(f"unexpected Jira request: {request.method} {request.url.path}")
 
-        client = httpx.Client(
-            base_url="https://jira.fixture", transport=httpx.MockTransport(handler)
+        real_httpx_client = httpx.Client
+        monkeypatch.setattr(
+            "worktrace.cli.httpx.Client",
+            lambda **_: real_httpx_client(
+                base_url="https://jira.fixture", transport=httpx.MockTransport(handler)
+            ),
         )
-        monkeypatch.setattr("worktrace.cli.httpx.Client", lambda **_: client)
         return fixture
