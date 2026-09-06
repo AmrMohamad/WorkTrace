@@ -39,6 +39,11 @@ without persisting provider responses.
 
 ## Core workflow
 
+For the full consumer journey—trusted scope, readiness, bounded MCP investigation, explicit
+grouping decisions, canonical packet interpretation, and safe upgrade—see
+[`docs/agent-workflow.md`](docs/agent-workflow.md). It distinguishes offline repository proof from
+separately authorized live-provider and private-ledger operations.
+
 ```console
 uv run worktrace import git sample_store_b2c /configured/repository 2024-01-01 2024-12-31
 uv run worktrace import all sample_store_b2c 2024-01-01 2024-12-31

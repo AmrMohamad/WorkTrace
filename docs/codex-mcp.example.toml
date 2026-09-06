@@ -5,6 +5,7 @@
 # view_token and send expected_view_token on related reads. Discard stale/legacy
 # cursors; follow non-null continuations even on empty pages. Packet section or
 # question_id detail retrieval uses the same build_phase4_packet tool.
+# Consumer workflow and operational boundaries: docs/agent-workflow.md.
 
 [mcp_servers.worktrace]
 command = "/absolute/path/to/WorkTrace/.venv/bin/python"
