@@ -288,3 +288,64 @@ def test_undated_historical_jira_is_visible_only_without_date_filter(
     )
     assert filtered["results"] == []
     assert filtered["date_filter_policy"] == "undated_excluded"
+
+
+def test_jira_subresources_page_per_issue_without_duplicate_imports(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    comments: list[dict[str, object]] = [
+        {
+            "id": str(40001 + index),
+            "created": "2026-05-01T12:00:00Z",
+            "updated": "2026-05-01T12:00:00Z",
+            "author": {"accountId": "self-jira"},
+            "updateAuthor": {"accountId": "self-jira"},
+            "body": {"type": "doc", "content": []},
+        }
+        for index in range(2)
+    ]
+    histories: list[dict[str, object]] = [
+        {
+            "id": str(50001 + index),
+            "created": "2026-06-01T12:00:00Z",
+            "author": {"accountId": "self-jira"},
+            "items": [
+                {
+                    "field": "assignee",
+                    "from": "former",
+                    "fromString": "Former",
+                    "to": "self-jira",
+                    "toString": "Renamed Engineer",
+                }
+            ],
+        }
+        for index in range(2)
+    ]
+    fixture = PublicWorkflowFixture.create(
+        tmp_path,
+        monkeypatch,
+        jira_comments={"10001": comments},
+        jira_changelog={"10001": histories},
+        subresource_page_size=1,
+    )
+    assert fixture.invoke("init").exit_code == 0
+    assert fixture.invoke("import", "all", "sample").exit_code == 0
+    assert sum("/comment?" in request for request in fixture.jira_requests) >= 2
+    assert sum("/changelog?" in request for request in fixture.jira_requests) >= 2
+    configuration = load_config(fixture.config_path)
+    connection = connect_read_only(configuration.database_path)
+    try:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM source_objects WHERE kind='jira_issue_comment'"
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM source_objects WHERE kind='jira_issue_changelog'"
+            ).fetchone()[0]
+            == 2
+        )
+    finally:
+        connection.close()

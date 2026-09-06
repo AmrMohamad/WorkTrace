@@ -79,6 +79,8 @@ class PublicWorkflowFixture:
         jira_issues: dict[str, dict[str, object]] | None = None,
         jira_comments: dict[str, list[dict[str, object]]] | None = None,
         jira_changelog: dict[str, list[dict[str, object]]] | None = None,
+        subresource_page_size: int = 100,
+        jira_failures: dict[tuple[str, str], int] | None = None,
         dense_context: bool = False,
     ) -> PublicWorkflowFixture:
         for key in list(os.environ):
@@ -167,7 +169,9 @@ gitlab_project_ids = []
         available = jira_issues or {"DEMO-1": _issue("10001", "DEMO-1", "Later edited issue")}
 
         def handler(request: httpx.Request) -> httpx.Response:
-            fixture.jira_requests.append(f"{request.method} {request.url.path}")
+            fixture.jira_requests.append(
+                f"{request.method} {request.url.path}?{request.url.query.decode()}"
+            )
             if request.url.path.endswith("/myself"):
                 return httpx.Response(200, json={"accountId": "self-jira"}, request=request)
             if request.url.path.endswith("/search/jql"):
@@ -212,13 +216,19 @@ gitlab_project_ids = []
                 issue_id = request.url.path.rsplit("/", 2)[-2]
                 if issue_id not in {str(value["id"]) for value in available.values()}:
                     raise AssertionError(f"unknown Jira comment issue: {issue_id}")
+                if ("comment", issue_id) in (jira_failures or {}):
+                    return httpx.Response(
+                        (jira_failures or {})[("comment", issue_id)], request=request
+                    )
                 comments = (jira_comments or {}).get(issue_id, [])
+                start = int(request.url.params.get("startAt", "0"))
+                page = comments[start : start + subresource_page_size]
                 return httpx.Response(
                     200,
                     json={
-                        "startAt": 0,
-                        "maxResults": 100,
-                        "comments": comments,
+                        "startAt": start,
+                        "maxResults": subresource_page_size,
+                        "comments": page,
                         "total": len(comments),
                     },
                     request=request,
@@ -227,15 +237,21 @@ gitlab_project_ids = []
                 issue_id = request.url.path.rsplit("/", 2)[-2]
                 if issue_id not in {str(value["id"]) for value in available.values()}:
                     raise AssertionError(f"unknown Jira changelog issue: {issue_id}")
+                if ("changelog", issue_id) in (jira_failures or {}):
+                    return httpx.Response(
+                        (jira_failures or {})[("changelog", issue_id)], request=request
+                    )
                 changelog = (jira_changelog or {}).get(issue_id, [])
+                start = int(request.url.params.get("startAt", "0"))
+                page = changelog[start : start + subresource_page_size]
                 return httpx.Response(
                     200,
                     json={
-                        "startAt": 0,
-                        "maxResults": 100,
+                        "startAt": start,
+                        "maxResults": subresource_page_size,
                         "total": len(changelog),
-                        "values": changelog,
-                        "isLast": True,
+                        "values": page,
+                        "isLast": start + len(page) >= len(changelog),
                     },
                     request=request,
                 )
