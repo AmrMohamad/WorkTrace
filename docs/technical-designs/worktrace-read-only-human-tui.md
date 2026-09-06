@@ -12,8 +12,8 @@
 
 **Delivery**: The design merged in [PR #13](https://github.com/AmrMohamad/WorkTrace/pull/13) and
 the complete original vertical slice merged in [PR #16](https://github.com/AmrMohamad/WorkTrace/pull/16).
-The #22 evidence-search addendum below is an accepted implementation contract, not a statement that
-search has shipped.
+The #22 evidence-search addendum below is the accepted implementation contract. Its implementation
+is pending PR merge and independent acceptance QA; this document does not claim shipped delivery.
 
 ## Overview
 
@@ -450,7 +450,7 @@ UI state remains in memory and contains only the current app, screen, selected s
 page, cursor history, request IDs, and compact-mode choice. It does not persist evidence, drafts,
 credentials, URLs, or preferences.
 
-## Evidence discovery addendum — [#22](https://github.com/AmrMohamad/WorkTrace/issues/22) implementation contract, not implemented
+## Evidence discovery addendum — [#22](https://github.com/AmrMohamad/WorkTrace/issues/22) implementation contract
 
 `ReadOnlyWorkspace.search_evidence()` will return frozen page, result, link, and TUI-search-cursor
 DTOs. Each completed page retains successfully submitted parameters, returned results,

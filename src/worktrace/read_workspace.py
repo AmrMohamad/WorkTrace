@@ -6,15 +6,23 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from worktrace.candidates.decisions import CREATION_ACTIONS
 from worktrace.candidates.projector import project_candidate
 from worktrace.config import WorkTraceConfig
 from worktrace.constants import MAX_EXCERPT_CHARS
 from worktrace.db.connection import connect_read_only
 from worktrace.db.readiness import DatabaseReadinessStatus, database_readiness
-from worktrace.errors import DatabaseError, ScopeViolation
+from worktrace.errors import DatabaseError, NotFound, ScopeViolation
 from worktrace.packets.builder import PacketBuilder
 from worktrace.packets.gaps import build_gap_report
 from worktrace.read_models.candidates import CandidateCursor, CandidatePage, candidate_page
+from worktrace.read_models.evidence_search import (
+    EvidenceSearchCursor,
+    EvidenceSearchFilters,
+    EvidenceSearchPage,
+    evidence_search_page,
+    normalize_evidence_search_filters,
+)
 
 TUI_BUSY_TIMEOUT_MS = 500
 
@@ -166,13 +174,49 @@ class ReadOnlyWorkspace:
                 cursor=cursor,
             )
 
+    def search_evidence(
+        self,
+        app_id: str,
+        filters: EvidenceSearchFilters,
+        *,
+        cursor: EvidenceSearchCursor | None = None,
+        expected_revision: int | None = None,
+    ) -> EvidenceSearchPage:
+        """Search current evidence with a TUI-only, revision-bound continuation."""
+
+        self._config.app(app_id)
+        normalized = normalize_evidence_search_filters(
+            filters.query,
+            source=filters.source,
+            module_text=filters.module_text,
+            date_from=filters.date_from,
+            date_to=filters.date_to,
+        )
+        with self._read_snapshot() as connection:
+            return evidence_search_page(
+                connection,
+                PacketBuilder(connection, self._config),
+                app_id,
+                normalized,
+                cursor=cursor,
+                expected_revision=expected_revision,
+            )
+
     def contribution_review(self, app_id: str, candidate_id: str) -> ContributionReview:
         self._config.app(app_id)
         with self._read_snapshot() as connection:
-            projected = project_candidate(connection, candidate_id)
-            if projected.app_id != app_id:
+            builder = PacketBuilder(connection, self._config)
+            canonical = builder.resolve_contribution(candidate_id)
+            if canonical.app_id != app_id:
                 raise ScopeViolation("candidate belongs to another application")
-            packet = PacketBuilder(connection, self._config).build_packet(candidate_id)
+            resolved_candidate_id = canonical.candidate_id or candidate_id
+            try:
+                projected = project_candidate(connection, resolved_candidate_id)
+            except NotFound:
+                projected = None
+            if projected is not None and projected.app_id != app_id:
+                raise ScopeViolation("candidate belongs to another application")
+            packet = builder.build_packet(candidate_id)
             contribution = packet.get("contribution")
             if not isinstance(contribution, dict) or contribution.get("app_id") != app_id:
                 raise ScopeViolation("candidate belongs to another application")
@@ -209,11 +253,31 @@ class ReadOnlyWorkspace:
                     )
                     for row in rows
                 )
+            lineage = builder._decision_projection
+            if lineage is None:
+                lineage = builder.page_projection_builder(app_id)._decision_projection
+            canonical_lineage = (
+                lineage.resolve_lineage(candidate_id, app_id=app_id)
+                if lineage is not None
+                else None
+            )
+            confirmed = bool(
+                canonical_lineage
+                and any(
+                    decision.action in CREATION_ACTIONS for decision in canonical_lineage.decisions
+                )
+            )
         return ContributionReview(
             app_id=app_id,
-            candidate_id=candidate_id,
+            candidate_id=resolved_candidate_id,
             resolved_contribution_id=contribution_id,
-            status=projected.status,
+            status=(
+                projected.status
+                if projected is not None
+                else "confirmed"
+                if confirmed
+                else "suggestion"
+            ),
             packet=packet,
             gaps=build_gap_report(packet),
             unsupported_members=unsupported,

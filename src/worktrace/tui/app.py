@@ -19,6 +19,7 @@ from worktrace.tui.screens.applications import ApplicationScreen
 from worktrace.tui.screens.base import WorkTraceModal, WorkTraceScreen
 from worktrace.tui.screens.candidates import CandidateScreen
 from worktrace.tui.screens.contribution import ContributionScreen
+from worktrace.tui.screens.evidence_search import EvidenceSearchScreen
 
 # Below this width the candidate browser uses the four-column compact table; the
 # six-column full layout is reserved for the documented full terminal size.
@@ -44,6 +45,10 @@ j/k     Move selection
 Arrows  Scroll focused details
 Enter   Open
 n/p     Next/previous candidate page
+/       Search the selected application's current evidence
+Search  Enter submits query/source/module/from/to filters
+Search  Tab traverses form, results, and canonical links
+Search  n/p pages outside editable fields; incomplete links name their limit
 1-5     Contribution tabs
 
 The UI cannot import, modify, rebuild, export, or contact providers.
@@ -230,6 +235,12 @@ class WorkTraceApp(App[None], inherit_bindings=False):
                 "Return to the selected application's candidate page",
                 self.action_return_to_candidates,
             )
+        if isinstance(screen, EvidenceSearchScreen) and self.current_app_id is not None:
+            yield SystemCommand(
+                "Return to candidates",
+                "Return to the selected application's candidate page",
+                self.action_return_to_candidates,
+            )
 
     def action_copy_text(self) -> None:
         """No selected-text clipboard path exists in WorkTrace."""
@@ -389,6 +400,14 @@ class WorkTraceApp(App[None], inherit_bindings=False):
             self.push_screen(screen)
         else:
             self._show_screen(screen)
+
+    def open_evidence_search(self, app_id: str) -> None:
+        application = self._application(app_id)
+        if application is None:
+            self._show_screen(InitialErrorScreen(FailureKind.OUT_OF_SCOPE))
+            return
+        self.current_app_id = app_id
+        self.push_screen(EvidenceSearchScreen(application))
 
 
 def run_worktrace_ui(

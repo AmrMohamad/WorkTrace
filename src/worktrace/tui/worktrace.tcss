@@ -64,6 +64,40 @@ TabbedContent {
     height: auto;
 }
 
+#evidence-search-form {
+    height: 6;
+    max-height: 6;
+    padding: 0 1;
+}
+
+#evidence-search-form:focus {
+    border: solid $accent;
+}
+
+#evidence-search-form Input {
+    height: 1;
+}
+
+#evidence-search-submit {
+    width: 16;
+    height: 1;
+}
+
+#evidence-search-status, #evidence-search-link-detail {
+    height: auto;
+    max-height: 3;
+}
+
+#evidence-search-result-detail {
+    height: 2;
+    max-height: 2;
+}
+
+#evidence-search-results, #evidence-search-links {
+    height: 1fr;
+    min-height: 3;
+}
+
 #evidence-dialog, #help-dialog, #terminal-dialog {
     width: 90%;
     height: 90%;

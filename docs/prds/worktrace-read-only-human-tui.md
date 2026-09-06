@@ -27,8 +27,9 @@ The original product and implementation sequence is complete:
 The current MCP surface is seven bounded read-only tools with view-bound `wtc1:` candidate and
 evidence cursors. References to six tools and `offset:` cursors below describe the original PRD
 baseline; [AgDR-0007](../agdr/AgDR-0007-agent-evidence-workflow-migration.md) supersedes only
-those historical MCP constraints. This addendum approves the #22 discovery contract; it does not
-claim that search is implemented. The representative private-ledger measurement remains deferred,
+those historical MCP constraints. This addendum approves the #22 discovery contract. Its
+implementation is pending PR merge and independent acceptance QA; the representative private-ledger
+measurement remains deferred,
 so the later parent feature remains open.
 
 ## Overview
@@ -235,7 +236,7 @@ At 80x24, the workflow uses a single primary pane and drill-down navigation. At 
 
 No dashboard-only shell is part of this release. The first executable UI must ship the complete journey.
 
-## Evidence discovery addendum — accepted contract for [#22](https://github.com/AmrMohamad/WorkTrace/issues/22), not implemented
+## Evidence discovery addendum — accepted contract for [#22](https://github.com/AmrMohamad/WorkTrace/issues/22)
 
 This addendum adds a bounded evidence-search journey above the delivered candidate browser. It is
 not a replacement browser mode and does not make a search match evidence of contribution ownership
