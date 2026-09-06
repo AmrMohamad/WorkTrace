@@ -64,16 +64,33 @@ jobs:
       - name: Type check
         run: uv run mypy src
 
+      - name: Build source and wheel distributions
+        run: uv build
+
+      - name: Prepare installed wheel transport environment
+        run: |
+          runtime_requirements="$RUNNER_TEMP/worktrace-runtime-requirements.txt"
+          artifact_environment="$(mktemp -d "$RUNNER_TEMP/worktrace-artifact-smoke.XXXXXX")"
+          artifact_working_directory="$(mktemp -d "$RUNNER_TEMP/worktrace-artifact-cwd.XXXXXX")"
+          uv export --locked --no-dev --no-emit-project --output-file "$runtime_requirements"
+          uv venv "$artifact_environment" --python 3.12
+          uv pip install --python "$artifact_environment/bin/python" \
+            --requirement "$runtime_requirements" dist/*.whl
+          {
+            echo "WORKTRACE_TEST_SERVER_PYTHON=$artifact_environment/bin/python"
+            echo "WORKTRACE_TEST_SERVER_PREFIX=$artifact_environment"
+            echo "WORKTRACE_TEST_SERVER_CWD=$artifact_working_directory"
+          } >> "$GITHUB_ENV"
+
       - name: Test with branch coverage
         run: |
           uv run coverage run -m pytest
           uv run coverage report
 
-      - name: Build source and wheel distributions
-        run: uv build
-
       - name: Smoke test installed wheel
         run: |
-          uv venv .artifact-smoke --python 3.12
-          uv pip install --python .artifact-smoke/bin/python dist/*.whl
-          .artifact-smoke/bin/worktrace version
+          uv run pytest tests/test_installed_wheel_protocol.py -q
+          (
+            cd "$WORKTRACE_TEST_SERVER_CWD"
+            PYTHONPATH= "$WORKTRACE_TEST_SERVER_PREFIX/bin/worktrace" version
+          )
