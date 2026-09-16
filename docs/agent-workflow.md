@@ -96,7 +96,9 @@ snapshot, and static or fixture proof is not live-provider proof. The `--jira-co
 option is mutually exclusive with the existing `--app`/`--candidate` options. `jira backup` and
 `jira restore` are the only vault portability commands; existing `worktrace backup` remains
 DB-only and warns when vault state exists. Restore requires a fresh destination and fail-closed
-verification. Purge includes vault data only with explicit `--include-jira-vault --yes`.
+verification. The shipped `worktrace purge --yes` fails before deleting DB/HMAC/backups when any
+Jira collection/vault/key references exist. Use `worktrace jira purge COLLECTION_ID --include-vault
+--yes` for one collection; whole-installation vault purge is a separate explicit command/flag.
 
 Configure the seven read-only stdio tools with
 [`codex-mcp.example.toml`](codex-mcp.example.toml). The MCP process receives no Jira or GitLab

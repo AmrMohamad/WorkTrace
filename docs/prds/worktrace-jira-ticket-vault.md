@@ -118,9 +118,12 @@ deletion or restore occurs.
 Exit codes are stable: `0` for complete or complete-with-unavailable-resources, `2` for paused,
 partial, or unstable-partial status requiring action, `1` for failed/preflight/integrity/security
 refusal, and `3` for invalid input or incompatible schema/format. An explicit purge may include
-vault data only with `--include-jira-vault --yes`; it quiesces jobs, honors manifest references and
-backup retention, retires unreferenced keys, and reports logical deletion rather than secure
-erasure.
+vault data only with `worktrace jira purge COLLECTION_ID --include-vault --yes`; it quiesces jobs,
+honors manifest references and backup retention, retires unreferenced keys, and reports logical
+deletion rather than secure erasure. The shipped `worktrace purge --yes` remains DB/HMAC/backup
+safe only when no Jira vault/collection/key references exist; otherwise it fails before deletion
+with actionable Jira purge guidance. Whole-installation vault purge requires a separate explicit
+command/flag.
 
 ## Status contract
 

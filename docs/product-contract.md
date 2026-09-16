@@ -155,9 +155,13 @@ launches the exported file. `worktrace jira backup/restore` owns vault portabili
 `worktrace backup` remains DB-only and warns when vault state exists. Vault backup quiesces the single writer at a resource boundary and
 binds SQLite, configuration, HMAC material, vault manifest/ciphertexts, and key versions as one
 epoch. Restore is explicit to a fresh destination and fails closed on any mismatch; no automatic
-deletion, restore, merge, or overwrite occurs. An explicit purge requires
-`--include-jira-vault --yes`, quiesces jobs, honors manifest references and backup retention, and
-reports logical deletion rather than secure erasure; Keychain versions retire only when unreferenced.
+deletion, restore, merge, or overwrite occurs. The shipped `worktrace purge --yes` remains safe only
+when no Jira collection/vault/key references exist; otherwise it fails before deleting DB/HMAC/
+backups with actionable guidance. Jira purge is the explicit
+`worktrace jira purge COLLECTION_ID --include-vault --yes`, which quiesces jobs, honors manifest
+references and backup retention, reports logical deletion rather than secure erasure, and retires
+Keychain versions only when unreferenced. Whole-installation vault purge requires a separate
+explicit command/flag.
 
 The vault key is a dedicated random key in the explicit macOS Keychain backend through keyring,
 service `WorkTrace Jira Vault`, account `<installation-id>:<key-version>`. Keychain access is

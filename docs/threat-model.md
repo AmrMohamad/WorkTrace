@@ -233,16 +233,21 @@ redirect credential exfiltration, parser bombs, and incoherent database/vault ba
   only after verifying the same binding;
 - attachment HTTP uses `trust_env=False` and `follow_redirects=False`, exact origin/path
   construction, rejects all 3xx before body, and never sends credentials to redirects or proxies;
-- extraction requires a capability-probed macOS `sandbox-exec` profile denying network, process
-  and filesystem access except inherited pipes. Unavailable sandbox means saved
-  `extraction_unavailable`, not an unsandboxed attempt. The exact interpreter/module uses an empty
-  allowlist environment, fixed cwd, close-on-exec descriptors, limits of 25 MiB/60 seconds/512 MiB/
-  1,000 pages/1M chars, TERM/KILL/reap, and OOXML 10,000 entries/100 MiB inflated content;
+- extraction requires generated profile version `1` for macOS `sandbox-exec`, with SHA-256 integrity
+  over the exact profile bytes. The install/runtime allowlist resolves and hashes only the exact venv/interpreter, dyld/system
+  libraries, Python stdlib, WorkTrace worker, and approved parser packages; all other file access,
+  network, subprocess, and process creation is denied. Input/output use inherited pipes only.
+  Invalid capability/profile/allowlist hashes or symlinks save `extraction_unavailable`, never an
+  unsandboxed attempt. The worker uses an empty allowlist environment, fixed cwd,
+  close-on-exec descriptors, limits of 25 MiB/60 seconds/512 MiB/1,000 pages/1M chars,
+  TERM/KILL/reap, and OOXML 10,000 entries/100 MiB inflated content;
 - a coherent backup epoch quiesces the writer at a resource boundary and binds SQLite/config/HMAC,
   vault manifest/ciphertexts, and key versions separately; restore fails closed and never deletes,
   merges, overwrites, or runs automatically. Purge quiesces jobs, checks manifest/backup references,
-  retires only unreferenced keys, and requires `--include-jira-vault --yes`; it reports logical
-  deletion, not secure erasure.
+  retires only unreferenced keys, and requires `worktrace jira purge COLLECTION_ID --include-vault
+  --yes`; it reports logical deletion, not secure erasure. Legacy `worktrace purge --yes` fails
+  before deleting DB/HMAC/backups whenever Jira collection/vault/key references exist; whole-
+  installation vault purge requires a separate explicit command/flag.
 
 ### Database, backup, and export exposure
 

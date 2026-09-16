@@ -389,19 +389,27 @@ version-1 envelope has this exact logical JSON shape and binary encoding:
 {
   "format": "worktrace-jira-recovery",
   "version": 1,
-  "kdf": {"name": "argon2id", "opslimit": 3, "memlimit": 67108864,
-          "dk_len": 32, "salt_b64": "<22-char-base64url>"},
-  "aead": {"name": "xchacha20-poly1305-ietf", "nonce_b64": "<32-char-base64url>"},
-  "aad_b64": "<base64url canonical descriptor bytes>",
-  "ciphertext_b64": "<base64url authenticated wrapped-key bytes>"
+  "installation_id": "install:...",
+  "site_ids": ["jira-site:..."],
+  "collection_ids": ["jcol:..."],
+  "vault_id": "vault:...",
+  "epoch_id": "epoch:...",
+  "key_versions": [1],
+  "schema_version": 1,
+  "kdf": {"name": "argon2id", "opslimit": 3, "memlimit": 67108864, "dk_len": 32},
+  "aead": {"name": "xchacha20-poly1305-ietf"}
 }
 ```
 
-Canonical JSON uses the vault descriptor rules. The file is `WTRK` magic, version byte `0x01`,
-big-endian `u32` descriptor length (maximum 8,192), canonical descriptor bytes, `u32` ciphertext
-length (maximum 4,096), and ciphertext bytes. The descriptor binds installation ID, site IDs,
-collection/vault IDs, key versions, epoch ID, and schema/vault format versions. `salt` is exactly
-16 random bytes and `nonce` exactly 24 random bytes, encoded unpadded base64url. Argon2id uses
+The JSON above is the descriptor only: it excludes ciphertext, salt, nonce, and any `aad_b64` or
+other wrapper fields. Canonical JSON uses the vault descriptor rules. The binary file is
+`WTRK` magic, version byte `0x01`, flags byte `0x00`, endian marker `0x4245` (big-endian),
+descriptor length `u32` (maximum 8,192), exact canonical descriptor bytes, salt (exactly 16 random
+bytes), nonce (exactly 24 random bytes), ciphertext length `u32` (maximum 4,096), and ciphertext
+bytes. The descriptor binds installation ID, site IDs, collection/vault IDs, key versions, epoch
+ID, and schema/vault format versions. The exact descriptor bytes are the AEAD AAD; they are not
+encoded again as an envelope field. Salt, nonce, and ciphertext fields use unpadded base64url only
+in diagnostic JSON, never as a second binary representation. Argon2id uses
 PyNaCl's `opslimit` and `memlimit` parameters only; no parallelism field is accepted or used;
 derive exactly 32 bytes. Accepted costs are `1 <= opslimit <= 10` and
 `8 MiB <= memlimit <= 1 GiB`; the default is 3/64 MiB. Values outside this range, duplicate or
@@ -409,7 +417,7 @@ unknown fields, duplicate JSON keys, non-canonical encodings, oversized descript
 unsupported KDF/AEAD/version, or downgrade to a lower format are rejected before decryption.
 
 The wrapping AEAD is PyNaCl `nacl.secret.Aead` XChaCha20-Poly1305-IETF with a 32-byte key and
-24-byte nonce; `aad_b64` canonical descriptor bytes are cryptographic AAD. The plaintext is a
+the binary descriptor bytes as cryptographic AAD. The plaintext is a
 versioned `WRAP` record containing `u32` key-version count followed by exactly one 32-byte vault
 key per declared version; duplicate versions, extra bytes, or a key count above 64 are rejected.
 The envelope never contains plaintext keys, is never logged, refuses stdout/overwrite/untrusted
@@ -420,9 +428,9 @@ AAD, or authentication failure is indistinguishable to the caller and never crea
 Portable epoch backups must include and hash a verified recovery envelope; same-host restore may use
 the Keychain only when the required key versions are present, but still verifies the envelope/hash.
 Import is explicit, validates all bindings, requires a fresh empty destination, and never merges,
-deletes, or restores automatically. #48 must add deterministic vectors for canonical descriptor,
-salt/nonce, known passphrase, KDF parameters, AAD, ciphertext, wrong passphrase, and every reject
-case above.
+deletes, or restores automatically. #48 must add a known-answer fixture containing fixed salt,
+nonce, passphrase, KDF parameters, canonical descriptor bytes, ciphertext, and a decoder result;
+also cover wrong passphrase and every reject case above without circular fields.
 
 ## Jira collection pipeline
 
@@ -460,22 +468,36 @@ Default network policy is 30 seconds per request and three attempts for timeout/
 
 ## Extraction and search
 
-Extraction runs after encrypted preservation. It must run under `sandbox-exec` on supported macOS
-hosts after a capability probe; the profile denies network, process creation, and all filesystem
-access except inherited stdin/stdout/stderr pipes. If the probe or sandbox is unavailable, save
-`extraction_unavailable` and retain the original; never silently run unsandboxed. The worker is the
-exact installed interpreter/module, uses `shell=False`, a fixed empty working directory, an empty
-allowlist environment, and `FD_CLOEXEC` on all unrelated descriptors. Apply 25 MiB
+Extraction runs after encrypted preservation. It must run under generated profile version `1` for
+`sandbox-exec` on supported macOS hosts after a capability probe. The profile integrity hash is
+SHA-256 over the exact profile bytes. At install/runtime,
+resolve and hash the exact venv/interpreter executable, dyld/system libraries, Python stdlib,
+WorkTrace worker module, and approved parser packages; the profile's immutable read/execute
+allowlist contains only those resolved paths and denies every other file read/write, network,
+subprocess, and process creation. The profile hash is recorded in the extraction status and checked
+before each job. If the probe, profile hash, allowlist path, symlink check, executable hash, or
+capability is invalid, save `extraction_unavailable` and retain the original; never run
+unsandboxed. Input/output use only inherited stdin/stdout/stderr pipes: no plaintext temporary
+fallback is permitted. The worker is the exact installed interpreter/module, uses `shell=False`, a
+fixed empty working directory, an empty allowlist environment, and `FD_CLOEXEC` on all unrelated
+descriptors. Apply 25 MiB
 input/decompressed parser stream, 60 seconds wall time, 512 MiB memory, 1,000 pages, and 1,000,000
 output-character limits. On timeout send TERM, wait briefly, KILL if needed, and reap; all pipe ends
 close in `finally`. For OOXML, reject more than 10,000 ZIP entries or 100 MiB inflated content;
 parse XML through `defusedxml`. Text extraction supports plain text, Markdown, CSV, JSON, XML, and
-HTML, text PDFs, and DOCX/XLSX/PPTX. It does not OCR images or transcribe audio/video. If a
-capability-probed host requires a temp fallback, use a 0700 directory, `O_EXCL|O_NOFOLLOW` 0600
-files, crash cleanup, and a next-start stale-temp sweep. A parser failure or unsupported type
+HTML, text PDFs, and DOCX/XLSX/PPTX. It does not OCR images or transcribe audio/video. A parser failure or unsupported type
 leaves the encrypted original intact and records `unsupported` or `failed`. PDF parsing must apply
 the input/page limits; pypdf documents that content-stream parsing can have high memory cost
 ([text extraction guidance](https://github.com/py-pdf/pypdf/blob/main/docs/user/extract-text.md)).
+
+The worker protocol is also bounded and versioned. Parent sends raw bytes on stdin plus a small
+canonical JSON header on a separate control pipe (`schema_version`, revision attachment ID, MIME
+type, declared length, and limits); no path or provider filename is accepted. Worker stdout is one
+canonical JSON result, with `status` in `complete|unsupported|limit|failed`, bounded redacted-free
+text chunks, page/character counts, parser version, and no filesystem path. Exit codes are `0`
+complete, `10` unsupported, `11` limit exceeded, `12` parser failure, and `13` sandbox/capability
+failure; signal/timeout is mapped to `14` after TERM/KILL/reap. The parent redacts stdout before
+SQLite insertion and never treats `unsupported`, `limit`, or `failed` as an empty match.
 
 Extracted text is normalized, redacted with the existing versioned redactor, bounded, and inserted
 as chunks with source locator, attachment ID, extraction version, and character count. Search reads
@@ -624,13 +646,15 @@ compatibility before opening the ledger. Missing key versions, mismatched HMAC/c
 final tags, incomplete ciphertext, or non-empty destination causes fail-closed refusal. Restore
 never deletes existing data, overwrites a destination, merges collections, or runs automatically.
 
-An explicit purge extension may be invoked only as
-`worktrace purge COLLECTION_ID --include-jira-vault --yes`. It first quiesces active jobs, verifies
-the collection is not part of an in-progress backup, and computes manifest reference counts. It then
-deletes ciphertexts only when their manifest references are removed, retires Keychain versions only
-when no retained collection/epoch references them, and reports logical deletion (not secure
-erasure). Backup retention is an explicit user choice; no backup is deleted implicitly. Without
-`--include-jira-vault --yes`, purge cannot touch vault objects.
+The shipped `worktrace purge --yes` signature remains unchanged only when no Jira collection, vault,
+or key references exist. If any exist, it fails before deleting the database, HMAC material, or
+backups and instructs the user to use the Jira command. Jira purge is
+`worktrace jira purge COLLECTION_ID --include-vault --yes`: it quiesces active jobs, verifies no
+backup is in progress, computes shared manifest references, deletes collection projections and only
+unreferenced ciphertexts, retires only unreferenced Keychain versions, and reports logical deletion
+(not secure erasure). Backup retention is an explicit user choice; no backup is deleted implicitly.
+A whole-installation vault purge requires a separate explicit command/flag and never follows legacy
+purge implicitly. Without `--include-vault --yes`, Jira purge cannot touch vault objects.
 
 Schema migration is forward-only and CLI-owned. Older binaries reject newer schema/vault formats;
 newer binaries retain all prior observation and decision IDs. Migration must take a coherent backup
@@ -642,10 +666,10 @@ to a fresh destination; it does not reverse individual decisions or silently del
 
 | Concern | Owning module for implementation | Explicit non-owner |
 |---|---|---|
-| Site/issue identity and selector | `importers/jira_selection.py` successor | App mapping, TUI |
-| Jira endpoint paging and retries | `adapters/jira.py` successor | Vault crypto, MCP |
-| Resource state/orchestration | `importers/jira_vault.py` | Adapter HTTP details, TUI |
-| SQLite schema/repository | `db/migrations.py`, `db/repository.py` | Vault filesystem writer |
+| Site/issue identity and selector | `src/worktrace/archive/jira/selector.py` (#49) | Legacy `importers/jira_selection.py`, app mapping, TUI |
+| Jira endpoint paging and retries | `src/worktrace/archive/jira/provider.py` (#49) | Legacy `adapters/jira.py`, vault crypto, MCP |
+| Resource state/orchestration | `src/worktrace/archive/jira/orchestrator.py` (#49) | Legacy importers, adapter HTTP details, TUI |
+| SQLite archive schema/repository/models | `src/worktrace/archive/jira/models.py`, `db/migrations.py`, `db/repository.py` (#49) | Legacy app source rail, vault filesystem writer |
 | Vault format/keychain | `vault/format.py`, `vault/keychain.py` | HMAC identity key, MCP |
 | Extraction/indexing | `vault/extract.py`, `vault/search.py` | Network/provider, TUI |
 | CLI contract | `cli.py` and focused command module | TUI internal subprocess |
@@ -661,8 +685,8 @@ write a secret into SQLite/logs/arguments. New dependency use belongs only to #4
 | Unit | Issue | Deliverable | Required tests/evidence |
 |---|---:|---|---|
 | Foundation | [#48](https://github.com/AmrMohamad/WorkTrace/issues/48) | Additive schema; vault object format; Keychain backend; recovery envelope; extraction sandbox; epoch backup/restore | Crypto vectors including missing final tag/AAD; keychain fail-closed; migration/recovery; parser bombs/limits; fresh restore |
-| Collection | [#49](https://github.com/AmrMohamad/WorkTrace/issues/49) | Root selection; assignment overlap; one-hop context; resource paging; attachment downloads; resume/pause; recheck/status | HTTP fixtures for all resource families, permission loss, redirect refusal, 2-download bound, 20 GiB/2 GiB budgets, unstable revision |
-| Investigation | [#50](https://github.com/AmrMohamad/WorkTrace/issues/50) | Redacted extraction/search; CLI status/search/show/export; query-only TUI; wheel packaging | Search locator parity, unsupported originals, export path safety, TUI capability negatives, existing seven-tool MCP and TUI regressions |
+| Collection | [#49](https://github.com/AmrMohamad/WorkTrace/issues/49) | Root selection; assignment overlap; one-hop context; resource paging; attachment downloads; resume/pause; recheck/status | HTTP fixtures for all resource families, permission loss, redirect refusal, 2-download bound, 20 GiB/2 GiB budgets, unstable revision, legacy/new purge compatibility and shared-reference accounting |
+| Investigation | [#50](https://github.com/AmrMohamad/WorkTrace/issues/50) | Redacted extraction/search; CLI status/search/show/export; query-only TUI; wheel packaging | Search locator parity, parser JSON/exit contract and sandbox negatives, unsupported originals, export path safety, TUI capability negatives, existing seven-tool MCP and TUI regressions |
 | Rollout | [#51](https://github.com/AmrMohamad/WorkTrace/issues/51) | Controlled migration, pilot, authorized full collection, independent QA | Backup epoch readback, live Jira identity/permissions, pilot resource accounting, fresh restore, limitations and rollback report |
 
 Acceptance is blocked if any material resource is silently omitted, context becomes participation,

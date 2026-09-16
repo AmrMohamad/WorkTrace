@@ -135,13 +135,17 @@ or persisted in the ledger.
 Recovery is part of the explicit backup flow. Envelope v1 uses canonical JSON descriptor fields
 `format=worktrace-jira-recovery`, `version=1`, Argon2id `opslimit`/`memlimit` only (no parallelism),
 `dk_len=32`, 16-byte salt, and PyNaCl `nacl.secret.Aead` XChaCha20-Poly1305-IETF with a 24-byte
-nonce and descriptor bytes as cryptographic AAD. Salt, nonce, AAD, and ciphertext use unpadded
-base64url. Accepted costs are opslimit 1..10 and memlimit 8 MiB..1 GiB (default 3/64 MiB).
-On-disk grammar is `WTRK | 0x01 | descriptor_len[u32] <=8192 | descriptor |
-ciphertext_len[u32] <=4096 | ciphertext`. Reject downgrade, unknown/duplicate fields, duplicate
-versions, non-canonical bytes, oversize, wrong passphrase, or authentication failure. Require a
-twice-entered passphrase of at least 12 Unicode scalar values; never log or persist it. Import is
-explicit, validates all bindings, requires a fresh empty destination, and never merges or deletes.
+nonce and descriptor bytes as cryptographic AAD. The descriptor excludes ciphertext, salt, nonce,
+`aad_b64`, and other wrapper fields. On-disk grammar is `WTRK | 0x01 | flags=0x00 | endian=0x4245 |
+descriptor_len[u32] <=8192 | descriptor | salt[16] | nonce[24] | ciphertext_len[u32] <=4096 |
+ciphertext`. Reject downgrade, unknown/duplicate fields, duplicate versions, non-canonical bytes,
+oversize, wrong passphrase, or authentication failure. Salt, nonce, and ciphertext use unpadded
+base64url only in diagnostic JSON, never as a second binary representation. Accepted costs are
+opslimit 1..10 and memlimit 8 MiB..1 GiB (default 3/64 MiB). Require a twice-entered passphrase of
+at least 12 Unicode scalar values; never log or persist it. Import is explicit, validates all
+bindings, requires a fresh empty destination, and never merges or deletes. #48 must include a
+known-answer fixture with fixed salt, nonce, passphrase, KDF parameters, descriptor bytes,
+ciphertext, and decoder result; no circular fields.
 
 ### 5. Dependencies and parser safety
 
@@ -183,17 +187,23 @@ warns when a vault exists. The explicit commands are
 `worktrace jira restore --input EPOCH_DIRECTORY --destination FRESH_DIRECTORY --yes`. Both refuse
 overwrite; restore requires a fresh destination and verifies a portable recovery-envelope hash.
 
-Extraction must use a capability-probed macOS `sandbox-exec` profile denying network, process
-creation, and filesystem access except inherited pipes. If unavailable, persist
-`extraction_unavailable` and do not run unsandboxed. The exact installed interpreter/module uses
-`shell=False`, empty allowlist environment, fixed cwd, close-on-exec descriptors, resource limits,
-TERM/KILL timeout handling, and reap. Any temp fallback is 0700 with `O_EXCL|O_NOFOLLOW` 0600 files,
-crash cleanup, and next-start sweep.
+Extraction must use generated profile version `1` for macOS `sandbox-exec`, with SHA-256 integrity
+over the exact profile bytes. Install/runtime capability probing resolves and hashes only the exact venv/interpreter executable,
+dyld/system libraries, Python stdlib, WorkTrace worker module, and approved parser packages in an
+immutable read/execute allowlist; all other file reads/writes, network, subprocess, and process
+creation are denied. Input/output use inherited pipes only. If the capability, profile/allowlist
+hash, path, symlink, or executable check fails, persist `extraction_unavailable` and do not run
+unsandboxed. The exact worker uses `shell=False`, an empty allowlist environment, fixed cwd,
+close-on-exec descriptors, resource limits, TERM/KILL timeout handling, and reap. No plaintext temp
+fallback is permitted.
 
-An explicit `worktrace purge COLLECTION_ID --include-jira-vault --yes` quiesces active jobs,
-checks backup references, deletes ciphertext only when unreferenced, retires only unreferenced
-Keychain versions, and reports logical deletion rather than secure erasure. Backup retention is
-never changed implicitly. Without both flags, purge cannot touch vault objects.
+The shipped `worktrace purge --yes` remains unchanged only when no Jira collection, vault, or key
+references exist. If any exist, it fails before deleting DB/HMAC/backups and instructs the user to
+use `worktrace jira purge COLLECTION_ID --include-vault --yes`. Jira purge quiesces active jobs,
+checks backup references, deletes collection projections and only unreferenced ciphertexts, retires
+only unreferenced Keychain versions, and reports logical deletion rather than secure erasure.
+Backup retention is never changed implicitly. Whole-installation vault purge requires a separate
+explicit command/flag and never follows legacy purge.
 
 ## Consequences
 
