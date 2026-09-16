@@ -77,6 +77,8 @@ This document records intentional v0.1 boundaries and validation gaps. It must n
 - Jira vault extraction is intentionally limited to plain text/Markdown/CSV/JSON/XML/HTML, text
   PDFs, DOCX/XLSX/PPTX. OCR and audio/video transcription are not provided; unsupported originals
   remain preserved with explicit search-unavailable status.
+- Extraction is fail-closed when the capability-probed macOS sandbox is unavailable. Portable vault
+  restore requires a verified recovery-envelope hash; a same-host Keychain reference is not enough.
 - MCP source excerpts remain untrusted data even after redaction. Prompt approval for a broader excerpt is a review step, not a guarantee that the content is safe or correct.
 - The MCP server's read-only design limits WorkTrace actions; it cannot prevent a separate client/tool from acting on malicious source text. Codex must keep source text as data.
 

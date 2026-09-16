@@ -35,12 +35,27 @@ TUI, exports, logs, or credentials.
 
 ### 1. Identity and selection
 
-Collection identity is Jira site plus numeric issue ID, independent of application mapping:
+Keep site identity, collection instance, run, activated revision, ticket identity, and provider
+attachment identity distinct:
 
 ```text
-<site_canonical, numeric_issue_id>
-jira:<site_fingerprint>:issue:<numeric_issue_id>
+site_id       = jira-site:<lowercase hex SHA-256(canonical HTTPS origin)>
+collection_id = jcol:<UUIDv4>
+run_id        = jrun:<UUIDv4>
+revision_id   = jrev:<collection_id>:<monotonic integer>
+ticket_id     = jira:<site_id>:issue:<numeric issue ID>
+attachment_id = jira:<site_id>:attachment:<numeric attachment ID>
 ```
+
+Site identity is non-secret SHA-256; no `collection_id_key` exists and no HMAC/vault-key reuse is
+permitted. The deterministic vector for canonical `https://jira.example.test` is
+`5521c7ed7714cbf69b5714241341c02057f405f72ee9a199333e98b3bac49f03`; a trailing slash canonicalizes
+to the same origin. Credentials, query/fragment, non-HTTPS, and non-default ports are rejected.
+The collection is an instance, the run is an attempt, and the activated revision is immutable and
+queryable after supersession. Every resource, attachment revision object, chunk, vault object path,
+and manifest carries collection+revision IDs. Archive evidence IDs are site-scoped and live on a
+separate provenance rail from app `source_objects`/observations/references; an optional app
+association cannot affect app authority or candidates.
 
 Roots are verified assignment intervals overlapping configured local dates `2024-01-28..2026-09-06`
 in the configured timezone. Discovery first queries an expanded day range, then retrieves full
@@ -63,24 +78,33 @@ redacted metadata, hashes, stable locators, statuses/errors, and extracted redac
 attachment MIME types are eligible for preservation; unsupported extraction never deletes the
 original. MCP and TUI cannot decrypt or return originals.
 
-The additive migration introduces logical `jira_collections`, `jira_collection_issues`,
-`jira_resource_states`, `jira_attachment_objects`, and `jira_search_chunks` tables as specified in
-the technical design. Existing source-object, observation, participation, decision, app, and
-read-revision IDs and semantics remain unchanged. Collection identity is not made app-scoped by
-adding an app foreign key; an optional app association is projection metadata only.
+The additive migration introduces site/collection/run/revision tables plus
+`jira_collection_issues`, `jira_resource_states`, `jira_attachment_objects`, and
+`jira_search_chunks` as specified in the technical design. Existing source-object, observation,
+participation, decision, app, and read-revision IDs and semantics remain unchanged. A dedicated
+`archive/jira` provider/selector/orchestrator seam owns #49; it does not reuse app-scoped authority
+tables as its archive source of truth.
 
 ### 3. Vault object format
 
 Each raw resource/original is an independent versioned object with a canonical immutable descriptor
-and associated data:
+and associated data. Canonical JSON is UTF-8, sorted keys, separators `,`/`:`, `ensure_ascii=true`,
+`allow_nan=false`, no whitespace, and rejects duplicate keys, invalid UTF-8, non-canonical numbers/
+escapes, unknown fields, and reserialization mismatch. Descriptor length is a big-endian `u32`
+bounded to 65,536 bytes:
 
 ```text
-magic | format_version | descriptor_length | descriptor_json
-      | secretstream_header | ciphertext_chunks...
+magic[4] = WTVA | version[1] = 0x01 | descriptor_len[u32]
+descriptor[descriptor_len] | secretstream_header[24]
+repeat { record_len[u32] | ciphertext[record_len] }
 ```
 
-Descriptor fields include format, collection/object IDs, kind, plaintext length/hash, key version,
-and chunk size. Descriptor bytes are AAD on every chunk. Chunks use
+Descriptor fields include format, collection/revision/object IDs, kind, plaintext length/hash, key
+version, and chunk size. `record_len` is big-endian and must be `17..1,048,593` for 1 MiB
+plaintext chunks. There is one mandatory zero-byte final record for an empty plaintext; all other
+records use `TAG_MESSAGE`, and the last uses `TAG_FINAL`. Parsing is streaming-only: reject malformed
+or oversized lengths, truncation, missing final tag, any record after final, and trailing bytes.
+Descriptor bytes are AAD on every chunk. Chunks use
 `crypto_secretstream_xchacha20poly1305` with `TAG_MESSAGE` except the final chunk, which must use
 `TAG_FINAL`. A reader rejects a missing final tag, altered descriptor/AAD, invalid tag, plaintext
 hash/length mismatch, ciphertext hash mismatch, malformed header, or trailing bytes. The writer
@@ -99,18 +123,25 @@ account = <installation-id>:<key-version>
 
 The implementation verifies the selected backend before use and fails closed if it is unavailable
 or ambiguous. There is no plaintext fallback, environment fallback, SQLite key column, or reuse of
-the email HMAC key. `keyring` documents the macOS Keychain backend and its access-control caveat in
+the email HMAC key. Keychain access is limited to the logged-in user session and authorized Python
+executable; it does not protect against malware running as that user. `keyring` documents the macOS
+Keychain backend and its access-control caveat in
 its [security considerations](https://keyring.readthedocs.io/en/stable/).
 
 Rotation creates a new version, writes/re-encrypts objects explicitly, verifies all manifests, and
 retains old versions until a fresh restore test and explicit retirement. No key material is logged
 or persisted in the ledger.
 
-Recovery export is a versioned envelope containing only installation/vault IDs, key versions, KDF
-parameters, salt, nonce/header, and authenticated ciphertext of the wrapped key. Argon2id derives
-the wrapping key from a user passphrase. Export refuses stdout, overwrite, and untrusted paths.
-Import is explicit, validates all bindings, requires a fresh empty destination, and never merges or
-deletes automatically.
+Recovery is part of the explicit backup flow. Envelope v1 uses canonical JSON descriptor fields
+`format=worktrace-jira-recovery`, `version=1`, Argon2id `opslimit`/`memlimit` only (no parallelism),
+`dk_len=32`, 16-byte salt, and PyNaCl `nacl.secret.Aead` XChaCha20-Poly1305-IETF with a 24-byte
+nonce and descriptor bytes as cryptographic AAD. Salt, nonce, AAD, and ciphertext use unpadded
+base64url. Accepted costs are opslimit 1..10 and memlimit 8 MiB..1 GiB (default 3/64 MiB).
+On-disk grammar is `WTRK | 0x01 | descriptor_len[u32] <=8192 | descriptor |
+ciphertext_len[u32] <=4096 | ciphertext`. Reject downgrade, unknown/duplicate fields, duplicate
+versions, non-canonical bytes, oversize, wrong passphrase, or authentication failure. Require a
+twice-entered passphrase of at least 12 Unicode scalar values; never log or persist it. Import is
+explicit, validates all bindings, requires a fresh empty destination, and never merges or deletes.
 
 ### 5. Dependencies and parser safety
 
@@ -129,13 +160,14 @@ HTML, text PDFs, DOCX, XLSX, and PPTX. No OCR or transcription is part of this d
 
 ### 6. Download, restart, and backup
 
-Attachment content uses `GET /rest/api/3/attachment/content/{id}?redirect=false`. Redirects are
-forbidden; credentials are sent only to the configured Jira origin. A response is accepted only
-after declared-size/hash/final-tag verification. Two downloads may run concurrently, with one DB
-writer and short transactions. Network timeout is 30 seconds, with three attempts for timeout,
-429, and 5xx only. Invocation transfer budget defaults to 20 GiB and is adjustable; preserve 2 GiB
-free space. Incomplete resource streams start over at that resource boundary; verified resources
-remain idempotently complete. Pause is durable.
+Attachment content uses an `httpx` client with `trust_env=False` and `follow_redirects=False`,
+exact origin/path construction, and `GET /rest/api/3/attachment/content/{id}?redirect=false`.
+Reject every 3xx before reading a body; never send auth to redirects or proxies. A response is
+accepted only after declared-size/hash/final-tag verification. Two downloads may run concurrently,
+with one DB writer and short transactions. Network timeout is 30 seconds, with three attempts for
+timeout, 429, and 5xx only. Invocation transfer budget defaults to 20 GiB and is adjustable;
+preserve 2 GiB free space. Incomplete resource streams start over at that resource boundary;
+verified resources remain idempotently complete. Pause is durable.
 
 Before activation, recheck issue `updated` and attachment manifest. One changed retry is allowed;
 another change or failed comparison produces `unstable_partial` and prevents activation.
@@ -145,7 +177,23 @@ SQLite, bind protected config and HMAC material separately, and bind the immutab
 ciphertext hashes, and key versions. Restore is fresh-destination-only and fail-closed on any
 binding, key, schema, hash, final-tag, or non-empty-destination failure. No automatic deletion,
 restore, merge, or overwrite is permitted. Rollback means restoring a prior coherent epoch to a
-fresh destination; it does not erase intervening decisions.
+fresh destination; it does not erase intervening decisions. `worktrace backup` remains DB-only and
+warns when a vault exists. The explicit commands are
+`worktrace jira backup COLLECTION_ID --output NEW_DIRECTORY --yes` and
+`worktrace jira restore --input EPOCH_DIRECTORY --destination FRESH_DIRECTORY --yes`. Both refuse
+overwrite; restore requires a fresh destination and verifies a portable recovery-envelope hash.
+
+Extraction must use a capability-probed macOS `sandbox-exec` profile denying network, process
+creation, and filesystem access except inherited pipes. If unavailable, persist
+`extraction_unavailable` and do not run unsandboxed. The exact installed interpreter/module uses
+`shell=False`, empty allowlist environment, fixed cwd, close-on-exec descriptors, resource limits,
+TERM/KILL timeout handling, and reap. Any temp fallback is 0700 with `O_EXCL|O_NOFOLLOW` 0600 files,
+crash cleanup, and next-start sweep.
+
+An explicit `worktrace purge COLLECTION_ID --include-jira-vault --yes` quiesces active jobs,
+checks backup references, deletes ciphertext only when unreferenced, retires only unreferenced
+Keychain versions, and reports logical deletion rather than secure erasure. Backup retention is
+never changed implicitly. Without both flags, purge cannot touch vault objects.
 
 ## Consequences
 

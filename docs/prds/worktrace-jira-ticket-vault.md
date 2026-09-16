@@ -21,6 +21,13 @@ private explicit attachment export without changing WorkTrace's evidence authori
 This document supersedes the existing attachment exclusion only for this Jira vault scope. It does
 not permit attachments in SQLite, MCP responses, automatic exports, or automatic provider writes.
 
+The model distinguishes the non-secret site identity, collection instance, collection run, and
+immutable activated revision. Historical revisions remain queryable. Stable ticket identity is
+site plus numeric Jira issue ID; provider attachment ID is distinct from each revision's attachment
+object ID. Archive provenance uses site-scoped evidence IDs on a separate rail from app
+`source_objects`/observations/references; an optional app association is projection-only and cannot
+alter app authority or candidates.
+
 ## User and safety boundary
 
 The only user is the local engineer reviewing their own authorized history. Assignment, issue links,
@@ -47,6 +54,8 @@ capability, attachment bytes, raw payloads, or new signature.
 - Provide truthful status dimensions, resource-granularity restart, durable pause, bounded network
   and extraction work, and a coherent vault-inclusive backup/restore contract.
 - Preserve existing IDs, roles, decisions, app-scoped authority, and unknown/contradicted states.
+- Keep a dedicated archive provider/selector/orchestrator seam for #49; do not route archive
+  resources through app-scoped source-object ownership.
 
 ## Non-goals
 
@@ -64,14 +73,14 @@ capability, attachment bytes, raw payloads, or new signature.
 | ID | Requirement | Priority | Acceptance signal |
 |---|---|---:|---|
 | FR-1 | Verify configured date/timezone and assignment roots before collection | Must | Root has selection evidence or `boundary_unknown` |
-| FR-2 | Use site+numeric issue ID as collection identity, independent of app map | Must | Same issue cannot fork by app mapping |
+| FR-2 | Separate site, collection instance, run, revision, ticket, and attachment identities | Must | Historical revisions query; same ticket cannot fork by app mapping |
 | FR-3 | Traverse exactly one direct-context hop across accessible projects | Must | Parent/subtask/typed link edges are retained; no second hop |
 | FR-4 | Capture all declared current resource families with page/field completeness | Must | Each resource has a terminal state and locator |
 | FR-5 | Save every attachment type as an encrypted original or explicit unavailable outcome | Must | No MIME/type allowlist drops an original |
 | FR-6 | Extract only bounded supported formats after original encryption | Must | Redacted chunks cite attachment and locator |
 | FR-7 | Resume at resource boundaries and pause durably | Must | Incomplete stream restarts; verified resources remain idempotent |
 | FR-8 | Recheck issue update and attachment manifest before activation | Must | One retry then `unstable_partial` |
-| FR-9 | Expose exact CLI workflow and query-only TUI | Must | Commands and TUI contract match design |
+| FR-9 | Expose exact CLI workflow, vault backup/restore, and query-only TUI | Must | Commands and mutually exclusive TUI options match design |
 | FR-10 | Back up and restore SQLite/config/HMAC/vault as one coherent epoch | Must | Fresh destination opens only after all bindings verify |
 
 ## User workflow
@@ -88,6 +97,8 @@ worktrace jira resume COLLECTION_ID
 worktrace jira search COLLECTION_ID QUERY
 worktrace jira show COLLECTION_ID ISSUE_ID
 worktrace jira attachment-export COLLECTION_ID ATTACHMENT_ID --output PRIVATE_PATH
+worktrace jira backup COLLECTION_ID --output NEW_DIRECTORY --yes
+worktrace jira restore --input EPOCH_DIRECTORY --destination FRESH_DIRECTORY --yes
 worktrace ui --jira-collection COLLECTION_ID
 ```
 
@@ -95,7 +106,21 @@ worktrace ui --jira-collection COLLECTION_ID
 with the same scope, vault, and configuration binding. `status`, `search`, and `show` are redacted
 reads. `attachment-export` is explicit, private-destination-only, refuses overwrite and refuses to
 launch the result. `worktrace ui --jira-collection` displays redacted metadata/extracted chunks
-only; it has no vault key, original bytes, provider, network, or export capability.
+only; it has no vault key, original bytes, provider, network, or export capability. The option is
+additive and mutually exclusive with the existing `--app` and `--candidate` options; omitting it
+preserves the existing app/candidate TUI workflow.
+
+Both commands require explicit confirmation and refuse overwrite. `worktrace backup` remains
+DB-only and warns when Jira vault state exists. Restore accepts only a fresh destination and fails
+closed on any epoch, key, manifest, hash, schema, or recovery-envelope mismatch. No automatic
+deletion or restore occurs.
+
+Exit codes are stable: `0` for complete or complete-with-unavailable-resources, `2` for paused,
+partial, or unstable-partial status requiring action, `1` for failed/preflight/integrity/security
+refusal, and `3` for invalid input or incompatible schema/format. An explicit purge may include
+vault data only with `--include-jira-vault --yes`; it quiesces jobs, honors manifest references and
+backup retention, retires unreferenced keys, and reports logical deletion rather than secure
+erasure.
 
 ## Status contract
 

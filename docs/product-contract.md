@@ -116,13 +116,18 @@ operation requires a successor authority decision.
 
 ## Jira ticket-vault contract
 
-The vault records a bounded observation, not a global Jira snapshot. Collection identity is Jira
-site plus numeric issue ID and is independent of application mapping. Roots are verified assignment
+The vault records a bounded observation, not a global Jira snapshot. Site identity, collection
+instance, run, and immutable activated revision are distinct; historical revisions remain queryable.
+Collection identity is an instance, while stable ticket identity is Jira site plus numeric issue ID
+and is independent of application mapping. Provider attachment identity is distinct from a revision
+attachment object. Roots are verified assignment
 overlaps with the configured interval (`2024-01-28..2026-09-06` in configured timezone); expanded-day
 discovery is followed by complete assignment-changelog verification, retaining `boundary_unknown`.
 Once selected, current full accessible issue context is collected outside that interval.
 
-Exactly one hop of parent, true-subtask, and typed issue-link context may cross into any accessible
+Archive provenance uses site-scoped evidence IDs on a separate rail from app `source_objects`,
+observations, and references. An optional redacted app association is projection-only and cannot
+affect app authority or candidates. Exactly one hop of parent, true-subtask, and typed issue-link context may cross into any accessible
 project. Inaccessible endpoints and remote-link metadata are retained without crawling. Context is
 not participation. Every fields/custom-fields, comment page, changelog field, worklog/property,
 link, watcher/vote, attachment manifest/original, and embedded-media resource has independent
@@ -138,16 +143,27 @@ the revision is `unstable_partial` and not current.
 The exact read/write boundary is:
 
 ```text
-CLI: jira collect/resume/status/search/show/attachment-export, vault writes and backup/restore
-TUI: worktrace ui --jira-collection, query-only redacted metadata/extracted chunks
+CLI: jira collect/resume/status/search/show/attachment-export, jira backup/restore; vault writes
+     and backup/restore remain CLI-only
+TUI: worktrace ui [--jira-collection] with existing --app/--candidate preserved; options are
+     mutually exclusive, and the Jira view is query-only redacted metadata/extracted chunks
 MCP: existing seven SQLite-only tools; no vault signatures, keys, originals, or raw payloads
 ```
 
 `attachment-export` is explicit, private-destination-only, refuses overwrite and stdout, and never
-launches the exported file. Vault backup quiesces the single writer at a resource boundary and
+launches the exported file. `worktrace jira backup/restore` owns vault portability; existing
+`worktrace backup` remains DB-only and warns when vault state exists. Vault backup quiesces the single writer at a resource boundary and
 binds SQLite, configuration, HMAC material, vault manifest/ciphertexts, and key versions as one
 epoch. Restore is explicit to a fresh destination and fails closed on any mismatch; no automatic
-deletion, restore, merge, or overwrite occurs.
+deletion, restore, merge, or overwrite occurs. An explicit purge requires
+`--include-jira-vault --yes`, quiesces jobs, honors manifest references and backup retention, and
+reports logical deletion rather than secure erasure; Keychain versions retire only when unreferenced.
+
+The vault key is a dedicated random key in the explicit macOS Keychain backend through keyring,
+service `WorkTrace Jira Vault`, account `<installation-id>:<key-version>`. Keychain access is
+limited by the logged-in user session/ACL and does not defend against same-user malware. Portable
+epochs hash a verified recovery envelope; same-host restore may use Keychain only after binding
+verification. No plaintext fallback or HMAC/vault-key reuse is allowed.
 
 ## Human decisions
 

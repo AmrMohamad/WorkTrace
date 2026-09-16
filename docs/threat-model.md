@@ -39,6 +39,9 @@ SQLite ledger <---- read-only SQLite URI ---- MCP server ----> Codex
 - The Jira vault stores raw structured payloads and every accessible attachment type outside SQLite.
   A dedicated random key is held by an explicit macOS Keychain backend (`WorkTrace Jira Vault`,
   account `<installation-id>:<key-version>`). The TUI and MCP cannot read the vault or key.
+- Site identity is a non-secret SHA-256 of the canonical HTTPS origin. Collection instance, run,
+  immutable revision, ticket ID, and provider attachment ID are distinct. Archive evidence IDs are
+  site-scoped and do not become app-scoped source objects automatically.
 
 ## Assets and controls
 
@@ -68,6 +71,8 @@ Controls:
 - encrypted originals are stored only in the dedicated vault, outside SQLite and MCP;
 - raw Jira resource payloads are encrypted outside SQLite; only redacted metadata and extracted
   chunks are ledger-visible;
+- archive resources are not app participations; cross-project one-hop context cannot affect app
+  authority or candidates without an explicit, redacted association projection;
 - no arbitrary-path MCP inputs; and
 - record, excerpt, and total-response limits enforced after serialization.
 
@@ -219,21 +224,33 @@ redirect credential exfiltration, parser bombs, and incoherent database/vault ba
 - each object uses versioned libsodium secretstream XChaCha20-Poly1305 with immutable descriptor/AAD,
   authenticated chunks, and a required final tag;
 - temporary ciphertext is atomically published only after final-tag and hash verification;
-- keyring must be the explicit macOS Keychain backend; there is no plaintext fallback and the email
-  HMAC key is never reused;
+- keyring must be the explicit macOS Keychain backend, service `WorkTrace Jira Vault`, account
+  `<installation-id>:<key-version>`; access is limited by the logged-in user session/Keychain ACL,
+  but same-user malware is out of scope. There is no plaintext fallback and the email HMAC/vault
+  keys are never reused;
 - recovery is a passphrase-wrapped, versioned Argon2id authenticated envelope and import requires a
-  fresh destination;
-- attachment GET requests set `redirect=false`, reject redirects, and never send credentials to a
-  non-configured origin;
-- extraction has no credentials/network/child execution and is bounded to 25 MiB, 60 seconds,
-  512 MiB, 1,000 pages, 1M characters, and OOXML 10,000 entries/100 MiB inflated content;
+  fresh destination; portable epochs hash that envelope while same-host restore may use Keychain
+  only after verifying the same binding;
+- attachment HTTP uses `trust_env=False` and `follow_redirects=False`, exact origin/path
+  construction, rejects all 3xx before body, and never sends credentials to redirects or proxies;
+- extraction requires a capability-probed macOS `sandbox-exec` profile denying network, process
+  and filesystem access except inherited pipes. Unavailable sandbox means saved
+  `extraction_unavailable`, not an unsandboxed attempt. The exact interpreter/module uses an empty
+  allowlist environment, fixed cwd, close-on-exec descriptors, limits of 25 MiB/60 seconds/512 MiB/
+  1,000 pages/1M chars, TERM/KILL/reap, and OOXML 10,000 entries/100 MiB inflated content;
 - a coherent backup epoch quiesces the writer at a resource boundary and binds SQLite/config/HMAC,
   vault manifest/ciphertexts, and key versions separately; restore fails closed and never deletes,
-  merges, overwrites, or runs automatically.
+  merges, overwrites, or runs automatically. Purge quiesces jobs, checks manifest/backup references,
+  retires only unreferenced keys, and requires `--include-jira-vault --yes`; it reports logical
+  deletion, not secure erasure.
 
 ### Database, backup, and export exposure
 
-The ledger, its SQLite side files, backups, and exports inherit the same sensitivity. Store them only in the configured local data directory with restrictive permissions. Do not print their content in logs. Export is an explicit CLI action, remains redacted, and must not imply that the output is safe to publish. Purge is explicit and should report what retention boundary it applied.
+The ledger, its SQLite side files, backups, vault manifests/ciphertexts, and exports inherit the
+same sensitivity. Store them only in configured private directories with restrictive permissions.
+Do not print their content in logs. Export uses no-follow, exclusive 0600 temp creation and an
+atomic no-overwrite finalization under a trusted parent chain; it remains explicit/private and
+never launches the file. Purge reports its logical deletion and explicit backup-retention boundary.
 
 ## Redaction before persistence
 

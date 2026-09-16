@@ -81,6 +81,8 @@ uv run worktrace jira resume COLLECTION_ID
 uv run worktrace jira search COLLECTION_ID "checkout"
 uv run worktrace jira show COLLECTION_ID ISSUE_ID
 uv run worktrace jira attachment-export COLLECTION_ID ATTACHMENT_ID --output /private/path/file
+uv run worktrace jira backup COLLECTION_ID --output /private/path/epoch --yes
+uv run worktrace jira restore --input /private/path/epoch --destination /private/path/fresh --yes
 uv run worktrace ui --jira-collection COLLECTION_ID
 ```
 
@@ -90,7 +92,11 @@ integrity, extraction, search readiness, and app mapping. The current full ticke
 outside the interval, with exactly one hop of parent/subtask/typed-link context; context is not
 participation. The TUI and MCP show only redacted metadata/extracted chunks. Attachment export is
 explicit, private, no-overwrite, and never launches the file. A collection is not a global Jira
-snapshot, and static or fixture proof is not live-provider proof.
+snapshot, and static or fixture proof is not live-provider proof. The `--jira-collection` TUI
+option is mutually exclusive with the existing `--app`/`--candidate` options. `jira backup` and
+`jira restore` are the only vault portability commands; existing `worktrace backup` remains
+DB-only and warns when vault state exists. Restore requires a fresh destination and fail-closed
+verification. Purge includes vault data only with explicit `--include-jira-vault --yes`.
 
 Configure the seven read-only stdio tools with
 [`codex-mcp.example.toml`](codex-mcp.example.toml). The MCP process receives no Jira or GitLab

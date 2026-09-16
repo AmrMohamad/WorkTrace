@@ -89,9 +89,12 @@ Candidate rebuilds may delete and recreate derived references and suggestions. C
 
 ## Jira vault observations
 
-The optional Jira vault adds encrypted source observations without changing the evidence model.
-Collection identity is `(site_canonical, numeric_issue_id)`, not `app_id`; an app association is a
-projection convenience and cannot split or merge source identity. Assignment roots are selected
+The optional Jira vault adds encrypted archive observations without changing the existing app
+evidence model. Site identity, collection instance, run, and immutable activated revision are
+distinct; historical revisions remain queryable. Stable ticket identity is
+`(site_canonical, numeric_issue_id)`, not `app_id`; provider attachment identity is distinct from a
+revision attachment object. An app association is a projection convenience and cannot split or
+merge archive identity. Assignment roots are selected
 only after expanded-day discovery and full assignment-changelog overlap verification in the
 configured timezone/date interval. Unknown assignment boundaries remain `boundary_unknown`.
 
@@ -107,7 +110,9 @@ bytes; and embedded Jira media mappings. Empty successful responses are complete
 permission, deletion, boundary, parser, or transport failures are explicit unavailable/partial
 states. A collection never claims a global snapshot.
 
-Original attachment bytes and raw structured provider payloads are encrypted in a dedicated vault
+Archive evidence IDs are site-scoped and remain on a rail separate from app `source_objects`,
+`observations`, and `references`. A derived app association never automatically changes app
+authority or candidates. Original attachment bytes and raw structured provider payloads are encrypted in a dedicated vault
 outside SQLite. SQLite contains only redacted metadata, hashes, status/error summaries, stable
 locators, and extracted redacted chunks. Every attachment type is eligible for preservation;
 unsupported extraction retains the original and reports search unavailability. MCP and the TUI do

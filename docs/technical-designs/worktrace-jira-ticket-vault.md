@@ -35,22 +35,52 @@ its comments, worklogs, properties, links, media, or attachments were all access
 
 ## Domain model and identity
 
-### Collection identity
+### Site, collection, run, revision, and ticket identity
 
-`jira_collection_id = jcol:<base32url(HMAC-SHA256(collection_id_key, site_canonical))>` is the
-ledger-facing site identity. The site canonical form is the normalized HTTPS origin (lowercase
-host, default port removed, path normalized, no query/fragment). It is not an app ID and must not
-contain credentials. A collection's logical issue identity is:
+Keep five identities distinct:
 
 ```text
-jira_issue_identity = <site_canonical, numeric_issue_id>
-jira_issue_object_id = jira:<site_fingerprint>:issue:<numeric_issue_id>
+site_id       = jira-site:<lowercase hex SHA-256(canonical HTTPS origin)>
+collection_id = jcol:<UUIDv4>                         # one immutable requested scope/instance
+run_id        = jrun:<UUIDv4>                         # one attempt against that instance
+revision_id   = jrev:<collection_id>:<monotonic integer>
+ticket_id     = jira:<site_id>:issue:<numeric Jira issue ID>
 ```
 
-The numeric ID, not a mutable key or application map, is the deduplication key. The latest observed
-key, project key, and canonical web URL are metadata. If a key is renamed or an issue appears under
-another configured app, the same issue object remains one identity; app mappings are separate
-read-model associations and never split collection identity.
+The site canonical form is the normalized HTTPS origin (lowercase host, default port removed,
+normalized path, no query/fragment). Site identity is non-secret SHA-256, not HMAC and not a vault
+key. Deterministic vector: `https://jira.example.test` →
+`sha256=5521c7ed7714cbf69b5714241341c02057f405f72ee9a199333e98b3bac49f03` and
+`https://jira.example.test/` canonicalizes to the same input. A query, fragment, credentials,
+non-HTTPS origin, or non-default port is rejected rather than hashed.
+
+`collection_id` identifies an instance and therefore never collides when the same site is collected
+under a new scope or configuration. A run is an attempt; it cannot become authoritative by itself.
+An activated revision is immutable and remains queryable after a later revision supersedes it. Every
+resource state, attachment revision object, extracted chunk, vault object path, and vault manifest
+row carries both `collection_id` and `revision_id` (and `run_id` where provenance requires it).
+The provider attachment identity is separate:
+
+```text
+provider_attachment_id = jira:<site_id>:attachment:<numeric attachment ID>
+revision_attachment_id = jatt:<collection_id>:<revision_id>:<provider_attachment_id>
+```
+
+The numeric issue ID, not a mutable key or app map, is the stable ticket deduplication key. Key,
+project key, URL, and current fields are revision metadata. A renamed or remapped issue remains one
+ticket identity while its historical revisions and optional app projections remain distinct.
+
+The archive provenance rail is separate from the existing app-scoped `source_objects`,
+`observations`, and `references` rail. Site-scoped archive evidence IDs are:
+
+```text
+jare:<site_id>:<collection_id>:<revision_id>:<resource_kind>:<locator_hash>
+```
+
+`jira_archive_app_associations` may project a redacted archive evidence ID into an `app_id` with an
+explicit configured/derived reason. It has no foreign key back from archive resources into app
+authority, candidates, or participation. Cross-project context can never affect app-scoped source
+authority or candidate generation automatically.
 
 ### Root selection
 
@@ -127,45 +157,82 @@ The implementation adds a forward migration after the current schema. Existing t
 unchanged. The following logical schema is normative; exact SQLite affinity may follow current
 conventions.
 
-### `jira_collections`
+### `jira_archive_sites`, `jira_collections`, `jira_collection_runs`, and revisions
 
 ```text
-id TEXT PRIMARY KEY                         -- jcol stable ID
-site_canonical TEXT NOT NULL
-site_fingerprint TEXT NOT NULL
-identity_key_version INTEGER NOT NULL
-app_id TEXT NULL REFERENCES apps(id)       -- optional association, not identity
-scope_json TEXT NOT NULL                   -- dates, timezone, policy, project allowlist
-manifest_hash TEXT NOT NULL
-vault_id TEXT NOT NULL
-status TEXT NOT NULL
-created_at TEXT NOT NULL
-updated_at TEXT NOT NULL
-activated_at TEXT NULL
+jira_archive_sites(
+  id TEXT PRIMARY KEY,                       -- jira-site:<sha256(origin)>
+  canonical_origin TEXT NOT NULL UNIQUE,
+  hash_algorithm TEXT NOT NULL CHECK (hash_algorithm = 'sha256')
+)
+
+jira_collections(
+  id TEXT PRIMARY KEY,                       -- jcol UUIDv4
+  site_id TEXT NOT NULL REFERENCES jira_archive_sites(id),
+  scope_json TEXT NOT NULL,                  -- dates, timezone, policy, project allowlist
+  config_fingerprint TEXT NOT NULL,
+  vault_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  retired_at TEXT NULL
+)
+
+jira_collection_runs(
+  id TEXT PRIMARY KEY,                       -- jrun UUIDv4
+  collection_id TEXT NOT NULL REFERENCES jira_collections(id),
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  completed_at TEXT NULL,
+  progress_json TEXT NOT NULL,
+  error_json TEXT NULL
+)
+
+jira_archive_revisions(
+  id TEXT PRIMARY KEY,                       -- jrev:<collection>:<integer>
+  collection_id TEXT NOT NULL REFERENCES jira_collections(id),
+  run_id TEXT NOT NULL REFERENCES jira_collection_runs(id),
+  revision_number INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  manifest_hash TEXT NOT NULL,
+  activated_at TEXT NULL,
+  superseded_at TEXT NULL,
+  UNIQUE (collection_id, revision_number)
+)
+
+jira_archive_app_associations(
+  archive_evidence_id TEXT NOT NULL,
+  app_id TEXT NOT NULL REFERENCES apps(id),
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (archive_evidence_id, app_id)
+)
 ```
 
 ### `jira_collection_issues`
 
 ```text
 collection_id TEXT NOT NULL REFERENCES jira_collections(id)
+revision_id TEXT NOT NULL REFERENCES jira_archive_revisions(id)
+run_id TEXT NOT NULL REFERENCES jira_collection_runs(id)
 issue_id TEXT NOT NULL                      -- numeric Jira ID as text
-object_id TEXT NOT NULL                     -- stable source object ID
+object_id TEXT NOT NULL                     -- ticket_id from the archive rail, not app source_objects
 issue_key TEXT NOT NULL DEFAULT ''
 role TEXT NOT NULL CHECK (role IN ('root','context','explicit_root'))
 selection_reason_json TEXT NOT NULL
 assignment_status TEXT NOT NULL
 boundary_status TEXT NOT NULL
-current_revision INTEGER NOT NULL DEFAULT 0
 latest_updated_at TEXT NULL
-PRIMARY KEY (collection_id, issue_id)
+PRIMARY KEY (revision_id, issue_id)
 ```
 
 ### `jira_resource_states`
 
 ```text
-id TEXT PRIMARY KEY                           -- jres:<collection>:<issue>:<kind>:<locator_hash>
+id TEXT PRIMARY KEY                           -- jres:<collection>:<revision>:<issue>:<locator_hash>
 collection_id TEXT NOT NULL REFERENCES jira_collections(id)
-issue_id TEXT NOT NULL
+revision_id TEXT NOT NULL REFERENCES jira_archive_revisions(id)
+run_id TEXT NOT NULL REFERENCES jira_collection_runs(id)
+archive_evidence_id TEXT NOT NULL UNIQUE
+issue_id TEXT NOT NULL                      -- numeric Jira ID; ticket identity is site-scoped
 kind TEXT NOT NULL
 locator_json TEXT NOT NULL                    -- page/cursor/id, canonicalized
 role TEXT NOT NULL CHECK (role IN ('root','context','shared'))
@@ -181,17 +248,19 @@ redaction_version TEXT NOT NULL
 source_updated_at TEXT NULL
 fetched_at TEXT NULL
 error_json TEXT NULL
-UNIQUE (collection_id, issue_id, kind, locator_json)
+UNIQUE (revision_id, issue_id, kind, locator_json)
 ```
 
 ### `jira_attachment_objects` and `jira_search_chunks`
 
 ```text
 jira_attachment_objects(
-  id TEXT PRIMARY KEY,                         -- jatt:<site>:<numeric_attachment_id>
+  id TEXT PRIMARY KEY,                         -- jatt:<collection>:<revision>:<provider_id>
   collection_id TEXT NOT NULL,
+  revision_id TEXT NOT NULL,
   issue_id TEXT NOT NULL,
-  attachment_id TEXT NOT NULL,
+  attachment_id TEXT NOT NULL,                 -- provider_id, stable at site scope
+  archive_evidence_id TEXT NOT NULL UNIQUE,
   filename TEXT NOT NULL,
   mime_type TEXT NOT NULL DEFAULT '',
   declared_size INTEGER NULL,
@@ -201,12 +270,13 @@ jira_attachment_objects(
   ciphertext_sha256 TEXT NULL,
   extracted_state TEXT NOT NULL,
   source_locator TEXT NOT NULL,
-  UNIQUE (collection_id, attachment_id)
+  UNIQUE (revision_id, attachment_id)
 )
 
 jira_search_chunks(
-  id TEXT PRIMARY KEY,                         -- jchunk:<attachment>:<ordinal>
+  id TEXT PRIMARY KEY,                         -- jchunk:<collection>:<revision>:<attachment>:<ordinal>
   collection_id TEXT NOT NULL,
+  revision_id TEXT NOT NULL,
   issue_id TEXT NOT NULL,
   attachment_id TEXT NOT NULL,
   ordinal INTEGER NOT NULL,
@@ -214,28 +284,42 @@ jira_search_chunks(
   text_redacted TEXT NOT NULL,
   chars INTEGER NOT NULL,
   extraction_version TEXT NOT NULL,
-  UNIQUE (attachment_id, ordinal)
+  UNIQUE (revision_id, attachment_id, ordinal)
 )
 ```
 
 Raw issue resource JSON, raw ADF, raw changelog pages, and original attachment bytes never enter
 SQLite. SQLite stores only redacted normalized metadata, status/error summaries, hashes, stable
-locators, and extracted redacted chunks. The vault manifest is immutable once the collection
-revision is activated.
+locators, and extracted redacted chunks. The vault manifest is immutable once its collection
+revision is activated. Historical revisions remain queryable and are never rewritten in place.
+
+The #49 implementation owns a dedicated archive seam rather than routing through app evidence
+owners: `src/worktrace/archive/jira/selector.py` (selection/assignment),
+`src/worktrace/archive/jira/provider.py` (HTTP/resource adapters), and
+`src/worktrace/archive/jira/orchestrator.py` (run/revision/resource state). Existing
+`source_objects`/`observations` imports may optionally receive a redacted projection only through
+the explicit association table above.
 
 ## Vault format and key lifecycle
 
 ### Encrypted object format
 
 Every raw payload/original is one independent secretstream object. The immutable descriptor is a
-canonical UTF-8 JSON object with sorted keys and no secrets:
+canonical UTF-8 JSON object with sorted keys and no secrets. Canonical encoding is UTF-8,
+`json.dumps(sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False)`, with no
+leading/trailing whitespace. A parser rejects duplicate keys, invalid UTF-8, NaN/Infinity,
+non-canonical numbers/escapes, unknown required-field versions, and any descriptor whose bytes
+differ from canonical re-serialization. Descriptor length is a big-endian `u32`, bounded to
+65,536 bytes.
 
 ```json
 {
   "format": "worktrace-jira-vault-object",
   "format_version": 1,
+  "site_id": "jira-site:...",
   "collection_id": "jcol:...",
-  "object_id": "jatt:...",
+  "revision_id": "jrev:jcol:...:1",
+  "object_id": "jatt:jcol:...:jrev:...:jira-site:...:attachment:123",
   "kind": "attachment_original",
   "content_length": 1234,
   "content_sha256": "...",
@@ -244,20 +328,32 @@ canonical UTF-8 JSON object with sorted keys and no secrets:
 }
 ```
 
-The descriptor bytes are associated data (AAD) on every chunk and are stored in the immutable
-vault manifest with object path, ciphertext hash, key version, and finalization time. The file
-header stores a magic value, format version, descriptor length/bytes, secretstream header, then
-authenticated ciphertext chunks. Chunks use `TAG_MESSAGE` except the final chunk, which must use
-`TAG_FINAL`; decryption must reject EOF without a valid final tag, any AAD mismatch, descriptor
-mismatch, ciphertext hash mismatch, or trailing bytes. Use PyNaCl's libsodium binding to
+The normative binary grammar is big-endian and streaming-only:
+
+```text
+magic[4] = WTVA | version[1] = 0x01 | descriptor_len[u32]
+descriptor[descriptor_len] | secretstream_header[24]
+repeat { record_len[u32] | ciphertext[record_len] }
+```
+
+`record_len` must be `17..1,048,593` (`chunk_size=1,048,576` plus the 17-byte secretstream
+overhead). The final record is mandatory even for a zero-byte plaintext: its ciphertext decrypts to
+zero bytes and carries `TAG_FINAL`. Non-final records carry `TAG_MESSAGE`. A reader consumes one
+length-prefixed record at a time, rejects malformed/oversized lengths, EOF/truncation, missing final
+tag, any record after final, or trailing bytes, and never seeks or loads the object into memory.
+Descriptor bytes are associated data (AAD) on every chunk and are stored in the immutable vault
+manifest with object path, ciphertext hash, key version, and finalization time. Use PyNaCl's libsodium binding to
 `crypto_secretstream_xchacha20poly1305_*`; libsodium documents the header, authenticated chunks,
 final tags, and rekey tags in its [secretstream contract](https://libsodium.gitbook.io/doc/secret-key_cryptography/secretstream).
 
-The object writer streams to a private temporary path, fsyncs, atomically renames only after the
+The object writer streams to a private temporary path, fsyncs, and atomically renames only after the
 final tag and ciphertext hash are verified, then records the manifest row in a short SQLite
-transaction. A partial file is never addressable as an original. Reads decrypt to a pipe or
-explicit export destination; originals are not cached in SQLite or TUI memory beyond the bounded
-stream buffer.
+transaction. A partial file is never addressable as an original. Object paths are
+`vault/<site_id>/<collection_id>/<revision_id>/<revision_attachment_id>.wtva`; path components are
+generated IDs, never provider filenames. Reads decrypt to a pipe or explicit export destination;
+originals are not cached in SQLite or TUI memory beyond the bounded stream buffer. Test vectors must
+cover malformed length, duplicate/non-canonical descriptor, oversized record, empty object,
+truncation, extra record, descriptor substitution, and record reordering.
 
 ### Key storage and rotation
 
@@ -273,7 +369,10 @@ secret  = raw vault key bytes (encoded only as required by keyring API)
 The implementation must verify that the selected backend is the macOS Keychain backend before key
 creation/use. Missing, inaccessible, or ambiguous backends fail closed. There is no plaintext
 file fallback, environment fallback, SQLite key column, or reuse of WorkTrace's email HMAC key.
-The Keychain service/account descriptor is metadata only; it is never a vault secret.
+The Keychain service/account descriptor is metadata only; it is never a vault secret. The key is
+available only to the logged-in user session and the authorized Python executable under the
+Keychain ACL; this is not protection from malware running as that same user. A same-host backup may
+reference verified Keychain key versions, but a portable backup must not assume Keychain portability.
 
 Rotation creates a new key version, writes new objects with that version, and rewraps or rewrites
 old objects only in an explicit maintenance operation after a complete backup. Both versions remain
@@ -283,15 +382,47 @@ material. A missing retired version makes affected originals unavailable, not si
 
 ### Recovery export
 
-`worktrace jira key-export` is intentionally not part of the public command set in this delivery;
-the foundation unit may expose it only as an explicit, documented recovery subcommand after review.
-The format is nevertheless fixed now: a versioned JSON envelope containing installation ID,
-collection/vault IDs, key versions, KDF parameters, salt, nonce/header, and authenticated ciphertext
-of the wrapped vault key. The passphrase derives a wrapping key with Argon2id using recorded memory,
-iterations, and parallelism parameters; authenticated encryption covers the envelope descriptor and
-wrapped key. The export never contains plaintext key material, is never logged, and refuses stdout,
-overwrite, or an untrusted destination. Import requires an explicit fresh-install recovery flow,
-validates the envelope and manifest bindings, and never merges into a non-empty vault automatically.
+Recovery is an explicit part of the vault backup flow, not a new standalone public command. Its
+version-1 envelope has this exact logical JSON shape and binary encoding:
+
+```json
+{
+  "format": "worktrace-jira-recovery",
+  "version": 1,
+  "kdf": {"name": "argon2id", "opslimit": 3, "memlimit": 67108864,
+          "dk_len": 32, "salt_b64": "<22-char-base64url>"},
+  "aead": {"name": "xchacha20-poly1305-ietf", "nonce_b64": "<32-char-base64url>"},
+  "aad_b64": "<base64url canonical descriptor bytes>",
+  "ciphertext_b64": "<base64url authenticated wrapped-key bytes>"
+}
+```
+
+Canonical JSON uses the vault descriptor rules. The file is `WTRK` magic, version byte `0x01`,
+big-endian `u32` descriptor length (maximum 8,192), canonical descriptor bytes, `u32` ciphertext
+length (maximum 4,096), and ciphertext bytes. The descriptor binds installation ID, site IDs,
+collection/vault IDs, key versions, epoch ID, and schema/vault format versions. `salt` is exactly
+16 random bytes and `nonce` exactly 24 random bytes, encoded unpadded base64url. Argon2id uses
+PyNaCl's `opslimit` and `memlimit` parameters only; no parallelism field is accepted or used;
+derive exactly 32 bytes. Accepted costs are `1 <= opslimit <= 10` and
+`8 MiB <= memlimit <= 1 GiB`; the default is 3/64 MiB. Values outside this range, duplicate or
+unknown fields, duplicate JSON keys, non-canonical encodings, oversized descriptor/ciphertext,
+unsupported KDF/AEAD/version, or downgrade to a lower format are rejected before decryption.
+
+The wrapping AEAD is PyNaCl `nacl.secret.Aead` XChaCha20-Poly1305-IETF with a 32-byte key and
+24-byte nonce; `aad_b64` canonical descriptor bytes are cryptographic AAD. The plaintext is a
+versioned `WRAP` record containing `u32` key-version count followed by exactly one 32-byte vault
+key per declared version; duplicate versions, extra bytes, or a key count above 64 are rejected.
+The envelope never contains plaintext keys, is never logged, refuses stdout/overwrite/untrusted
+paths, and requires an interactive passphrase entered twice (minimum 12 Unicode scalar values).
+Passphrases are held only for the operation and best-effort cleared. Wrong passphrase, malformed
+AAD, or authentication failure is indistinguishable to the caller and never creates partial state.
+
+Portable epoch backups must include and hash a verified recovery envelope; same-host restore may use
+the Keychain only when the required key versions are present, but still verifies the envelope/hash.
+Import is explicit, validates all bindings, requires a fresh empty destination, and never merges,
+deletes, or restores automatically. #48 must add deterministic vectors for canonical descriptor,
+salt/nonce, known passphrase, KDF parameters, AAD, ciphertext, wrong passphrase, and every reject
+case above.
 
 ## Jira collection pipeline
 
@@ -299,7 +430,8 @@ The CLI orchestrator owns this sequence:
 
 1. Validate credentials/origin, verified Jira account, configured site/project scope, interval,
    keychain backend, schema, vault directory permissions, free-space reserve, and transfer budget.
-2. Create a collection in `paused`/`running` state with immutable scope and a manifest seed.
+2. Create a collection instance, a run, and a new immutable revision row with immutable scope and
+   manifest seed; only the run carries mutable progress.
 3. Discover expanded days and persist candidates; then fetch complete assignment changelog pages
    and classify roots (`verified_overlap`, `boundary_unknown`, or excluded with reason).
 4. Fetch each selected root's current issue fields and one-hop allowed context. Schedule all
@@ -307,10 +439,13 @@ The CLI orchestrator owns this sequence:
 5. Fetch pages in bounded tasks. A resource's incomplete page stream starts from its first page on
    resume; a completed resource is idempotently skipped by stable locator/hash. At most two
    attachment downloads run concurrently. One SQLite writer serializes short transactions.
-6. For every attachment, issue a GET to `/rest/api/3/attachment/content/{id}?redirect=false`.
-   Reject all redirects and any response whose final credential origin is not the configured Jira
-   origin. Do not send credentials to a redirect host. Stream, hash, encrypt, and commit the
-   original only after final-tag verification.
+6. For every attachment, use an `httpx` client configured with `trust_env=False` and
+   `follow_redirects=False`, construct the path from validated numeric IDs and the configured
+   origin, and issue GET `/rest/api/3/attachment/content/{id}?redirect=false`. Reject every 3xx
+   before reading a body, proxy, or redirect. Credentials are sent only to the exact configured
+   origin; no auth header is copied to another host. Stream, hash, encrypt, and commit the original
+   only after final-tag verification. The adapter test seam must assert origin/path construction,
+   `trust_env=False`, `follow_redirects=False`, and no credential/header reachability on 3xx.
 7. After all resources, re-fetch the issue's `updated` value and attachment manifest. If either
    changed, retry the affected issue once from resource boundaries. If it changes again or cannot
    be compared, mark the revision `unstable_partial` and do not activate it.
@@ -325,15 +460,22 @@ Default network policy is 30 seconds per request and three attempts for timeout/
 
 ## Extraction and search
 
-Extraction runs after encrypted preservation and has no Jira credentials, network, or child-process
-execution capability. Use a subprocess with a sanitized environment, no shell, a private temporary
-directory, and resource limits: 25 MiB input/decompressed parser stream, 60 seconds wall time,
-512 MiB memory, 1,000 pages, 1,000,000 output characters. For OOXML, reject more than 10,000 ZIP
-entries or 100 MiB inflated content; parse XML through `defusedxml`. Text extraction supports plain
-text, Markdown, CSV, JSON, XML, and HTML, text PDFs, and DOCX/XLSX/PPTX. It does not OCR images or
-transcribe audio/video. A parser failure or unsupported type leaves the encrypted original intact
-and records `unsupported` or `failed` extraction state. PDF parsing must apply the input/page limits;
-pypdf documents that content-stream parsing can have high memory cost ([text extraction guidance](https://github.com/py-pdf/pypdf/blob/main/docs/user/extract-text.md)).
+Extraction runs after encrypted preservation. It must run under `sandbox-exec` on supported macOS
+hosts after a capability probe; the profile denies network, process creation, and all filesystem
+access except inherited stdin/stdout/stderr pipes. If the probe or sandbox is unavailable, save
+`extraction_unavailable` and retain the original; never silently run unsandboxed. The worker is the
+exact installed interpreter/module, uses `shell=False`, a fixed empty working directory, an empty
+allowlist environment, and `FD_CLOEXEC` on all unrelated descriptors. Apply 25 MiB
+input/decompressed parser stream, 60 seconds wall time, 512 MiB memory, 1,000 pages, and 1,000,000
+output-character limits. On timeout send TERM, wait briefly, KILL if needed, and reap; all pipe ends
+close in `finally`. For OOXML, reject more than 10,000 ZIP entries or 100 MiB inflated content;
+parse XML through `defusedxml`. Text extraction supports plain text, Markdown, CSV, JSON, XML, and
+HTML, text PDFs, and DOCX/XLSX/PPTX. It does not OCR images or transcribe audio/video. If a
+capability-probed host requires a temp fallback, use a 0700 directory, `O_EXCL|O_NOFOLLOW` 0600
+files, crash cleanup, and a next-start stale-temp sweep. A parser failure or unsupported type
+leaves the encrypted original intact and records `unsupported` or `failed`. PDF parsing must apply
+the input/page limits; pypdf documents that content-stream parsing can have high memory cost
+([text extraction guidance](https://github.com/py-pdf/pypdf/blob/main/docs/user/extract-text.md)).
 
 Extracted text is normalized, redacted with the existing versioned redactor, bounded, and inserted
 as chunks with source locator, attachment ID, extraction version, and character count. Search reads
@@ -366,7 +508,66 @@ flag appropriate to the CLI's existing safety conventions. It refuses stdout, pa
 ledger/vault, symlink destinations, automatic opening/launching, and provider URLs. Export is not
 an evidence write and does not alter the vault.
 
-The TUI launches only from `worktrace ui --jira-collection COLLECTION_ID`. It uses worker-local
+The exact vault portability commands are:
+
+```text
+worktrace jira backup COLLECTION_ID --output NEW_DIRECTORY --yes
+worktrace jira restore --input EPOCH_DIRECTORY --destination FRESH_DIRECTORY --yes
+```
+
+`jira backup` requires an explicit non-existing output directory and `--yes`; it quiesces at a
+resource boundary and emits a JSON epoch manifest. `jira restore` requires an explicit non-existing
+or empty fresh destination and `--yes`; it verifies the epoch, recovery-envelope hash, and all
+bindings before opening the ledger. `worktrace backup` remains the existing DB-only operation and
+must print a warning when Jira vault state exists; it never implies vault portability.
+
+The public JSON envelopes are exact at the contract level (additional diagnostic fields are not
+permitted without a schema-version bump):
+
+```json
+{
+  "schema_version": 1,
+  "collection_id": "jcol:...",
+  "run_id": "jrun:...",
+  "revision_id": "jrev:jcol:...:1",
+  "status": "complete_with_unavailable_resources",
+  "dimensions": {
+    "selection": "complete",
+    "enumeration": "complete",
+    "original_availability": "complete_with_unavailable_resources",
+    "download_integrity": "complete_with_unavailable_resources",
+    "extraction": "complete_with_unavailable_resources",
+    "search_readiness": "ready",
+    "app_mapping": "not_configured"
+  },
+  "resource_counts": {"complete": 10, "partial": 0, "unavailable": 1},
+  "as_of": "2026-09-16T12:00:00Z",
+  "next_action": null,
+  "limitations": []
+}
+```
+
+`jira backup` emits `{ "schema_version": 1, "epoch_id": "epoch:<UUIDv4>",
+"collection_id": "jcol:...", "revision_id": "jrev:...", "sqlite_sha256": "...",
+"config_binding_sha256": "...", "hmac_binding_sha256": "...", "vault_manifest_sha256":
+"...", "ciphertext_count": 10, "key_versions": [1], "recovery_envelope_sha256": "...",
+"complete": true }`. `jira restore` emits `{ "schema_version": 1, "epoch_id": "epoch:...",
+"destination": "<redacted-basename>", "verified": true, "status": "restored" }` and never
+prints the absolute destination, keys, paths, or plaintext. A refusal emits the same versioned
+envelope with `verified: false`, a stable error code, and a sanitized limitation; it performs no
+partial restore.
+
+Export uses a trusted existing parent chain with no symlink components. Prefer descriptor-relative
+`openat`/`O_NOFOLLOW`; where unavailable, resolve and recheck every parent with `lstat`, refuse
+symlinks/races, and document the weaker portable fallback. Create a generated-ID filename under a
+same-directory temp path with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600; fsync, atomically rename with
+no replacement, then fsync the parent. Provider filenames never become paths.
+
+The TUI accepts the additive `--jira-collection COLLECTION_ID` option alongside the existing
+`--app APP_ID` and `--candidate CANDIDATE_ID` options. `--jira-collection` is mutually exclusive
+with both existing options; without it the existing app/candidate TUI behavior is preserved. The
+TUI launches a Jira collection view only from `worktrace ui --jira-collection COLLECTION_ID`. It
+uses worker-local
 SQLite `mode=ro` connections with `PRAGMA query_only=ON`, renders redacted metadata/chunks using the
 existing literal terminal encoder, and exposes no vault key, original bytes, provider client,
 network, writer, export, migration, or backup capability. It is query-only and does not change the
@@ -388,6 +589,11 @@ Only `running` may fetch. `complete*` is immutable except an explicit new revisi
 terminal for that attempt and may be superseded by a new attempt; `paused` is resumable with the
 same scope/vault/config binding. A revision with `unstable_partial` cannot activate.
 
+Exit codes are part of the public contract: `0` for `complete` or
+`complete_with_unavailable_resources`; `2` for `paused`, `partial`, or `unstable_partial` requiring
+user action; `1` for failed/preflight/integrity/security refusal; and `3` for invalid CLI input or
+incompatible schema/format. `status` uses the same mapping and always emits JSON when requested.
+
 Resource states are:
 
 ```text
@@ -402,7 +608,7 @@ when available, and final tag. `original_availability=unavailable` is distinct f
 `extraction=unsupported`. `search_readiness=ready` requires all requested searchable resources to
 be successfully extracted and indexed; non-searchable resources do not block readiness.
 
-## Backup, restore, compatibility, rollback
+## Backup, restore, purge, compatibility, rollback
 
 The CLI's vault-inclusive backup begins a coherent epoch: stop accepting new collection work,
 quiesce the single DB writer at the current resource boundary, checkpoint/backup SQLite, capture
@@ -417,6 +623,14 @@ configuration/HMAC continuity, vault manifest, ciphertext hashes, keychain key v
 compatibility before opening the ledger. Missing key versions, mismatched HMAC/config, invalid
 final tags, incomplete ciphertext, or non-empty destination causes fail-closed refusal. Restore
 never deletes existing data, overwrites a destination, merges collections, or runs automatically.
+
+An explicit purge extension may be invoked only as
+`worktrace purge COLLECTION_ID --include-jira-vault --yes`. It first quiesces active jobs, verifies
+the collection is not part of an in-progress backup, and computes manifest reference counts. It then
+deletes ciphertexts only when their manifest references are removed, retires Keychain versions only
+when no retained collection/epoch references them, and reports logical deletion (not secure
+erasure). Backup retention is an explicit user choice; no backup is deleted implicitly. Without
+`--include-jira-vault --yes`, purge cannot touch vault objects.
 
 Schema migration is forward-only and CLI-owned. Older binaries reject newer schema/vault formats;
 newer binaries retain all prior observation and decision IDs. Migration must take a coherent backup

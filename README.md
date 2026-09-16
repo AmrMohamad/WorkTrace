@@ -170,6 +170,11 @@ uv run worktrace ui --app sample_store_b2c
 uv run worktrace ui --app sample_store_b2c --candidate candidate:stable-id
 ```
 
+The Jira archive view is additive: `uv run worktrace ui --jira-collection COLLECTION_ID` is
+mutually exclusive with `--app` and `--candidate`, and remains query-only over redacted metadata
+and extracted chunks. Vault portability uses explicit `worktrace jira backup` and `worktrace jira
+restore`; the existing `worktrace backup` remains DB-only and warns when Jira vault state exists.
+
 The UI reviews source-attempt status, bounded candidate pages, contribution evidence,
 participation, seven independent delivery states, Phase 4 questions and gaps, and bounded source
 excerpts. From a settled candidate page, press `/` to open evidence search. Enter a literal query
