@@ -210,6 +210,35 @@ jira_archive_app_associations(
 )
 ```
 
+Preview approval is held in a separate pending row and never stores the raw token:
+
+```text
+jira_scope_previews(
+  preview_id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL,                    -- SHA-256(domain || raw_token)
+  scope_hash TEXT NOT NULL,
+  provider_view_hash TEXT NOT NULL,
+  config_fingerprint TEXT NOT NULL,
+  site_id TEXT NOT NULL,
+  verified_account_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,                    -- UTC
+  expires_at TEXT NOT NULL,                    -- UTC, fixed/configured TTL 900 seconds
+  consumed_at TEXT NULL,
+  preview_status TEXT NOT NULL
+)
+```
+
+The token is 32 bytes from the OS CSPRNG, returned once as unpadded base64url. Its hash input is
+exactly `b"worktrace:jira-scope-approval:v1\\0" + token`; lookup compares hashes in constant time.
+Before that transaction, `collect` repeats the fixed metadata-only preview requests and recomputes
+the canonical scope/provider-view representation, account/site identity, and config fingerprint.
+`collect --approve-scope` then runs `BEGIN IMMEDIATE`, validates one unconsumed/unexpired row plus
+the freshly revalidated scope/config/provider-view/account/site hashes, sets `consumed_at`, and creates the
+collection, immutable manifest, run, and revision in the same transaction. The token is single-use
+and never logged or persisted. Missing, forged, replayed, expired, concurrently consumed, or stale
+scope/config/provider tokens fail before resource hydration. The clock, CSPRNG, canonicalization,
+constant-time comparison, and concurrent double-consume cases have deterministic fixtures.
+
 ### `jira_collection_issues`
 
 ```text
@@ -551,7 +580,9 @@ bounded metadata only:
   "attachment_estimate": {"visible_count": 2, "visible_bytes": 4096},
   "limitations": [],
   "scope_hash": "sha256:...",
-  "approval_token": "scope:..."
+  "provider_view_hash": "sha256:...",
+  "preview_id": "preview:...",
+  "approval_token": "<43-char-base64url-no-padding>"
 }
 ```
 
@@ -561,6 +592,20 @@ policy, interval/timezone, and provider-scope view. Any change invalidates the t
 Preview tests must cover forged/stale tokens, injected projects, changed context, partial or
 inaccessible preview enumeration, and an HTTP assertion that no content or attachment download is
 performed.
+
+Preview request policy is fixed. Root discovery may use only Jira search/JQL (`GET` or `POST
+/rest/api/3/search`) with the assignment query and the field mask
+`id,key,project,parent,subtasks,issuelinks,attachment`, `fieldsByKeys=false`, and `expand=[]`.
+For a relationship target that search cannot describe, the provider may call only the issue
+metadata endpoint with the same mask and flags. Preview never calls comment, changelog, worklog,
+property, attachment-content, thumbnail, remote-link-content, or raw issue hydration endpoints.
+The adapter parser immediately projects only numeric issue ID, key, project ID/key, parent/subtask
+IDs, typed link endpoint IDs/types/directions, and attachment ID/declared size/MIME. Filenames,
+content URLs, self URLs, authors, summaries, descriptions, ADF, custom fields, and every
+unexpected/forbidden field are discarded before persistence, logging, or output; parser tests use
+sentinel secrets in those fields and assert they never cross the preview boundary. Unknown declared
+attachment size remains unknown. `provider_view_hash` is SHA-256 over the ordered sanitized
+projection plus every pagination completion marker, and is included in the approval-token binding.
 
 JSON output includes `schema_version`, stable IDs, `as_of`, collection scope, per-dimension status,
 per-resource completeness, counts, continuation/next action, and limitations. It never includes
@@ -676,7 +721,7 @@ Resource states are:
 ```text
 planned -> fetching -> complete
 planned -> fetching -> unavailable | unsupported | failed | paused
-rechecking -> unstable
+complete -> unstable (when collection recheck detects a changed resource family)
 unstable -> planned
 fetching (stale after crash) -> planned
 complete -> superseded (only by explicit stable revision)
@@ -686,6 +731,12 @@ complete -> superseded (only by explicit stable revision)
 when available, and final tag. `original_availability=unavailable` is distinct from
 `extraction=unsupported`. `search_readiness=ready` requires all requested searchable resources to
 be successfully extracted and indexed; non-searchable resources do not block readiness.
+
+The adversarial acceptance sequence is A→B→C→C: A and B complete in revision 1; C completes, but
+the final recheck observes C changed twice. Only C becomes `unstable`, collection outcome becomes
+`unstable_partial` (exit 2), and revision 1 is not activated. Resume creates revision 2, resets
+and refetches C's issue fields, manifest, original, and derived chunks, while A/B remain their own
+verified complete resources; the resulting revision is activated only after its own stable recheck.
 
 ## Backup, restore, purge, compatibility, rollback
 
