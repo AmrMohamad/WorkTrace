@@ -169,7 +169,7 @@ jira_archive_sites(
 jira_collections(
   id TEXT PRIMARY KEY,                       -- jcol UUIDv4
   site_id TEXT NOT NULL REFERENCES jira_archive_sites(id),
-  scope_json TEXT NOT NULL,                  -- dates, timezone, policy, project allowlist
+  scope_json TEXT NOT NULL,                  -- dates, timezone, policy, optional archive filters
   config_fingerprint TEXT NOT NULL,
   vault_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -436,8 +436,11 @@ also cover wrong passphrase and every reject case above without circular fields.
 
 The CLI orchestrator owns this sequence:
 
-1. Validate credentials/origin, verified Jira account, configured site/project scope, interval,
-   keychain backend, schema, vault directory permissions, free-space reserve, and transfer budget.
+1. Freshly verify `WORKTRACE_JIRA_*` credentials, canonical site origin, and Jira account identity;
+   validate the configured interval/timezone, keychain backend, schema, vault directory permissions,
+   free-space reserve, and transfer budget. No app or configured project allowlist is required for
+   archive collection: the verified account's visible same-site projects define the universe,
+   constrained by assignment overlap and future explicit archive filters.
 2. Create a collection instance, a run, and a new immutable revision row with immutable scope and
    manifest seed; only the run carries mutable progress.
 3. Discover expanded days and persist candidates; then fetch complete assignment changelog pages
@@ -456,7 +459,8 @@ The CLI orchestrator owns this sequence:
    `trust_env=False`, `follow_redirects=False`, and no credential/header reachability on 3xx.
 7. After all resources, re-fetch the issue's `updated` value and attachment manifest. If either
    changed, retry the affected issue once from resource boundaries. If it changes again or cannot
-   be compared, mark the revision `unstable_partial` and do not activate it.
+   be compared, mark the revision `unstable_partial`, retain prior completed resources and the
+   pending unstable resource, and do not activate it.
 8. Build redacted normalized projections and extraction jobs only from verified originals. Activate
    the revision only when all selected resources have terminal outcomes and the manifest is stable.
 
@@ -510,7 +514,7 @@ is `unsupported`, and a failed extraction cannot be reported as no matching text
 The exact new command names are:
 
 ```text
-worktrace jira collect
+worktrace jira collect --scope assigned-during-employment --context-depth 1 --attachments all --config CONFIG
 worktrace jira resume
 worktrace jira status
 worktrace jira search
@@ -552,6 +556,7 @@ permitted without a schema-version bump):
   "collection_id": "jcol:...",
   "run_id": "jrun:...",
   "revision_id": "jrev:jcol:...:1",
+  "collection_outcome": "complete_with_unavailable_resources",
   "status": "complete_with_unavailable_resources",
   "dimensions": {
     "selection": "complete",
@@ -562,7 +567,7 @@ permitted without a schema-version bump):
     "search_readiness": "ready",
     "app_mapping": "not_configured"
   },
-  "resource_counts": {"complete": 10, "partial": 0, "unavailable": 1},
+  "resource_counts": {"complete": 10, "partial": 0, "unavailable": 1, "unstable_partial": 0},
   "as_of": "2026-09-16T12:00:00Z",
   "next_action": null,
   "limitations": []
@@ -602,14 +607,19 @@ Collection and resource dimensions are independent. The legal collection transit
 ```text
 new -> preflight_failed
 new -> paused -> running -> paused
-running -> partial | failed | complete | complete_with_unavailable_resources
+running -> rechecking | partial | failed
+rechecking -> complete | complete_with_unavailable_resources | partial | failed | unstable_partial
 partial -> running | failed | paused
 paused -> running | failed
+unstable_partial -> running | rechecking | failed
 ```
 
-Only `running` may fetch. `complete*` is immutable except an explicit new revision; `failed` is
-terminal for that attempt and may be superseded by a new attempt; `paused` is resumable with the
-same scope/vault/config binding. A revision with `unstable_partial` cannot activate.
+Only `running` may fetch and `rechecking` may perform the final version/manifest comparison. A
+recheck that changes again enters public terminal state `unstable_partial`, preserving prior
+completed resources and the pending unstable resource. `unstable_partial` resumes through
+`resume` into collecting/rechecking under the same scope/vault/config binding; it is never complete
+or successful. `complete*` is immutable except an explicit new revision; `failed` is terminal for
+that attempt and may be superseded by a new attempt; `paused` is resumable with the same binding.
 
 Exit codes are part of the public contract: `0` for `complete` or
 `complete_with_unavailable_resources`; `2` for `paused`, `partial`, or `unstable_partial` requiring

@@ -134,11 +134,19 @@ link, watcher/vote, attachment manifest/original, and embedded-media resource ha
 completeness and availability. All attachment types are preserved as encrypted originals when
 accessible; unsupported extraction leaves the original intact.
 
-Public collection states are `complete`, `complete_with_unavailable_resources`, `partial`,
-`paused`, and `failed`, with independent selection, enumeration, original-availability,
-download-integrity, extraction, search-readiness, and app-mapping dimensions. A final issue-updated
+The public `collection_outcome` states are `complete`, `complete_with_unavailable_resources`, `partial`,
+`paused`, `unstable_partial`, and `failed`, with independent selection, enumeration, original-availability,
+download-integrity, extraction, search-readiness, and app-mapping dimensions. Component dimensions
+may independently report `unstable_partial` for the pending unstable resource; the
+`collection_outcome` remains unstable until a later recheck activates a stable revision. A final issue-updated
 and attachment-manifest recheck is required before activation; one retry is allowed, after which
-the revision is `unstable_partial` and not current.
+the revision is `unstable_partial` and not current. It retains prior completed resources and the
+pending unstable resource, exits 2, resumes through rechecking, and is never complete or successful.
+
+Archive collection uses freshly verified `WORKTRACE_JIRA_*` credentials for the site origin and
+account identity and ranges over same-site projects visible to that account. No app or configured
+project allowlist is required; existing `apps[].jira_project_keys` remains solely app evidence
+import/projection authority and is never implicitly applied to the archive.
 
 The exact read/write boundary is:
 

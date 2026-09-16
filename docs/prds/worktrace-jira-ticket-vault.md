@@ -86,8 +86,8 @@ capability, attachment bytes, raw payloads, or new signature.
 ## User workflow
 
 ```text
-worktrace jira collect APP_ID [--from DATE --to DATE --timezone ZONE]
-  -> preflight identity, site, keychain, free space, and configured scope
+worktrace jira collect --scope assigned-during-employment --context-depth 1 --attachments all --config CONFIG
+  -> freshly verify WORKTRACE_JIRA_* credentials, site origin, account identity, keychain, and free space
   -> discover expanded days; verify assignment changelog; show proposed roots
   -> collect current issue/context resources and encrypted attachment originals
   -> recheck versions/manifests; activate only a stable complete revision
@@ -102,8 +102,11 @@ worktrace jira restore --input EPOCH_DIRECTORY --destination FRESH_DIRECTORY --y
 worktrace ui --jira-collection COLLECTION_ID
 ```
 
-`collect` is explicit and write-capable. `resume` may continue only an interrupted/paused collection
-with the same scope, vault, and configuration binding. `status`, `search`, and `show` are redacted
+`collect` is explicit and write-capable. Archive collection does not require an app or configured
+project allowlist: freshly verified Jira site/account credentials define the visible project
+universe, constrained by assignment overlap; optional explicit archive filters are future additions.
+`resume` may continue only an interrupted/paused/unstable-partial collection with the same scope,
+vault, and configuration binding. `status`, `search`, and `show` are redacted
 reads. `attachment-export` is explicit, private-destination-only, refuses overwrite and refuses to
 launch the result. `worktrace ui --jira-collection` displays redacted metadata/extracted chunks
 only; it has no vault key, original bytes, provider, network, or export capability. The option is
@@ -127,16 +130,20 @@ command/flag.
 
 ## Status contract
 
-Status reports dimensions independently; no aggregate hides a failing dimension:
+Status reports `collection_outcome` and dimensions independently; no aggregate hides a failing
+dimension. `collection_outcome` may be `unstable_partial` even when some component dimensions are
+complete; a component status/count may likewise report `unstable_partial` for the pending resource:
 
 `selection`, `enumeration`, `original_availability`, `download_integrity`, `extraction`,
 `search_readiness`, and `app_mapping`.
 
 Public collection terminal states are `complete`, `complete_with_unavailable_resources`, `partial`,
-`paused`, and `failed`. A collection is `complete` only when all selected resources have verified
+`paused`, `unstable_partial`, and `failed`. A collection is `complete` only when all selected resources have verified
 terminal outcomes and the final manifest/version recheck is stable. Unsupported extraction does not
 make an original unavailable. Missing permission, a revoked/deleted resource, an invalid redirect,
-or an integrity failure is explicit and citable.
+or an integrity failure is explicit and citable. `unstable_partial` retains prior completed
+resources and the pending unstable resource after one recheck still changes, exits 2, resumes into
+rechecking, and is never reported as complete or successful.
 
 ## Success measures
 

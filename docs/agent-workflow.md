@@ -75,7 +75,7 @@ uv run worktrace rebuild all APP_ID --config /path/to/config.toml
 For a separately authorized complete Jira collection, use the dedicated CLI workflow:
 
 ```console
-uv run worktrace jira collect APP_ID --from 2024-01-28 --to 2026-09-06
+uv run worktrace jira collect --scope assigned-during-employment --context-depth 1 --attachments all --config CONFIG
 uv run worktrace jira status COLLECTION_ID
 uv run worktrace jira resume COLLECTION_ID
 uv run worktrace jira search COLLECTION_ID "checkout"
@@ -86,9 +86,11 @@ uv run worktrace jira restore --input /private/path/epoch --destination /private
 uv run worktrace ui --jira-collection COLLECTION_ID
 ```
 
-The selector verifies assignment overlap after expanded-day discovery and retains unknown
-boundaries. Collection status separates selection, enumeration, original availability, download
-integrity, extraction, search readiness, and app mapping. The current full ticket is hydrated
+The selector uses freshly verified `WORKTRACE_JIRA_*` credentials for site/account identity and
+verifies assignment overlap after expanded-day discovery across visible same-site projects; no app
+or configured project allowlist is required. Collection status separates selection, enumeration,
+original availability, download integrity, extraction, search readiness, and app mapping. The
+current full ticket is hydrated
 outside the interval, with exactly one hop of parent/subtask/typed-link context; context is not
 participation. The TUI and MCP show only redacted metadata/extracted chunks. Attachment export is
 explicit, private, no-overwrite, and never launches the file. A collection is not a global Jira
@@ -96,7 +98,9 @@ snapshot, and static or fixture proof is not live-provider proof. The `--jira-co
 option is mutually exclusive with the existing `--app`/`--candidate` options. `jira backup` and
 `jira restore` are the only vault portability commands; existing `worktrace backup` remains
 DB-only and warns when vault state exists. Restore requires a fresh destination and fail-closed
-verification. The shipped `worktrace purge --yes` fails before deleting DB/HMAC/backups when any
+verification. `unstable_partial` is a public terminal state after a second-changing recheck: it
+retains completed resources plus the pending unstable resource, exits 2, and resumes through
+rechecking; it is not complete or successful. The shipped `worktrace purge --yes` fails before deleting DB/HMAC/backups when any
 Jira collection/vault/key references exist. Use `worktrace jira purge COLLECTION_ID --include-vault
 --yes` for one collection; whole-installation vault purge is a separate explicit command/flag.
 
