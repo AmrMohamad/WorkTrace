@@ -70,7 +70,13 @@ This document records intentional v0.1 boundaries and validation gaps. It must n
 
 - Redaction is best effort. It reduces known secret and personal-data patterns but cannot identify every sensitive fact. Review exports before sharing.
 - Employee display names may be retained where required to explain participation. External emails are hashed, but a small identity set may still be inferable from context.
-- The SQLite database, backups, and exports are sensitive local files. WorkTrace does not provide encryption at rest beyond operating-system facilities.
+- The SQLite database, backups, and exports are sensitive local files. The planned Jira vault
+  encrypts originals and raw payloads outside SQLite, but this design does not claim that existing
+  ledgers or ordinary redacted exports are encrypted at rest. Keychain access and local-machine
+  compromise remain residual risks.
+- Jira vault extraction is intentionally limited to plain text/Markdown/CSV/JSON/XML/HTML, text
+  PDFs, DOCX/XLSX/PPTX. OCR and audio/video transcription are not provided; unsupported originals
+  remain preserved with explicit search-unavailable status.
 - MCP source excerpts remain untrusted data even after redaction. Prompt approval for a broader excerpt is a review step, not a guarantee that the content is safe or correct.
 - The MCP server's read-only design limits WorkTrace actions; it cannot prevent a separate client/tool from acting on malicious source text. Codex must keep source text as data.
 

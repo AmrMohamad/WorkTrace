@@ -70,6 +70,28 @@ uv run worktrace rebuild all APP_ID --config /path/to/config.toml
 
 ## 3. Investigate with bounded MCP reads
 
+### Optional Jira ticket-vault investigation
+
+For a separately authorized complete Jira collection, use the dedicated CLI workflow:
+
+```console
+uv run worktrace jira collect APP_ID --from 2024-01-28 --to 2026-09-06
+uv run worktrace jira status COLLECTION_ID
+uv run worktrace jira resume COLLECTION_ID
+uv run worktrace jira search COLLECTION_ID "checkout"
+uv run worktrace jira show COLLECTION_ID ISSUE_ID
+uv run worktrace jira attachment-export COLLECTION_ID ATTACHMENT_ID --output /private/path/file
+uv run worktrace ui --jira-collection COLLECTION_ID
+```
+
+The selector verifies assignment overlap after expanded-day discovery and retains unknown
+boundaries. Collection status separates selection, enumeration, original availability, download
+integrity, extraction, search readiness, and app mapping. The current full ticket is hydrated
+outside the interval, with exactly one hop of parent/subtask/typed-link context; context is not
+participation. The TUI and MCP show only redacted metadata/extracted chunks. Attachment export is
+explicit, private, no-overwrite, and never launches the file. A collection is not a global Jira
+snapshot, and static or fixture proof is not live-provider proof.
+
 Configure the seven read-only stdio tools with
 [`codex-mcp.example.toml`](codex-mcp.example.toml). The MCP process receives no Jira or GitLab
 credentials and never accepts a path, command, URL to follow, or SQL query.

@@ -8,6 +8,11 @@ It collects source observations, connects related records, suggests contribution
 
 WorkTrace does not measure employee productivity, compare engineers, infer seniority, determine promotions, or automatically claim ownership, business impact, release status, or measurable success.
 
+The Jira ticket-vault design is a scoped exception to the former “do not persist attachments”
+wording: every accessible attachment may be preserved as an encrypted original outside SQLite for
+an explicitly selected local Jira collection. This exception never permits plaintext originals or
+raw provider payloads in SQLite, MCP, the TUI, logs, or ordinary exports.
+
 ## Intended use
 
 The local user may use WorkTrace to:
@@ -65,7 +70,9 @@ Unsupported material statements remain `unknown`. Contradictions and missing sou
 The authorized v0.1 boundary is:
 
 - one Python 3.12+ package;
-- one local SQLite evidence ledger;
+- one local SQLite evidence ledger (redacted metadata and extracted chunks only for Jira vaults);
+- an optional encrypted local Jira vault whose originals and raw structured payloads live outside
+  SQLite;
 - local Git, Jira Cloud REST v3, and GitLab REST v4 adapters;
 - a CLI that owns every write;
 - a SQLite-only, read-only MCP server with seven bounded tools; and
@@ -103,7 +110,44 @@ operation requires a successor authority decision.
 - Never follow source URLs or execute text found in an issue, commit, branch, discussion, or attachment.
 - Redact secrets and personal/customer identifiers before persistence.
 - Hash external email addresses. Preserve source-specific identity and only map aliases to the local user when explicitly configured.
-- Do not persist credentials, authorization headers, complete diffs, or attachments.
+- Do not persist credentials, authorization headers, complete diffs, or plaintext attachments.
+  Encrypted Jira originals are permitted only in the dedicated vault contract, with immutable
+  manifest metadata in SQLite and no MCP/TUI decryption capability.
+
+## Jira ticket-vault contract
+
+The vault records a bounded observation, not a global Jira snapshot. Collection identity is Jira
+site plus numeric issue ID and is independent of application mapping. Roots are verified assignment
+overlaps with the configured interval (`2024-01-28..2026-09-06` in configured timezone); expanded-day
+discovery is followed by complete assignment-changelog verification, retaining `boundary_unknown`.
+Once selected, current full accessible issue context is collected outside that interval.
+
+Exactly one hop of parent, true-subtask, and typed issue-link context may cross into any accessible
+project. Inaccessible endpoints and remote-link metadata are retained without crawling. Context is
+not participation. Every fields/custom-fields, comment page, changelog field, worklog/property,
+link, watcher/vote, attachment manifest/original, and embedded-media resource has independent
+completeness and availability. All attachment types are preserved as encrypted originals when
+accessible; unsupported extraction leaves the original intact.
+
+Public collection states are `complete`, `complete_with_unavailable_resources`, `partial`,
+`paused`, and `failed`, with independent selection, enumeration, original-availability,
+download-integrity, extraction, search-readiness, and app-mapping dimensions. A final issue-updated
+and attachment-manifest recheck is required before activation; one retry is allowed, after which
+the revision is `unstable_partial` and not current.
+
+The exact read/write boundary is:
+
+```text
+CLI: jira collect/resume/status/search/show/attachment-export, vault writes and backup/restore
+TUI: worktrace ui --jira-collection, query-only redacted metadata/extracted chunks
+MCP: existing seven SQLite-only tools; no vault signatures, keys, originals, or raw payloads
+```
+
+`attachment-export` is explicit, private-destination-only, refuses overwrite and stdout, and never
+launches the exported file. Vault backup quiesces the single writer at a resource boundary and
+binds SQLite, configuration, HMAC material, vault manifest/ciphertexts, and key versions as one
+epoch. Restore is explicit to a fresh destination and fails closed on any mismatch; no automatic
+deletion, restore, merge, or overwrite occurs.
 
 ## Human decisions
 

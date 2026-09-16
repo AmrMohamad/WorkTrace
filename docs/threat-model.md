@@ -4,9 +4,9 @@
 
 WorkTrace processes proprietary engineering history, employee identities, source assertions, and potentially sensitive incident text. It is a private local single-user tool, but “local” is not a complete security control. The design assumes source text is untrusted and source credentials are high-value secrets.
 
-This model covers the CLI, adapters, local Git subprocess boundary, SQLite ledger, backups/exports,
-the read-only MCP process, and the approved structurally read-only human TUI. It does not authorize
-organization-wide collection or evaluation.
+This model covers the CLI, adapters, local Git subprocess boundary, SQLite ledger, encrypted Jira
+vault, backups/exports, the read-only MCP process, and the approved structurally read-only human TUI.
+It does not authorize organization-wide collection or evaluation.
 
 ## Trust boundaries
 
@@ -24,6 +24,8 @@ SQLite ledger <---- read-only SQLite URI ---- MCP server ----> Codex
       ^
       |
       +--------- worker-local read-only SQLite URI -------- Textual TUI
+      |
+      +--------- encrypted Jira vault (Keychain key; CLI only)
 ```
 
 - The CLI is the only mutation boundary.
@@ -34,6 +36,9 @@ SQLite ledger <---- read-only SQLite URI ---- MCP server ----> Codex
 - The TUI receives only a read-only workspace. It does not receive providers, credentials, network,
   writes, imports, decisions, migrations, maintenance, export, backup, purge, or configuration
   editing.
+- The Jira vault stores raw structured payloads and every accessible attachment type outside SQLite.
+  A dedicated random key is held by an explicit macOS Keychain backend (`WorkTrace Jira Vault`,
+  account `<installation-id>:<key-version>`). The TUI and MCP cannot read the vault or key.
 
 ## Assets and controls
 
@@ -60,7 +65,9 @@ Controls:
 - repository paths resolved and validated by the CLI;
 - no remote auto-discovery outside configured identifiers;
 - path and module metadata instead of complete patches;
-- no attachment import;
+- encrypted originals are stored only in the dedicated vault, outside SQLite and MCP;
+- raw Jira resource payloads are encrypted outside SQLite; only redacted metadata and extracted
+  chunks are ledger-visible;
 - no arbitrary-path MCP inputs; and
 - record, excerpt, and total-response limits enforced after serialization.
 
@@ -196,6 +203,34 @@ Jira `Done`, GitLab `merged`, tags, fix versions, deployments, mobile availabili
 
 Each source page persists transactionally in its run. A killed, failed, partial, or stale-running run cannot become current. Previous complete evidence remains readable with visible staleness; retry uses stable identities and must not duplicate logical objects.
 
+For Jira collections, resource streams are the restart unit: an incomplete stream starts over from
+its first page, while verified resources remain idempotently complete. At most two attachment
+downloads run concurrently and one SQLite writer commits short transactions. Default network
+timeouts are 30 seconds with three attempts for timeouts/429/5xx only; each invocation has a 20 GiB
+transfer budget, an adjustable explicit override, and a 2 GiB free-space reserve. Pause is durable.
+Before revision activation, the CLI rechecks issue `updated` and the attachment manifest; one retry
+is allowed, then the revision remains `unstable_partial`.
+
+### Encrypted-vault threats and controls
+
+Threats include plaintext leakage, ciphertext truncation, descriptor substitution, key loss,
+redirect credential exfiltration, parser bombs, and incoherent database/vault backup. Controls:
+
+- each object uses versioned libsodium secretstream XChaCha20-Poly1305 with immutable descriptor/AAD,
+  authenticated chunks, and a required final tag;
+- temporary ciphertext is atomically published only after final-tag and hash verification;
+- keyring must be the explicit macOS Keychain backend; there is no plaintext fallback and the email
+  HMAC key is never reused;
+- recovery is a passphrase-wrapped, versioned Argon2id authenticated envelope and import requires a
+  fresh destination;
+- attachment GET requests set `redirect=false`, reject redirects, and never send credentials to a
+  non-configured origin;
+- extraction has no credentials/network/child execution and is bounded to 25 MiB, 60 seconds,
+  512 MiB, 1,000 pages, 1M characters, and OOXML 10,000 entries/100 MiB inflated content;
+- a coherent backup epoch quiesces the writer at a resource boundary and binds SQLite/config/HMAC,
+  vault manifest/ciphertexts, and key versions separately; restore fails closed and never deletes,
+  merges, overwrites, or runs automatically.
+
 ### Database, backup, and export exposure
 
 The ledger, its SQLite side files, backups, and exports inherit the same sensitivity. Store them only in the configured local data directory with restrictive permissions. Do not print their content in logs. Export is an explicit CLI action, remains redacted, and must not imply that the output is safe to publish. Purge is explicit and should report what retention boundary it applied.
@@ -237,6 +272,27 @@ markup-derived spans or links, and registers or triggers no actions, commands, o
 Behavioral tests also attempt mouse selection over evidence and dispatch both `ctrl+c` and
 `super+c`; the clipboard remains unchanged and `copy_to_clipboard` is not called. The explicit
 validated-ID action remains covered and copies the exact stable ID once.
+
+## Source references
+
+- [Jira REST v3 introduction](https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro)
+  documents expansion, pagination, ADF, and the current REST version.
+- [Issue attachments](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-attachments/),
+  [comments](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/),
+  [worklogs](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-worklogs/),
+  and [properties](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-properties/)
+  establish the resource, pagination, and permission surfaces being treated as independently
+  complete or unavailable.
+- [Jira issue linking model](https://developer.atlassian.com/cloud/jira/platform/issue-linking-model/)
+  describes link endpoints, labels, and bidirectional interpretation.
+- [libsodium secretstream](https://libsodium.gitbook.io/doc/secret-key_cryptography/secretstream)
+  and [PyNaCl's binding](https://github.com/pyca/pynacl/blob/main/src/nacl/bindings/crypto_secretstream.py)
+  support the authenticated chunk/final-tag contract.
+- [keyring](https://keyring.readthedocs.io/en/stable/) documents macOS Keychain support and its
+  backend access-control considerations.
+- [pypdf extraction guidance](https://github.com/py-pdf/pypdf/blob/main/docs/user/extract-text.md)
+  and [defusedxml security notes](https://github.com/tiran/defusedxml/blob/main/README.md) support
+  the bounded parser and XML-bomb controls.
 
 ## Residual risk
 

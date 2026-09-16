@@ -11,8 +11,10 @@ staleness without turning relationships into ownership or productivity claims.
 - Local Git access is read-only and never fetches or mutates a repository.
 - Provider credentials are read only by CLI imports from environment variables; the MCP server
   opens SQLite read-only and receives no provider credentials.
-- External email addresses are HMAC-hashed before persistence. Diffs, patches, attachments,
-  authorization data, and known secret fields are removed before persistence.
+- External email addresses are HMAC-hashed before persistence. Diffs, patches, authorization data,
+  and known secret fields are removed before persistence. The planned Jira ticket vault is the
+  sole scoped exception for attachments: originals and raw Jira payloads remain encrypted outside
+  SQLite; only redacted metadata and extracted chunks are persisted.
 - Implemented, merged, release-associated, deployed, released-to-users, currently-enabled, and
   measurably-successful are separate states. Unknown evidence stays unknown.
 
