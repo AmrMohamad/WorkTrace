@@ -174,7 +174,9 @@ preserve 2 GiB free space. Incomplete resource streams start over at that resour
 verified resources remain idempotently complete. Pause is durable.
 
 Before activation, recheck issue `updated` and attachment manifest. One changed retry is allowed;
-another change or failed comparison produces `unstable_partial` and prevents activation.
+another change or failed comparison marks affected resource families `unstable`, sets collection
+outcome `unstable_partial`, and prevents activation. Resume creates a new run/revision attempt and
+refetches the affected issue families before rechecking.
 
 Vault-inclusive backup is an epoch: quiesce the writer at a resource boundary, checkpoint/backup
 SQLite, bind protected config and HMAC material separately, and bind the immutable vault manifest,

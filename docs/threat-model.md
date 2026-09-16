@@ -196,6 +196,15 @@ CLI configuration resolves repository roots once and rejects duplicates, nonexis
 
 A configured issue may mention another private project or URL. WorkTrace may retain a redacted textual reference, but it must not fetch the target unless the target project/source instance is explicitly configured. Candidate generation cannot cross app scope merely because identifiers or names resemble one another.
 
+Jira archive collection uses a mandatory preview/approval gate rather than treating credential
+visibility or a static app map as authorization. `collect-preview` performs bounded metadata/JQL
+root and one-hop relationship enumeration only; it returns the canonical site/account, approved
+root/context issue+project set, visible attachment estimates, policy, interval/timezone,
+limitations, scope hash, and expiring approval token without content or attachment downloads.
+`collect` requires the token bound to provider-scope view and config; forged/stale tokens, injected
+projects, changed context, or provider scope changes are rejected. A newly discovered target pauses
+with `scope_expansion_required` for a new preview and never hydrates automatically.
+
 ### Role and ownership escalation
 
 Adversarial inputs include another engineer as author with the local user as committer, a review-only participant, reassignment after implementation, an MR author using another engineer's branch, release merges, backports, and reverts. These remain distinct participations and relationships. No path converts them into implementation or ownership without claim-appropriate evidence or attestation.
@@ -214,7 +223,8 @@ downloads run concurrently and one SQLite writer commits short transactions. Def
 timeouts are 30 seconds with three attempts for timeouts/429/5xx only; each invocation has a 20 GiB
 transfer budget, an adjustable explicit override, and a 2 GiB free-space reserve. Pause is durable.
 Before revision activation, the CLI rechecks issue `updated` and the attachment manifest; one retry
-is allowed, then the revision remains `unstable_partial`.
+is allowed. A second-changing recheck marks affected resources `unstable` and the collection outcome
+`unstable_partial`; resume creates a new run/revision attempt and refetches affected resources.
 
 ### Encrypted-vault threats and controls
 

@@ -136,12 +136,12 @@ accessible; unsupported extraction leaves the original intact.
 
 The public `collection_outcome` states are `complete`, `complete_with_unavailable_resources`, `partial`,
 `paused`, `unstable_partial`, and `failed`, with independent selection, enumeration, original-availability,
-download-integrity, extraction, search-readiness, and app-mapping dimensions. Component dimensions
-may independently report `unstable_partial` for the pending unstable resource; the
-`collection_outcome` remains unstable until a later recheck activates a stable revision. A final issue-updated
+download-integrity, extraction, search-readiness, and app-mapping dimensions. Resource counts use
+the separate state `unstable`; only the collection outcome is `unstable_partial`. A final issue-updated
 and attachment-manifest recheck is required before activation; one retry is allowed, after which
 the revision is `unstable_partial` and not current. It retains prior completed resources and the
-pending unstable resource, exits 2, resumes through rechecking, and is never complete or successful.
+pending unstable resource, exits 2, resumes by creating a new run/revision attempt, and is never
+complete or successful.
 
 Archive collection uses freshly verified `WORKTRACE_JIRA_*` credentials for the site origin and
 account identity and ranges over same-site projects visible to that account. No app or configured
@@ -151,8 +151,8 @@ import/projection authority and is never implicitly applied to the archive.
 The exact read/write boundary is:
 
 ```text
-CLI: jira collect/resume/status/search/show/attachment-export, jira backup/restore; vault writes
-     and backup/restore remain CLI-only
+CLI: jira collect-preview, jira collect --approve-scope TOKEN, resume/status/search/show/
+     attachment-export, jira backup/restore; vault writes and backup/restore remain CLI-only
 TUI: worktrace ui [--jira-collection] with existing --app/--candidate preserved; options are
      mutually exclusive, and the Jira view is query-only redacted metadata/extracted chunks
 MCP: existing seven SQLite-only tools; no vault signatures, keys, originals, or raw payloads

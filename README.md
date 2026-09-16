@@ -132,6 +132,20 @@ uv run worktrace status APP_ID
 `import all` rebuilds references and candidates; separate source imports require an explicit
 `worktrace rebuild all APP_ID`. MCP cursors remain opaque and view-bound.
 
+The complete Jira archive has a separate explicit scope approval flow. `collect-preview` verifies
+the `WORKTRACE_JIRA_*` site/account and enumerates bounded roots and one-hop relationships across
+visible same-site projects without content or attachment downloads. `collect` requires its returned
+scope token; existing `apps[].jira_project_keys` is app-import/projection authority only.
+
+```console
+uv run worktrace jira collect-preview --scope assigned-during-employment --context-depth 1 --config CONFIG
+uv run worktrace jira collect --scope assigned-during-employment --context-depth 1 --attachments all --config CONFIG --approve-scope TOKEN
+```
+
+Provider changes that reveal a new project or target pause with `scope_expansion_required` for a new
+preview. `unstable_partial` is a collection outcome only; affected resources are `unstable`, and
+resume creates a new run/revision attempt before rechecking.
+
 ## Discovery coverage and selector upgrades
 
 Jira exact-key discovery uses exact personal participation, canonically confirmed contributions,

@@ -169,7 +169,10 @@ jira_archive_sites(
 jira_collections(
   id TEXT PRIMARY KEY,                       -- jcol UUIDv4
   site_id TEXT NOT NULL REFERENCES jira_archive_sites(id),
-  scope_json TEXT NOT NULL,                  -- dates, timezone, policy, optional archive filters
+  scope_json TEXT NOT NULL,                  -- immutable approved roots/context projects+issues
+  scope_hash TEXT NOT NULL,
+  approval_token_hash TEXT NOT NULL,
+  policy_version INTEGER NOT NULL,
   config_fingerprint TEXT NOT NULL,
   vault_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -436,16 +439,22 @@ also cover wrong passphrase and every reject case above without circular fields.
 
 The CLI orchestrator owns this sequence:
 
-1. Freshly verify `WORKTRACE_JIRA_*` credentials, canonical site origin, and Jira account identity;
-   validate the configured interval/timezone, keychain backend, schema, vault directory permissions,
-   free-space reserve, and transfer budget. No app or configured project allowlist is required for
-   archive collection: the verified account's visible same-site projects define the universe,
-   constrained by assignment overlap and future explicit archive filters.
-2. Create a collection instance, a run, and a new immutable revision row with immutable scope and
-   manifest seed; only the run carries mutable progress.
+1. `collect-preview` freshly verifies `WORKTRACE_JIRA_*` credentials, canonical site origin, and
+   Jira account identity, then validates the configured interval/timezone. It enumerates only
+   bounded metadata/JQL roots and one-hop relationships across visible same-site projects; it does
+   not hydrate raw resources or download attachments. The preview returns root/context IDs and
+   project keys, unresolved refs, visible attachment estimates, policy, limitations, canonical
+   `scope_hash`, and expiring `approval_token`.
+2. `collect` requires `--approve-scope TOKEN`; validate the token against the provider-scope view,
+   config fingerprint, scope hash, expiry, and policy. Reject forged/stale tokens and persist the
+   approved project+issue set/policy in the immutable collection manifest. Create a collection
+   instance, a run, and a new immutable revision row; only the run carries mutable progress.
 3. Discover expanded days and persist candidates; then fetch complete assignment changelog pages
-   and classify roots (`verified_overlap`, `boundary_unknown`, or excluded with reason).
-4. Fetch each selected root's current issue fields and one-hop allowed context. Schedule all
+   and classify roots (`verified_overlap`, `boundary_unknown`, or excluded with reason), rejecting
+   any root not in the approved set.
+4. Fetch each approved root's current issue fields and one-hop allowed context. If provider changes
+   reveal a new target/project, pause with `scope_expansion_required`, retain the unresolved ref,
+   and require a new preview/token; never hydrate it automatically. Schedule all
    resource families and persist resource state before fetching pages.
 5. Fetch pages in bounded tasks. A resource's incomplete page stream starts from its first page on
    resume; a completed resource is idempotently skipped by stable locator/hash. At most two
@@ -459,8 +468,8 @@ The CLI orchestrator owns this sequence:
    `trust_env=False`, `follow_redirects=False`, and no credential/header reachability on 3xx.
 7. After all resources, re-fetch the issue's `updated` value and attachment manifest. If either
    changed, retry the affected issue once from resource boundaries. If it changes again or cannot
-   be compared, mark the revision `unstable_partial`, retain prior completed resources and the
-   pending unstable resource, and do not activate it.
+   be compared, mark affected resource families `unstable`, retain prior completed resources and
+   the pending unstable resource, set collection outcome `unstable_partial`, and do not activate it.
 8. Build redacted normalized projections and extraction jobs only from verified originals. Activate
    the revision only when all selected resources have terminal outcomes and the manifest is stable.
 
@@ -514,7 +523,8 @@ is `unsupported`, and a failed extraction cannot be reported as no matching text
 The exact new command names are:
 
 ```text
-worktrace jira collect --scope assigned-during-employment --context-depth 1 --attachments all --config CONFIG
+worktrace jira collect-preview --scope assigned-during-employment --context-depth 1 --config CONFIG
+worktrace jira collect --scope assigned-during-employment --context-depth 1 --attachments all --config CONFIG --approve-scope TOKEN
 worktrace jira resume
 worktrace jira status
 worktrace jira search
@@ -522,6 +532,35 @@ worktrace jira show
 worktrace jira attachment-export
 worktrace ui --jira-collection
 ```
+
+The fixed collection command prefix is
+`worktrace jira collect --scope assigned-during-employment --context-depth 1 --attachments all --config CONFIG`;
+`--approve-scope TOKEN` is mandatory and is the only additional approval argument. Preview JSON is
+bounded metadata only:
+
+```json
+{
+  "schema_version": 1,
+  "site_id": "jira-site:...",
+  "account_id": "jira-account:...",
+  "interval": {"from": "2024-01-28", "to": "2026-09-06", "timezone": "Area/City"},
+  "policy_version": 1,
+  "roots": [{"issue_id": "10001", "project_key": "DEMO"}],
+  "context": [{"issue_id": "10002", "project_key": "OTHER", "relationship": "blocks"}],
+  "unresolved_refs": [],
+  "attachment_estimate": {"visible_count": 2, "visible_bytes": 4096},
+  "limitations": [],
+  "scope_hash": "sha256:...",
+  "approval_token": "scope:..."
+}
+```
+
+Preview does not return issue bodies, comments, changelogs, raw payloads, or attachment bytes.
+Its `scope_hash` covers the canonical site/account, approved root/context project+issue set,
+policy, interval/timezone, and provider-scope view. Any change invalidates the token.
+Preview tests must cover forged/stale tokens, injected projects, changed context, partial or
+inaccessible preview enumeration, and an HTTP assertion that no content or attachment download is
+performed.
 
 JSON output includes `schema_version`, stable IDs, `as_of`, collection scope, per-dimension status,
 per-resource completeness, counts, continuation/next action, and limitations. It never includes
@@ -567,12 +606,16 @@ permitted without a schema-version bump):
     "search_readiness": "ready",
     "app_mapping": "not_configured"
   },
-  "resource_counts": {"complete": 10, "partial": 0, "unavailable": 1, "unstable_partial": 0},
+  "resource_counts": {"complete": 10, "partial": 0, "unavailable": 1, "unstable": 0},
   "as_of": "2026-09-16T12:00:00Z",
   "next_action": null,
   "limitations": []
 }
 ```
+
+An unstable status response sets both `collection_outcome` and `status` to `unstable_partial`,
+reports affected resources under `resource_counts.unstable`, sets `next_action` to `resume`, and
+has no activated revision for the attempt. The collection outcome is never placed in resource counts.
 
 `jira backup` emits `{ "schema_version": 1, "epoch_id": "epoch:<UUIDv4>",
 "collection_id": "jcol:...", "revision_id": "jrev:...", "sqlite_sha256": "...",
@@ -611,14 +654,16 @@ running -> rechecking | partial | failed
 rechecking -> complete | complete_with_unavailable_resources | partial | failed | unstable_partial
 partial -> running | failed | paused
 paused -> running | failed
-unstable_partial -> running | rechecking | failed
+unstable_partial -> running | failed
 ```
 
 Only `running` may fetch and `rechecking` may perform the final version/manifest comparison. A
-recheck that changes again enters public terminal state `unstable_partial`, preserving prior
-completed resources and the pending unstable resource. `unstable_partial` resumes through
-`resume` into collecting/rechecking under the same scope/vault/config binding; it is never complete
-or successful. `complete*` is immutable except an explicit new revision; `failed` is terminal for
+recheck that changes again enters public terminal state `unstable_partial`, while each affected
+resource enters `unstable`; prior completed resources remain complete and the unstable resource is
+pending. `unstable_partial` resumes through `resume` by creating a new run and revision attempt,
+resetting and refetching affected issue fields, attachment manifests, originals, and derived chunks
+before a new recheck; it never jumps directly to rechecking and is never complete or successful.
+`complete*` is immutable except an explicit new revision; `failed` is terminal for
 that attempt and may be superseded by a new attempt; `paused` is resumable with the same binding.
 
 Exit codes are part of the public contract: `0` for `complete` or
@@ -631,6 +676,8 @@ Resource states are:
 ```text
 planned -> fetching -> complete
 planned -> fetching -> unavailable | unsupported | failed | paused
+rechecking -> unstable
+unstable -> planned
 fetching (stale after crash) -> planned
 complete -> superseded (only by explicit stable revision)
 ```
@@ -695,7 +742,7 @@ write a secret into SQLite/logs/arguments. New dependency use belongs only to #4
 | Unit | Issue | Deliverable | Required tests/evidence |
 |---|---:|---|---|
 | Foundation | [#48](https://github.com/AmrMohamad/WorkTrace/issues/48) | Additive schema; vault object format; Keychain backend; recovery envelope; extraction sandbox; epoch backup/restore | Crypto vectors including missing final tag/AAD; keychain fail-closed; migration/recovery; parser bombs/limits; fresh restore |
-| Collection | [#49](https://github.com/AmrMohamad/WorkTrace/issues/49) | Root selection; assignment overlap; one-hop context; resource paging; attachment downloads; resume/pause; recheck/status | HTTP fixtures for all resource families, permission loss, redirect refusal, 2-download bound, 20 GiB/2 GiB budgets, unstable revision, legacy/new purge compatibility and shared-reference accounting |
+| Collection | [#49](https://github.com/AmrMohamad/WorkTrace/issues/49) | Preview approval, root selection; assignment overlap; one-hop context; resource paging; attachment downloads; resume/pause; recheck/status | Preview forged/stale-token, project-injection, changed-context, partial/inaccessible, and no-content-download tests; HTTP fixtures for all resource families, permission loss, redirect refusal, 2-download bound, 20 GiB/2 GiB budgets, unstable revision, legacy/new purge compatibility and shared-reference accounting; adversarial A→B→C→C refetch proves C is not mixed into activated A/B |
 | Investigation | [#50](https://github.com/AmrMohamad/WorkTrace/issues/50) | Redacted extraction/search; CLI status/search/show/export; query-only TUI; wheel packaging | Search locator parity, parser JSON/exit contract and sandbox negatives, unsupported originals, export path safety, TUI capability negatives, existing seven-tool MCP and TUI regressions |
 | Rollout | [#51](https://github.com/AmrMohamad/WorkTrace/issues/51) | Controlled migration, pilot, authorized full collection, independent QA | Backup epoch readback, live Jira identity/permissions, pilot resource accounting, fresh restore, limitations and rollback report |
 

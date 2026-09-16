@@ -86,7 +86,8 @@ capability, attachment bytes, raw payloads, or new signature.
 ## User workflow
 
 ```text
-worktrace jira collect --scope assigned-during-employment --context-depth 1 --attachments all --config CONFIG
+worktrace jira collect-preview --scope assigned-during-employment --context-depth 1 --config CONFIG
+worktrace jira collect --scope assigned-during-employment --context-depth 1 --attachments all --config CONFIG --approve-scope TOKEN
   -> freshly verify WORKTRACE_JIRA_* credentials, site origin, account identity, keychain, and free space
   -> discover expanded days; verify assignment changelog; show proposed roots
   -> collect current issue/context resources and encrypted attachment originals
@@ -102,10 +103,21 @@ worktrace jira restore --input EPOCH_DIRECTORY --destination FRESH_DIRECTORY --y
 worktrace ui --jira-collection COLLECTION_ID
 ```
 
+`collect-preview` authenticates and verifies the `WORKTRACE_JIRA_*` credentials, then performs only
+bounded metadata/JQL root and one-hop relationship enumeration: it does not hydrate raw resources
+or download attachments. Its redacted result returns the exact site/account, root numeric IDs and
+project keys, context targets or unresolved references, visible attachment metadata/byte estimates,
+policy version, interval/timezone, limitations, and an immutable canonical `scope_hash` plus
+`approval_token`. The token is bound to the provider-scope view and config, expires on any root,
+context, project, provider, or config change, and is required by `collect`.
+
 `collect` is explicit and write-capable. Archive collection does not require an app or configured
 project allowlist: freshly verified Jira site/account credentials define the visible project
 universe, constrained by assignment overlap; optional explicit archive filters are future additions.
-`resume` may continue only an interrupted/paused/unstable-partial collection with the same scope,
+The approved project+issue set and policy are persisted in the immutable collection manifest;
+anything outside it is rejected and honestly recorded. If provider changes reveal a new target or
+project during one-hop discovery, collection pauses with `scope_expansion_required` and requires a
+new preview/token; it never hydrates the new target automatically. `resume` may continue only an interrupted/paused/unstable-partial collection with the same scope,
 vault, and configuration binding. `status`, `search`, and `show` are redacted
 reads. `attachment-export` is explicit, private-destination-only, refuses overwrite and refuses to
 launch the result. `worktrace ui --jira-collection` displays redacted metadata/extracted chunks
@@ -132,7 +144,7 @@ command/flag.
 
 Status reports `collection_outcome` and dimensions independently; no aggregate hides a failing
 dimension. `collection_outcome` may be `unstable_partial` even when some component dimensions are
-complete; a component status/count may likewise report `unstable_partial` for the pending resource:
+complete; resource counts use the separate legal resource state `unstable` for the pending resource:
 
 `selection`, `enumeration`, `original_availability`, `download_integrity`, `extraction`,
 `search_readiness`, and `app_mapping`.
@@ -142,8 +154,9 @@ Public collection terminal states are `complete`, `complete_with_unavailable_res
 terminal outcomes and the final manifest/version recheck is stable. Unsupported extraction does not
 make an original unavailable. Missing permission, a revoked/deleted resource, an invalid redirect,
 or an integrity failure is explicit and citable. `unstable_partial` retains prior completed
-resources and the pending unstable resource after one recheck still changes, exits 2, resumes into
-rechecking, and is never reported as complete or successful.
+resources and the pending unstable resource after one recheck still changes, exits 2, resumes only
+by creating a new run/revision attempt that refetches affected resources before rechecking, and is
+never reported as complete or successful.
 
 ## Success measures
 
@@ -171,7 +184,7 @@ The implementation and rollout units are deliberately separate:
 | Unit | Issue | Scope | Exit evidence |
 |---|---:|---|---|
 | Foundation | [#48](https://github.com/AmrMohamad/WorkTrace/issues/48) | Additive schema, vault format/key lifecycle, bounded extraction worker, coherent backup/restore | Unit tests, security review, fresh restore |
-| Collection | [#49](https://github.com/AmrMohamad/WorkTrace/issues/49) | Selection, complete resources, one-hop context, downloads, resume, status | Sanitized Jira fixtures and restart/limit proof |
+| Collection | [#49](https://github.com/AmrMohamad/WorkTrace/issues/49) | Preview approval, selection, complete resources, one-hop context, downloads, resume, status | Sanitized Jira fixtures; forged/stale token, project-injection, changed-context, preview-partial/inaccessible, and no-content-download negatives; restart/limit proof; A→B→C→C recheck/refetch |
 | Investigation | [#50](https://github.com/AmrMohamad/WorkTrace/issues/50) | Extraction/indexing, CLI reads/export, query-only TUI, packaging | Search/TUI/export proof and MCP regression |
 | Rollout | [#51](https://github.com/AmrMohamad/WorkTrace/issues/51) | Controlled migration, pilot, authorized full collection, independent QA | Fresh backup/restore, live pilot, limitations report |
 
