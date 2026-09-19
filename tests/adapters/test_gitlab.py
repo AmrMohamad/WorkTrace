@@ -730,6 +730,103 @@ def test_gitlab_exact_mr_404_emits_unavailable_but_nested_404_is_not_parent_loss
         )
 
 
+def test_gitlab_missing_commit_association_is_bounded_and_does_not_abort_discovery() -> None:
+    missing_sha = "b" * 40
+    associated_iids = {"a" * 40: 7, "c" * 40: 8}
+    association_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v4/user":
+            return httpx.Response(200, json={"id": 41, "username": "fixture-self"}, request=request)
+        if path.endswith("/repository/commits"):
+            return httpx.Response(200, json=[], request=request)
+        if "/repository/commits/" in path and path.endswith("/merge_requests"):
+            sha = path.split("/")[-2]
+            association_calls.append(sha)
+            if sha == missing_sha:
+                return httpx.Response(404, request=request)
+            iid = associated_iids[sha]
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "project_id": 101,
+                        "iid": iid,
+                        "title": f"DEMO-{iid} association fixture",
+                        "created_at": "2026-01-09T00:00:00Z",
+                        "updated_at": "2026-01-12T00:00:00Z",
+                    }
+                ],
+                request=request,
+            )
+        if path.endswith("/merge_requests"):
+            return httpx.Response(200, json=[], request=request)
+        if path.endswith("/merge_requests/7") or path.endswith("/merge_requests/8"):
+            iid = int(path.rsplit("/", 1)[-1])
+            return httpx.Response(
+                200,
+                json={
+                    "project_id": 101,
+                    "iid": iid,
+                    "title": f"DEMO-{iid} hydrated fixture",
+                    "created_at": "2026-01-09T00:00:00Z",
+                    "updated_at": "2026-01-12T00:00:00Z",
+                },
+                request=request,
+            )
+        if path.endswith(("/commits", "/discussions")):
+            return httpx.Response(200, json=[], request=request)
+        if path.endswith("/changes"):
+            return httpx.Response(200, json={"changes": []}, request=request)
+        if path.endswith(("/releases", "/deployments")):
+            return httpx.Response(200, json=[], request=request)
+        raise AssertionError(f"unexpected GitLab request: {request.url}")
+
+    with httpx.Client(
+        base_url="https://gitlab.example",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        pages = list(
+            GitLabAdapter(
+                GitLabConfig(
+                    base_url="https://gitlab.example",
+                    source_instance="gitlab-main",
+                    app_id="sample_store",
+                    project_id=101,
+                    email_key=b"test-key",
+                    date_from=date(2026, 1, 1),
+                    date_to=date(2026, 1, 31),
+                    user_id=41,
+                    production_environments=("production",),
+                    relevant_commit_shas=(*tuple(associated_iids), missing_sha),
+                ),
+                client,
+            ).iter_pages()
+        )
+
+    merge_request_pages = [page for page in pages if page.resource_type == "merge_requests"]
+    merge_request_page = merge_request_pages[0]
+    assert {record.payload["iid"] for page in merge_request_pages for record in page.records} == {
+        "7",
+        "8",
+    }
+    assert merge_request_page.unavailable_objects == ()
+    assert merge_request_page.limitations == (
+        "GitLab commit-to-merge-request association was unavailable for the "
+        f"selected commit {missing_sha}; related merge requests remain unknown.",
+    )
+    assert merge_request_page.selection_events == (
+        {
+            "kind": "gitlab_commit_association_unavailable",
+            "sha": missing_sha,
+            "reason": "not_found",
+        },
+    )
+    assert association_calls.count(missing_sha) == 1
+    assert set(page.resource_type for page in pages) >= {"releases", "deployments"}
+
+
 def test_gitlab_rejects_cross_origin_next_link() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v4/user":
