@@ -309,7 +309,20 @@ class GitLabAdapter:
                 }
             )
         for sha in selected_association_shas:
-            self._add_commit_associated_merge_requests(commit_endpoint, sha, discovered)
+            try:
+                self._add_commit_associated_merge_requests(commit_endpoint, sha, discovered)
+            except SourceObjectUnavailable:
+                limitations.append(
+                    "GitLab commit-to-merge-request association was unavailable for the "
+                    f"selected commit {sha}; related merge requests remain unknown."
+                )
+                selection_events.append(
+                    {
+                        "kind": "gitlab_commit_association_unavailable",
+                        "sha": sha,
+                        "reason": "not_found",
+                    }
+                )
 
         hydration_policy = "updated_at_desc_then_iid_desc"
         ordered_iids = sorted(
@@ -431,7 +444,9 @@ class GitLabAdapter:
         discovered: dict[str, Mapping[str, object]],
     ) -> None:
         association_endpoint = f"{commit_endpoint}/{quote(sha, safe='')}/merge_requests"
-        for merge_requests in self._collection_documents(association_endpoint, {}):
+        for merge_requests in self._collection_documents(
+            association_endpoint, {}, exact_object=True
+        ):
             for raw_item in merge_requests:
                 value = _mapping(raw_item)
                 iid = self._scoped_merge_request_iid(value)
@@ -441,6 +456,8 @@ class GitLabAdapter:
         self,
         endpoint: str,
         params: Mapping[str, str | int],
+        *,
+        exact_object: bool = False,
     ) -> Iterator[list[object]]:
         page = 1
         seen_pages: set[int] = set()
@@ -451,6 +468,7 @@ class GitLabAdapter:
                 endpoint,
                 params={**params, "page": page, "per_page": self._config.page_size},
                 policy=self._config.retry_policy,
+                exact_object=exact_object,
             )
             try:
                 document = response.json()
