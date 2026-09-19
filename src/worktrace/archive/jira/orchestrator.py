@@ -631,11 +631,11 @@ class JiraCollector:
             "comments",
             "changelog",
             "worklogs",
-            "watchers_votes",
         ):
             self._collect_paged_resource(collection_id, revision_id, run_id, issue, kind)
         self._collect_issue_properties(collection_id, revision_id, run_id, issue)
         self._collect_remote_links(collection_id, revision_id, run_id, issue)
+        self._collect_watchers_votes(collection_id, revision_id, run_id, issue)
         attachments = self._attachments(full)
         self._store_json_resource(
             collection_id,
@@ -871,6 +871,43 @@ class JiraCollector:
             locator,
             {"issue_id": issue_id, "links": links},
         )
+
+    def _collect_watchers_votes(
+        self, collection_id: str, revision_id: str, run_id: str, issue: dict[str, object]
+    ) -> None:
+        issue_id = str(issue["issue_id"])
+        for kind, fetch in (("watchers", self.provider.watchers), ("votes", self.provider.votes)):
+            locator = {"issue_id": issue_id, "endpoint": kind}
+            if self._logical_resource_complete(
+                revision_id, self._logical_resource_id(collection_id, issue_id, kind, locator)
+            ):
+                continue
+            try:
+                document = fetch(issue_id)
+            except (PermissionDenied, SourceObjectUnavailable) as exc:
+                self._store_resource_state(
+                    collection_id,
+                    revision_id,
+                    run_id,
+                    issue,
+                    kind,
+                    locator,
+                    "unavailable",
+                    "unavailable",
+                    "unavailable",
+                    0,
+                    {"reason": type(exc).__name__},
+                )
+                continue
+            self._store_json_resource(
+                collection_id,
+                revision_id,
+                run_id,
+                issue,
+                kind,
+                locator,
+                document,
+            )
 
     def _collect_attachment(
         self,

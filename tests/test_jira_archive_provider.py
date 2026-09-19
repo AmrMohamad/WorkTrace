@@ -88,3 +88,11 @@ def test_remote_links_rejects_malformed_top_level_or_item(payload: object) -> No
     with pytest.raises(PermanentSourceError):
         provider.remote_links("1")
     provider.close()
+
+
+@pytest.mark.parametrize("path", ["/watchers", "/votes"])
+def test_watchers_and_votes_require_object_shapes(path: str) -> None:
+    provider = _provider(lambda request: httpx.Response(200, json=[], request=request))
+    with pytest.raises(PermanentSourceError):
+        (provider.watchers if path == "/watchers" else provider.votes)("1")
+    provider.close()

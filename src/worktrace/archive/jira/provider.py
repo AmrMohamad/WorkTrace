@@ -149,7 +149,6 @@ class JiraArchiveProvider:
             "changelog": "changelog",
             "worklogs": "worklog",
             "issue_properties": "properties",
-            "watchers_votes": "watchers",
         }
         endpoint = endpoints.get(kind)
         if endpoint is None:
@@ -174,6 +173,22 @@ class JiraArchiveProvider:
         if not all(isinstance(item, dict) for item in value):
             raise PermanentSourceError("Jira remote links response contained malformed metadata")
         return [dict(item) for item in value]
+
+    def watchers(self, issue_id: str) -> dict[str, object]:
+        return self._json(
+            "GET",
+            f"/rest/api/3/issue/{quote(issue_id, safe='')}/watchers",
+            resource="watchers",
+            exact_object=True,
+        )
+
+    def votes(self, issue_id: str) -> dict[str, object]:
+        return self._json(
+            "GET",
+            f"/rest/api/3/issue/{quote(issue_id, safe='')}/votes",
+            resource="votes",
+            exact_object=True,
+        )
 
     def issue_property(self, issue_id: str, key: str) -> dict[str, object]:
         return self._json(

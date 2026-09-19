@@ -97,6 +97,12 @@ class FakeJira:
     def remote_links(self, issue_id: str) -> list[dict[str, object]]:
         return []
 
+    def watchers(self, issue_id: str) -> dict[str, object]:
+        return {"watchCount": 0, "isWatching": False, "watchers": []}
+
+    def votes(self, issue_id: str) -> dict[str, object]:
+        return {"votes": 0, "hasVoted": False}
+
     class _Attachment:
         def __enter__(self):
             raise PermissionDenied("fixture attachment unavailable")
@@ -527,4 +533,55 @@ def test_remote_links_are_one_stable_resource_and_resume_permission_failure(
         ).fetchone()[0]
         == 2
     )
+    connection.close()
+
+
+def test_watchers_and_votes_are_independent_resources_and_resume_separately(
+    tmp_path: Path,
+) -> None:
+    class WatchVoteJira(FakeJira):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deny_watchers = False
+            self.deny_votes = True
+            self.calls: list[str] = []
+
+        def watchers(self, issue_id: str) -> dict[str, object]:
+            self.calls.append("watchers")
+            if self.deny_watchers:
+                raise PermissionDenied("watchers denied")
+            return {"watchCount": 1, "isWatching": True, "watchers": []}
+
+        def votes(self, issue_id: str) -> dict[str, object]:
+            self.calls.append("votes")
+            if self.deny_votes:
+                raise PermissionDenied("votes denied")
+            return {"votes": 2, "hasVoted": False}
+
+    provider = WatchVoteJira()
+    collector, connection = _collector(tmp_path, provider)
+    preview = collector.preview()
+    first = collector.collect(str(preview["approval_token"]))
+    assert first["status"] == "complete_with_unavailable_resources"
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM jira_resource_states WHERE kind='watchers' AND state='complete'"
+        ).fetchone()[0]
+        == 2
+    )
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM jira_resource_states WHERE kind='votes' AND state='unavailable'"
+        ).fetchone()[0]
+        == 2
+    )
+    connection.execute(
+        "UPDATE jira_collection_runs SET status='paused' WHERE id=?", (first["run_id"],)
+    )
+    connection.commit()
+    provider.deny_votes = False
+    resumed = collector.resume(str(first["collection_id"]))
+    assert resumed["status"] == "complete_with_unavailable_resources"
+    assert provider.calls.count("watchers") == 2
+    assert provider.calls.count("votes") == 4
     connection.close()
