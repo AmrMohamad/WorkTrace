@@ -22,6 +22,7 @@ from worktrace.candidates.decisions import append_decision, undo_decision
 from worktrace.candidates.projector import list_candidates, project_candidate
 from worktrace.config import (
     AppConfig,
+    GitLabCredentials,
     WorkTraceConfig,
     gitlab_credentials,
     jira_credentials,
@@ -78,6 +79,7 @@ _TUI_ENVIRONMENT_VARIABLES = (
     "WORKTRACE_JIRA_API_TOKEN",
     "WORKTRACE_GITLAB_BASE_URL",
     "WORKTRACE_GITLAB_TOKEN",
+    "WORKTRACE_GITLAB_OAUTH_TOKEN",
     "WORKTRACE_EMAIL_HMAC_KEY",
     "TEXTUAL",
     "TEXTUAL_DEBUG",
@@ -452,7 +454,7 @@ def _verified_repair_identities(
             raise WorkTraceError("GitLab credentials are required for verification")
         with httpx.Client(
             base_url=credentials_gitlab.base_url,
-            headers={"PRIVATE-TOKEN": credentials_gitlab.token, "Accept": "application/json"},
+            headers=credentials_gitlab.request_headers(),
             timeout=30,
         ) as client:
             gitlab_adapter = GitLabAdapter(
@@ -691,7 +693,7 @@ def _run_source_import(
                 )
                 scope["selection_reasons"] = ["configured repository read-only snapshot"]
             elif source == "gitlab":
-                assert credentials is not None and isinstance(identifier, int)
+                assert isinstance(credentials, GitLabCredentials) and isinstance(identifier, int)
                 source_instance = source_instance_id(app_id, source, identifier)
                 seeds = _relevant_git_commit_shas(repository, app_id)
                 counts = {
@@ -703,7 +705,7 @@ def _run_source_import(
                 client = stack.enter_context(
                     httpx.Client(
                         base_url=credentials.base_url,
-                        headers={"PRIVATE-TOKEN": credentials.token, "Accept": "application/json"},
+                        headers=credentials.request_headers(),
                         timeout=30,
                     )
                 )

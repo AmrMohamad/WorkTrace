@@ -439,7 +439,7 @@ def _live_checks(config: WorkTraceConfig) -> list[dict[str, object]]:
             GitLabAdapter._origin(gitlab.base_url)
             with httpx.Client(
                 base_url=gitlab.base_url,
-                headers={"PRIVATE-TOKEN": gitlab.token, "Accept": "application/json"},
+                headers=gitlab.request_headers(),
                 timeout=15,
             ) as client:
                 identity = client.get("/api/v4/user")
