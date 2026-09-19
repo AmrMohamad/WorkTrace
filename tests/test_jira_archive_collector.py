@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
+import httpx
 import pytest
 
 from worktrace.archive.jira.orchestrator import CollectorLimits, JiraCollector
@@ -83,7 +85,14 @@ class FakeJira:
         return self.issue | {"fields": dict(self.issue["fields"]), "id": issue_id}
 
     def resource_page(self, issue_id: str, kind: str, *, start_at: int = 0) -> dict[str, object]:
-        return {"startAt": start_at, "maxResults": 100, "total": 0, "values": []}
+        return {
+            "startAt": start_at,
+            "maxResults": 100,
+            "total": 0,
+            "comments": [] if kind == "comments" else None,
+            "keys": [] if kind == "issue_properties" else None,
+            "values": [] if kind != "issue_properties" else None,
+        }
 
     class _Attachment:
         def __enter__(self):
@@ -95,6 +104,29 @@ class FakeJira:
     def attachment_content(self, attachment_id: str):
         self.content_requests += 1
         return self._Attachment()
+
+
+class TwoPassJira(FakeJira):
+    def __init__(
+        self, first: bytes, second: bytes | None = None, *, unknown_size: bool = False
+    ) -> None:
+        super().__init__()
+        self.first = first
+        self.second = second if second is not None else first
+        self.pass_number = 0
+        if unknown_size:
+            self.issue["fields"]["attachment"][0]["size"] = None
+
+    @contextmanager
+    def attachment_content(self, attachment_id: str):
+        self.content_requests += 1
+        self.pass_number += 1
+        content = self.first if self.pass_number % 2 else self.second
+        yield httpx.Response(
+            200,
+            content=content,
+            headers={"ETag": "fixture-v1", "Content-Length": str(len(content))},
+        )
 
 
 def _config(tmp_path: Path) -> Path:
@@ -118,6 +150,24 @@ jira_project_keys = ["DEMO"]
         encoding="utf-8",
     )
     return path
+
+
+def _collector(tmp_path: Path, provider: FakeJira) -> tuple[JiraCollector, object]:
+    configuration = load_config(_config(tmp_path))
+    database = configuration.database_path
+    database.parent.mkdir()
+    connection = connect(database)
+    migrate(connection, database)
+    return (
+        JiraCollector(
+            connection,
+            configuration,
+            provider,
+            vault_key=b"k" * 32,
+            limits=CollectorLimits(free_space_floor_bytes=0),
+        ),
+        connection,
+    )
 
 
 def test_preview_is_metadata_only_bound_and_single_use(tmp_path: Path) -> None:
@@ -179,3 +229,104 @@ def test_one_hop_context_deduplicates_cycles_and_keeps_inaccessible_refs() -> No
     assert {item["issue_id"] for item in result.context} == {"10002"}
     assert result.unresolved_refs[0]["issue_id"] == "10003"
     assert provider.metadata_requests == ["10002", "10003"]
+
+
+def test_attachment_two_pass_preserves_known_and_unknown_sizes(tmp_path: Path) -> None:
+    provider = TwoPassJira(b"attachment-data", unknown_size=True)
+    collector, connection = _collector(tmp_path, provider)
+    preview = collector.preview()
+    result = collector.collect(str(preview["approval_token"]))
+    assert result["status"] == "complete"
+    assert provider.content_requests == 2  # shared attachment, two passes
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM jira_attachment_objects WHERE original_state='complete'"
+        ).fetchone()[0]
+        == 1
+    )
+    connection.close()
+
+
+def test_attachment_validator_change_never_publishes_or_activates(tmp_path: Path) -> None:
+    class ChangedValidator(TwoPassJira):
+        @contextmanager
+        def attachment_content(self, attachment_id: str):
+            self.content_requests += 1
+            self.pass_number += 1
+            content = self.first
+            yield httpx.Response(
+                200,
+                content=content,
+                headers={
+                    "ETag": f"fixture-v{self.pass_number}",
+                    "Content-Length": str(len(content)),
+                },
+            )
+
+    provider = ChangedValidator(b"attachment-data")
+    collector, connection = _collector(tmp_path, provider)
+    preview = collector.preview()
+    result = collector.collect(str(preview["approval_token"]))
+    assert result["status"] == "unstable_partial"
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM jira_attachment_objects WHERE original_state='complete'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM jira_archive_revisions WHERE status='active'"
+        ).fetchone()[0]
+        == 0
+    )
+    connection.close()
+
+
+def test_resume_requires_fresh_unchanged_scope_before_new_revision(tmp_path: Path) -> None:
+    provider = FakeJira()
+    collector, connection = _collector(tmp_path, provider)
+    preview = collector.preview()
+    first = collector.collect(str(preview["approval_token"]))
+    collection_id = str(first["collection_id"])
+    connection.execute(
+        "UPDATE jira_collection_runs SET status='paused' WHERE id=?",
+        (first["run_id"],),
+    )
+    connection.commit()
+    provider.issue["fields"]["parent"] = {"id": "10004", "key": "OTHER-4"}
+
+    original_metadata = provider.issue_metadata
+
+    def changed_metadata(issue_id: str) -> dict[str, object]:
+        if issue_id == "10004":
+            return {"id": issue_id, "key": "OTHER-4", "fields": {"project": {"key": "OTHER"}}}
+        return original_metadata(issue_id)
+
+    provider.issue_metadata = changed_metadata  # type: ignore[method-assign]
+    resumed = collector.resume(collection_id)
+    assert resumed["status"] == "paused"
+    assert resumed["next_action"] == "new_preview_required"
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM jira_archive_revisions WHERE collection_id=?", (collection_id,)
+        ).fetchone()[0]
+        == 1
+    )
+    connection.close()
+
+
+def test_malformed_resource_pagination_never_completes(tmp_path: Path) -> None:
+    class MalformedPageJira(FakeJira):
+        def resource_page(
+            self, issue_id: str, kind: str, *, start_at: int = 0
+        ) -> dict[str, object]:
+            return {"startAt": start_at, "maxResults": 100, "values": []}
+
+    provider = MalformedPageJira()
+    collector, connection = _collector(tmp_path, provider)
+    preview = collector.preview()
+    result = collector.collect(str(preview["approval_token"]))
+    assert result["status"] == "partial"
+    assert result["next_action"] == "resume"
+    connection.close()

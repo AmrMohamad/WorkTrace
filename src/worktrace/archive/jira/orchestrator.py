@@ -17,7 +17,12 @@ from typing import Any, BinaryIO, cast
 
 from worktrace.archive.jira.provider import JiraArchiveProvider
 from worktrace.archive.jira.repository import JiraArchiveRepository, site_id_for_origin
-from worktrace.archive.jira.selector import JiraSelector, PreviewSelection, token_hash
+from worktrace.archive.jira.selector import (
+    JiraSelector,
+    PreviewSelection,
+    sanitize_metadata,
+    token_hash,
+)
 from worktrace.config import WorkTraceConfig
 from worktrace.errors import (
     ConfigurationError,
@@ -110,6 +115,14 @@ class CollectionPaused(Exception):
     """Durable pause requested by a collection budget or free-space guard."""
 
 
+class AttachmentIntegrityError(Exception):
+    """The two authenticated attachment passes did not describe one object."""
+
+
+class ScopeExpansionRequired(Exception):
+    """Current issue hydration discovered an unapproved direct context target."""
+
+
 class JiraCollector:
     """Archive collector owning all Jira-specific SQLite writes."""
 
@@ -141,19 +154,7 @@ class JiraCollector:
         self._config_fingerprint = _fingerprint(configuration)
 
     def preview(self) -> dict[str, object]:
-        account_id = self.configuration.identity.jira_account_id
-        if not account_id:
-            raise ConfigurationError("Jira archive requires identity.jira_account_id")
-        selector = JiraSelector(
-            self.provider,
-            origin=self.provider.origin,
-            account_id=account_id,
-            date_from=self.configuration.employment_from,
-            date_to=self.configuration.employment_to,
-            timezone=self.configuration.employment_timezone,
-            config_fingerprint=self._config_fingerprint,
-        )
-        selection = selector.preview()
+        selection = self._fresh_selection()
         self._persist_preview(selection)
         return selection.as_dict()
 
@@ -162,19 +163,7 @@ class JiraCollector:
             raise ConfigurationError("Jira collection requires a verified 32-byte vault key")
         # Re-run the metadata-only preview before consuming anything. This is
         # the provider-view freshness gate; the raw token never crosses it.
-        account_id = self.configuration.identity.jira_account_id
-        if not account_id:
-            raise ConfigurationError("Jira archive requires identity.jira_account_id")
-        selector = JiraSelector(
-            self.provider,
-            origin=self.provider.origin,
-            account_id=account_id,
-            date_from=self.configuration.employment_from,
-            date_to=self.configuration.employment_to,
-            timezone=self.configuration.employment_timezone,
-            config_fingerprint=self._config_fingerprint,
-        )
-        fresh = selector.preview()
+        fresh = self._fresh_selection()
         collection_id, revision_id = self._consume_preview(approval_token, fresh)
         return self._run_collection(collection_id, revision_id, fresh)
 
@@ -185,6 +174,14 @@ class JiraCollector:
         if str(row["run_status"]) not in {"paused", "partial", "unstable_partial", "running"}:
             raise ConfigurationError("Jira collection is not resumable")
         scope = json.loads(str(row["scope_json"]))
+        fresh_selection = self._fresh_selection()
+        if not self._resume_scope_matches(row, scope, fresh_selection):
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE jira_collection_runs SET status='paused', error_json=? WHERE id=?",
+                    (_json({"reason": "new_preview_required"}), row["run_id"]),
+                )
+            return self.status(collection_id)
         roots = tuple(cast(list[dict[str, object]], scope.get("roots", [])))
         context = tuple(cast(list[dict[str, object]], scope.get("context", [])))
         fresh = PreviewSelection(
@@ -238,6 +235,16 @@ class JiraCollector:
         outcome = str(row["run_status"])
         if outcome == "complete" and counts["unavailable"]:
             outcome = "complete_with_unavailable_resources"
+        error_document = json.loads(str(row["error_json"])) if row["error_json"] else {}
+        next_action = (
+            "new_preview_required"
+            if error_document.get("reason")
+            in {
+                "new_preview_required",
+                "scope_expansion_required",
+            }
+            else ("resume" if outcome in {"paused", "partial", "unstable_partial"} else None)
+        )
         return {
             "schema_version": 1,
             "collection_id": str(row["collection_id"]),
@@ -262,13 +269,60 @@ class JiraCollector:
             },
             "resource_counts": counts,
             "as_of": _iso(self.clock()),
-            "next_action": "resume"
-            if outcome in {"paused", "partial", "unstable_partial"}
-            else None,
+            "next_action": next_action,
             "limitations": list(
                 cast(list[str], json.loads(str(row["scope_json"])).get("limitations", []))
             ),
         }
+
+    def _fresh_selection(self) -> PreviewSelection:
+        account_id = self.configuration.identity.jira_account_id
+        if not account_id:
+            raise ConfigurationError("Jira archive requires identity.jira_account_id")
+        return JiraSelector(
+            self.provider,
+            origin=self.provider.origin,
+            account_id=account_id,
+            date_from=self.configuration.employment_from,
+            date_to=self.configuration.employment_to,
+            timezone=self.configuration.employment_timezone,
+            config_fingerprint=self._config_fingerprint,
+        ).preview()
+
+    def _resume_scope_matches(
+        self,
+        row: sqlite3.Row,
+        scope: Mapping[str, object],
+        fresh: PreviewSelection,
+    ) -> bool:
+        interval = cast(dict[str, object], scope.get("interval", {}))
+        stored = {
+            "site_id": str(row["site_id"]),
+            "account_id": scope.get("account_id"),
+            "config_fingerprint": str(row["config_fingerprint"]),
+            "interval": interval,
+            "policy_version": int(row["policy_version"]),
+            "scope_hash": str(row["scope_hash"]),
+            "provider_view_hash": scope.get("provider_view_hash"),
+            "roots": scope.get("roots", []),
+            "context": scope.get("context", []),
+        }
+        current = {
+            "site_id": fresh.site_id,
+            "account_id": fresh.account_id,
+            "config_fingerprint": fresh.config_fingerprint,
+            "interval": {
+                "from": fresh.interval_from.isoformat(),
+                "to": fresh.interval_to.isoformat(),
+                "timezone": fresh.timezone,
+            },
+            "policy_version": fresh.policy_version,
+            "scope_hash": fresh.scope_hash,
+            "provider_view_hash": fresh.provider_view_hash,
+            "roots": list(fresh.roots),
+            "context": list(fresh.context),
+        }
+        return stored == current
 
     def _persist_preview(self, selection: PreviewSelection) -> None:
         repository = JiraArchiveRepository(self.connection)
@@ -410,17 +464,24 @@ class JiraCollector:
         self._persist_collection_issues(collection_id, revision_id, run_id, issues)
         unstable = False
         unavailable = False
+        partial = False
         for issue in issues:
             try:
                 first_signature = self._collect_issue(collection_id, revision_id, run_id, issue)
                 current_signature = self._issue_signature(str(issue["issue_id"]))
                 if current_signature != first_signature:
-                    self._collect_issue(collection_id, revision_id, run_id, issue)
+                    self._collect_issue(collection_id, revision_id, run_id, issue, force=True)
                     if self._issue_signature(str(issue["issue_id"])) != current_signature:
                         unstable = True
                         self._mark_issue_unstable(revision_id, str(issue["issue_id"]))
             except CollectionPaused:
                 self._finish_run(run_id, "paused")
+                return self.status(collection_id)
+            except AttachmentIntegrityError:
+                unstable = True
+                self._mark_issue_unstable(revision_id, str(issue["issue_id"]))
+            except ScopeExpansionRequired:
+                self._finish_run(run_id, "paused", error={"reason": "scope_expansion_required"})
                 return self.status(collection_id)
             except PermissionDenied:
                 unavailable = True
@@ -430,10 +491,15 @@ class JiraCollector:
             except (PermanentSourceError, RetryExhausted, OSError, VaultIntegrityError) as exc:
                 self._record_issue_error(revision_id, str(issue["issue_id"]), str(exc))
                 unavailable = True
+                partial = True
         outcome = (
             "unstable_partial"
             if unstable
-            else ("complete_with_unavailable_resources" if unavailable else "complete")
+            else (
+                "partial"
+                if partial
+                else ("complete_with_unavailable_resources" if unavailable else "complete")
+            )
         )
         self._finish_run(run_id, outcome)
         with self.connection:
@@ -474,11 +540,18 @@ class JiraCollector:
                 )
 
     def _collect_issue(
-        self, collection_id: str, revision_id: str, run_id: str, issue: dict[str, object]
+        self,
+        collection_id: str,
+        revision_id: str,
+        run_id: str,
+        issue: dict[str, object],
+        *,
+        force: bool = False,
     ) -> str:
         issue_id = str(issue["issue_id"])
         full = self.provider.issue_full(issue_id)
         initial_signature = self._signature_from_issue(full)
+        self._check_hydration_scope(revision_id, issue_id, full)
         self._store_json_resource(
             collection_id,
             revision_id,
@@ -508,15 +581,59 @@ class JiraCollector:
             {"issue_id": issue_id, "attachments": attachments},
         )
         for attachment in attachments:
-            self._collect_attachment(collection_id, revision_id, issue, attachment)
+            self._collect_attachment(collection_id, revision_id, issue, attachment, force=force)
         return initial_signature
+
+    def _check_hydration_scope(
+        self, revision_id: str, issue_id: str, full: dict[str, object]
+    ) -> None:
+        approved = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT issue_id FROM jira_collection_issues WHERE revision_id=?",
+                (revision_id,),
+            ).fetchall()
+        }
+        scope_row = self.connection.execute(
+            "SELECT c.scope_json FROM jira_collections c "
+            "JOIN jira_archive_revisions r ON r.collection_id=c.id WHERE r.id=?",
+            (revision_id,),
+        ).fetchone()
+        unresolved = set()
+        if scope_row is not None:
+            scope = json.loads(str(scope_row[0]))
+            unresolved = {
+                str(item["issue_id"])
+                for item in scope.get("unresolved_refs", [])
+                if isinstance(item, dict) and item.get("issue_id") is not None
+            }
+        projection = sanitize_metadata(full)
+        targets: set[str] = set()
+        parent = projection.get("parent")
+        if isinstance(parent, dict) and parent.get("issue_id") is not None:
+            targets.add(str(parent["issue_id"]))
+        for key in ("subtasks", "issue_links"):
+            values = projection.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    if isinstance(value, dict) and value.get("issue_id") is not None:
+                        targets.add(str(value["issue_id"]))
+        unexpected = sorted(targets - approved - unresolved - {issue_id})
+        if unexpected:
+            raise ScopeExpansionRequired(
+                f"Jira issue {issue_id} revealed unapproved targets: {','.join(unexpected)}"
+            )
 
     def _collect_paged_resource(
         self, collection_id: str, revision_id: str, run_id: str, issue: dict[str, object], kind: str
     ) -> None:
         issue_id = str(issue["issue_id"])
         start_at = 0
+        seen_starts: set[int] = set()
         while True:
+            if start_at in seen_starts:
+                raise PermanentSourceError(f"Jira {kind} pagination repeated startAt")
+            seen_starts.add(start_at)
             try:
                 page = self.provider.resource_page(issue_id, kind, start_at=start_at)
             except PermissionDenied:
@@ -534,11 +651,30 @@ class JiraCollector:
                     {"reason": "permission_denied"},
                 )
                 return
-            values = page.get("values")
-            if values is None:
-                values = page.get("comments", page.get("worklogs", page.get("properties", [])))
-            if not isinstance(values, list):
-                values = []
+            if kind == "watchers_votes":
+                values: list[object] = [page]
+                total = 1
+            else:
+                list_key = {
+                    "comments": "comments",
+                    "issue_properties": "keys",
+                }.get(kind, "values")
+                raw_values = page.get(list_key)
+                start_value = page.get("startAt")
+                max_value = page.get("maxResults")
+                raw_total = page.get("total")
+                if (
+                    not isinstance(raw_values, list)
+                    or not isinstance(start_value, int)
+                    or start_value != start_at
+                    or not isinstance(max_value, int)
+                    or max_value < 1
+                    or not isinstance(raw_total, int)
+                    or raw_total < 0
+                ):
+                    raise PermanentSourceError(f"Jira {kind} pagination metadata is invalid")
+                values = raw_values
+                total = raw_total
             self._store_json_resource(
                 collection_id,
                 revision_id,
@@ -548,9 +684,10 @@ class JiraCollector:
                 {"start_at": start_at},
                 page,
             )
-            total = page.get("total")
-            if not isinstance(total, int) or start_at + len(values) >= total or not values:
+            if start_at + len(values) >= total:
                 return
+            if not values:
+                raise PermanentSourceError(f"Jira {kind} pagination made no progress")
             start_at += len(values)
 
     def _collect_attachment(
@@ -559,9 +696,17 @@ class JiraCollector:
         revision_id: str,
         issue: dict[str, object],
         attachment: dict[str, object],
+        *,
+        force: bool = False,
     ) -> None:
         attachment_id = str(attachment["attachment_id"])
         object_id = f"jatt:{collection_id}:{revision_id}:{attachment_id}"
+        existing = self.connection.execute(
+            "SELECT original_state FROM jira_attachment_objects WHERE id=?",
+            (object_id,),
+        ).fetchone()
+        if not force and existing is not None and str(existing["original_state"]) == "complete":
+            return
         with self.connection:
             self.connection.execute(
                 "INSERT OR IGNORE INTO jira_attachment_objects "
@@ -584,9 +729,20 @@ class JiraCollector:
                 ),
             )
         try:
-            with self.provider.attachment_content(attachment_id) as response:
-                self._check_free_space()
-                reader = _ResponseReader(response, collector=self)
+            self._check_free_space()
+            with self.provider.attachment_content(attachment_id) as first_response:
+                first_validator = self._attachment_validator(first_response)
+                first_length, first_hash = self._hash_attachment_pass(first_response)
+            declared_size = attachment.get("declared_size")
+            if isinstance(declared_size, int) and first_length != declared_size:
+                raise AttachmentIntegrityError("Jira attachment declared size changed")
+            self._check_free_space()
+            with self.provider.attachment_content(attachment_id) as second_response:
+                if first_validator != self._attachment_validator(second_response):
+                    raise AttachmentIntegrityError(
+                        "Jira attachment validator changed between passes"
+                    )
+                reader = _ResponseReader(second_response, collector=self)
                 destination = _object_path(
                     self.vault_root, self._site_id, collection_id, revision_id, object_id
                 )
@@ -596,19 +752,10 @@ class JiraCollector:
                     revision_id=revision_id,
                     object_id=object_id,
                     kind="attachment_original",
-                    content_length=int(cast(int, attachment["declared_size"]))
-                    if isinstance(attachment.get("declared_size"), int)
-                    else 0,
-                    content_sha256="0" * 64,
+                    content_length=first_length,
+                    content_sha256=first_hash,
                     key_version=self.key_version,
                 )
-                # The stream writer requires final size/hash in the descriptor;
-                # fixtures with unknown metadata use an explicit unavailable state.
-                if attachment.get("declared_size") is None:
-                    self._mark_attachment_unavailable(
-                        collection_id, revision_id, object_id, "declared_size_unknown"
-                    )
-                    return
                 result = write_vault_object(
                     cast(BinaryIO, reader),
                     destination,
@@ -629,7 +776,14 @@ class JiraCollector:
                             object_id,
                         ),
                     )
+                if result.plaintext_length != first_length:
+                    raise AttachmentIntegrityError("Jira attachment length changed between passes")
         except CollectionPaused:
+            raise
+        except AttachmentIntegrityError:
+            self._mark_attachment_unavailable(
+                collection_id, revision_id, object_id, "integrity_changed"
+            )
             raise
         except PermissionDenied:
             self._mark_attachment_unavailable(
@@ -637,6 +791,25 @@ class JiraCollector:
             )
         except (PermanentSourceError, RetryExhausted, OSError, VaultIntegrityError) as exc:
             self._mark_attachment_unavailable(collection_id, revision_id, object_id, str(exc))
+
+    @staticmethod
+    def _attachment_validator(response: Any) -> tuple[str | None, str | None, str | None]:
+        return (
+            response.headers.get("ETag"),
+            response.headers.get("Last-Modified"),
+            response.headers.get("Content-Length"),
+        )
+
+    def _hash_attachment_pass(self, response: Any) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        length = 0
+        for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+            if not isinstance(chunk, bytes):
+                raise AttachmentIntegrityError("Jira attachment stream returned non-bytes")
+            self._account_transfer(len(chunk))
+            length += len(chunk)
+            digest.update(chunk)
+        return length, digest.hexdigest()
 
     def _store_json_resource(
         self,
@@ -833,17 +1006,20 @@ class JiraCollector:
                 (revision_id, issue_id),
             )
 
-    def _finish_run(self, run_id: str, status: str) -> None:
+    def _finish_run(
+        self, run_id: str, status: str, *, error: Mapping[str, object] | None = None
+    ) -> None:
         with self.connection:
             self.connection.execute(
-                "UPDATE jira_collection_runs SET status=?, completed_at=? WHERE id=?",
-                (status, _iso(self.clock()), run_id),
+                "UPDATE jira_collection_runs SET status=?, completed_at=?, error_json=? WHERE id=?",
+                (status, _iso(self.clock()), _json(error) if error else None, run_id),
             )
 
     def _latest_collection(self, collection_id: str | None) -> sqlite3.Row | None:
         query = (
-            "SELECT c.id AS collection_id, c.scope_json, c.config_fingerprint, c.policy_version, "
-            "c.site_id, r.id AS revision_id, r.run_id, run.status AS run_status "
+            "SELECT c.id AS collection_id, c.scope_json, c.scope_hash, c.config_fingerprint, "
+            "c.policy_version, "
+            "c.site_id, r.id AS revision_id, r.run_id, run.status AS run_status, run.error_json "
             "FROM jira_collections c JOIN jira_archive_revisions r ON r.collection_id=c.id "
             "JOIN jira_collection_runs run ON run.id=r.run_id "
             "WHERE (? IS NULL OR c.id=?) ORDER BY r.revision_number DESC LIMIT 1"

@@ -103,14 +103,16 @@ class JiraArchiveProvider:
             raise PermanentSourceError("Jira preview search omitted issues")
         continuation = document.get("nextPageToken")
         is_last = document.get("isLast")
-        if is_last is not None and not isinstance(is_last, bool):
-            raise PermanentSourceError("Jira preview pagination returned an invalid isLast")
+        if not isinstance(is_last, bool):
+            raise PermanentSourceError("Jira preview pagination omitted isLast")
         if continuation is not None and not isinstance(continuation, str):
             raise PermanentSourceError("Jira preview pagination returned an invalid token")
+        if not is_last and not isinstance(continuation, str):
+            raise PermanentSourceError("Jira preview pagination omitted its continuation token")
         return MetadataPage(
             tuple(item for item in issues),
             continuation if isinstance(continuation, str) else None,
-            bool(is_last) if isinstance(is_last, bool) else continuation is None,
+            is_last,
         )
 
     def issue_metadata(self, issue_id: str) -> dict[str, object]:
