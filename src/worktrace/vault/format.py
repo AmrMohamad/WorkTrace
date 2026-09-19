@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import struct
 import tempfile
 from collections.abc import Callable, Mapping
@@ -331,46 +332,63 @@ def decrypt_vault_object(
     plain_hash = hashlib.sha256()
     plain_length = 0
     saw_final = False
-    while True:
-        length_bytes = source.read(_RECORD_HEADER.size)
-        if length_bytes == b"":
-            if not saw_final:
-                raise VaultIntegrityError("vault object is missing its final record")
-            break
-        if saw_final:
-            raise VaultIntegrityError("vault object contains a record after its final tag")
-        if not isinstance(length_bytes, bytes) or len(length_bytes) != _RECORD_HEADER.size:
-            raise VaultIntegrityError("vault object has a truncated record length")
-        file_hash.update(length_bytes)
-        record_length = _RECORD_HEADER.unpack(length_bytes)[0]
-        if not SECRETSTREAM_OVERHEAD <= record_length <= MAX_RECORD_BYTES:
-            raise VaultFormatError("encrypted record length is outside the allowed range")
-        ciphertext = _read_exact(source, record_length, "encrypted record")
-        file_hash.update(ciphertext)
-        try:
-            plaintext, tag = bindings.crypto_secretstream_xchacha20poly1305_pull(
-                state, ciphertext, descriptor_bytes
+    with tempfile.TemporaryFile(mode="w+b") as verified_plaintext:
+        while True:
+            length_bytes = source.read(_RECORD_HEADER.size)
+            if length_bytes == b"":
+                if not saw_final:
+                    raise VaultIntegrityError("vault object is missing its final record")
+                break
+            if saw_final:
+                raise VaultIntegrityError("vault object contains a record after its final tag")
+            if not isinstance(length_bytes, bytes) or len(length_bytes) != _RECORD_HEADER.size:
+                raise VaultIntegrityError("vault object has a truncated record length")
+            file_hash.update(length_bytes)
+            record_length = _RECORD_HEADER.unpack(length_bytes)[0]
+            if not SECRETSTREAM_OVERHEAD <= record_length <= MAX_RECORD_BYTES:
+                raise VaultFormatError("encrypted record length is outside the allowed range")
+            ciphertext = _read_exact(source, record_length, "encrypted record")
+            file_hash.update(ciphertext)
+            try:
+                plaintext, tag = bindings.crypto_secretstream_xchacha20poly1305_pull(
+                    state, ciphertext, descriptor_bytes
+                )
+            except Exception as exc:
+                raise VaultIntegrityError("vault record authentication failed") from exc
+            if tag == bindings.crypto_secretstream_xchacha20poly1305_TAG_FINAL:
+                saw_final = True
+            elif tag != bindings.crypto_secretstream_xchacha20poly1305_TAG_MESSAGE:
+                raise VaultIntegrityError("vault record has an invalid tag")
+            verified_plaintext.write(plaintext)
+            plain_hash.update(plaintext)
+            plain_length += len(plaintext)
+        if source.read(1) != b"":
+            raise VaultIntegrityError("vault object has trailing bytes")
+        if (
+            plain_length != descriptor.content_length
+            or plain_hash.hexdigest() != descriptor.content_sha256
+        ):
+            raise VaultIntegrityError(
+                "vault plaintext length or hash does not match its descriptor"
             )
-        except Exception as exc:
-            raise VaultIntegrityError("vault record authentication failed") from exc
-        if tag == bindings.crypto_secretstream_xchacha20poly1305_TAG_FINAL:
-            saw_final = True
-        elif tag != bindings.crypto_secretstream_xchacha20poly1305_TAG_MESSAGE:
-            raise VaultIntegrityError("vault record has an invalid tag")
-        sink.write(plaintext)
-        plain_hash.update(plaintext)
-        plain_length += len(plaintext)
-    if source.read(1) != b"":
-        raise VaultIntegrityError("vault object has trailing bytes")
-    if (
-        plain_length != descriptor.content_length
-        or plain_hash.hexdigest() != descriptor.content_sha256
-    ):
-        raise VaultIntegrityError("vault plaintext length or hash does not match its descriptor")
-    ciphertext_hash = file_hash.hexdigest()
-    if expected_ciphertext_sha256 is not None and ciphertext_hash != expected_ciphertext_sha256:
-        raise VaultIntegrityError("vault ciphertext hash does not match its manifest")
-    return VaultObjectResult(descriptor, ciphertext_hash, plain_length)
+        ciphertext_hash = file_hash.hexdigest()
+        if expected_ciphertext_sha256 is not None and ciphertext_hash != expected_ciphertext_sha256:
+            raise VaultIntegrityError("vault ciphertext hash does not match its manifest")
+        verified_plaintext.seek(0)
+        shutil.copyfileobj(verified_plaintext, sink)
+        return VaultObjectResult(descriptor, ciphertext_hash, plain_length)
+
+
+def read_vault_descriptor(source: BinaryIO) -> VaultDescriptor:
+    """Read only the authenticated object's canonical descriptor and key version."""
+    prefix = _read_exact(source, 9, "header")
+    if prefix[:4] != MAGIC or prefix[4] != FORMAT_VERSION:
+        raise VaultFormatError("unsupported vault object header")
+    descriptor_length = struct.unpack(">I", prefix[5:])[0]
+    if descriptor_length > MAX_DESCRIPTOR_BYTES:
+        raise VaultFormatError("vault descriptor exceeds the size limit")
+    descriptor_bytes = _read_exact(source, descriptor_length, "descriptor")
+    return VaultDescriptor.from_mapping(_parse_canonical_json(descriptor_bytes))
 
 
 def read_vault_object(

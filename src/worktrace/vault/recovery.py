@@ -74,6 +74,8 @@ def _descriptor(value: Mapping[str, object]) -> tuple[bytes, list[int], int, int
         "installation_id",
         "kdf",
         "key_versions",
+        "ledger_schema_version",
+        "revision_ids",
         "schema_version",
         "site_ids",
         "vault_id",
@@ -85,6 +87,8 @@ def _descriptor(value: Mapping[str, object]) -> tuple[bytes, list[int], int, int
         raise RecoveryError("unsupported recovery envelope format")
     if value.get("schema_version") != 1 or value.get("aead") != {"name": "xchacha20-poly1305-ietf"}:
         raise RecoveryError("unsupported recovery envelope schema or AEAD")
+    if value.get("ledger_schema_version") != 7:
+        raise RecoveryError("recovery ledger schema version is unsupported")
     kdf = value.get("kdf")
     if not isinstance(kdf, dict) or set(kdf) != {"dk_len", "memlimit", "name", "opslimit"}:
         raise RecoveryError("recovery KDF descriptor is not exact")
@@ -111,7 +115,7 @@ def _descriptor(value: Mapping[str, object]) -> tuple[bytes, list[int], int, int
     for field in ("installation_id", "vault_id", "epoch_id"):
         if not isinstance(value.get(field), str) or not value[field]:
             raise RecoveryError(f"recovery descriptor field {field} is invalid")
-    for field in ("site_ids", "collection_ids"):
+    for field in ("site_ids", "collection_ids", "revision_ids"):
         items = value.get(field)
         if not isinstance(items, list) or any(
             not isinstance(item, str) or not item for item in items

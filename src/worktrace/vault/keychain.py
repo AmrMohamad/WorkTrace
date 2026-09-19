@@ -103,7 +103,8 @@ class MacOSKeychain:
         self.put(new_version, key)
         return key
 
-    def retire(self, version: int) -> None:
+    def _delete(self, version: int) -> None:
+        """Internal primitive; public retirement needs archive evidence and restore proof."""
         try:
             self.backend.delete_password(KEYCHAIN_SERVICE, self.account(version))
         except Exception as exc:
