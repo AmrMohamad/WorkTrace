@@ -475,6 +475,28 @@ def test_epoch_backup_restore_and_tamper_refusal(tmp_path: Path) -> None:
                 "object.wtva",
             ),
         )
+        unavailable_repository = JiraArchiveRepository(connection)
+        unavailable_repository.create_resource_checkpoint(
+            resource_id="jres:unavailable",
+            collection_id=collection_id,
+            revision_id=revision_id,
+            run_id=run_id,
+            issue_id="10001",
+            kind="comments",
+            locator={"page": 1},
+            role="root",
+            redaction_version="1",
+            state="unavailable",
+        )
+        unavailable_repository.checkpoint_resource(
+            resource_id="jres:unavailable",
+            state="unavailable",
+            completeness="unavailable",
+            availability="unavailable",
+            seen_count=0,
+            page_cursor=None,
+            attempt=1,
+        )
         connection.commit()
     finally:
         connection.close()
@@ -498,6 +520,16 @@ def test_epoch_backup_restore_and_tamper_refusal(tmp_path: Path) -> None:
     assert user_version(connect(restored / "worktrace.sqlite3")) == 7
     assert read_vault_object(restored / "vault/object.wtva", b"k" * 32) == data
     assert backup.manifest["complete"] is True
+    restored_connection = connect(restored / "worktrace.sqlite3")
+    try:
+        assert tuple(
+            restored_connection.execute(
+                "SELECT state, availability, raw_vault_object_path, raw_vault_object_id "
+                "FROM jira_resource_states WHERE id='jres:unavailable'"
+            ).fetchone()
+        ) == ("unavailable", "unavailable", None, None)
+    finally:
+        restored_connection.close()
 
     (epoch / "config.toml").write_text("tampered", encoding="utf-8")
     with pytest.raises(RecoveryError):
@@ -572,6 +604,77 @@ def test_epoch_backup_restore_and_tamper_refusal(tmp_path: Path) -> None:
             passphrase="passphrase-12",
         )
     assert not (tmp_path / "corrupt-backup").exists()
+
+
+def test_epoch_backup_rejects_partial_vault_tuple(tmp_path: Path) -> None:
+    database = tmp_path / "ledger.sqlite3"
+    connection = connect(database)
+    try:
+        migrate(connection, database)
+        repository = JiraArchiveRepository(connection)
+        site_id = repository.ensure_site("https://jira.example.test")
+        collection_id = repository.create_collection(
+            site_id=site_id,
+            scope={"roots": ["10001"]},
+            scope_hash="scope",
+            approval_token_hash="token",
+            policy_version=1,
+            config_fingerprint="config",
+            vault_id="vault:test",
+        )
+        run_id = repository.start_run(collection_id)
+        connection.execute(
+            "UPDATE jira_collection_runs SET status='complete', "
+            "completed_at='2026-01-01T00:00:00+00:00' WHERE id=?",
+            (run_id,),
+        )
+        connection.commit()
+        revision_id = repository.create_revision(collection_id, run_id, "manifest")
+        connection.execute(
+            "INSERT INTO jira_attachment_objects "
+            "(id, collection_id, revision_id, issue_id, attachment_id, archive_evidence_id, "
+            "filename, manifest_sha256, original_state, extracted_state, source_locator, "
+            "vault_object_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "jatt:partial",
+                collection_id,
+                revision_id,
+                "10001",
+                "1",
+                "jare:partial",
+                "object.bin",
+                "manifest",
+                "unavailable",
+                "not_requested",
+                "object.wtva",
+                "object.wtva",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    config = tmp_path / "config.toml"
+    config.write_text("schema_version = 1\n", encoding="utf-8")
+    hmac_key = tmp_path / "email-hmac.key"
+    hmac_key.write_bytes(b"h" * 64)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    with pytest.raises(RecoveryError, match="partial vault tuple"):
+        create_epoch_backup(
+            database_path=database,
+            config_path=config,
+            hmac_key_path=hmac_key,
+            vault_root=vault,
+            output=tmp_path / "partial-epoch",
+            collection_id=collection_id,
+            revision_id=revision_id,
+            installation_id="install:test",
+            vault_id="vault:test",
+            key_versions={1: b"k" * 32},
+            passphrase="passphrase-12",
+        )
+    assert not (tmp_path / "partial-epoch").exists()
 
 
 def test_epoch_backup_holds_single_writer_quiescence(

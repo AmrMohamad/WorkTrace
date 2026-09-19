@@ -176,6 +176,11 @@ def _epoch_identity(
     )
     for object_row in rows:
         relative_path, object_id, ciphertext_hash, key_version, kind = object_row
+        vault_tuple = (relative_path, object_id, ciphertext_hash, key_version)
+        if not any(value is not None for value in vault_tuple):
+            continue
+        if not all(value is not None for value in vault_tuple):
+            raise RecoveryError("archive vault object manifest has a partial vault tuple")
         if (
             not isinstance(relative_path, str)
             or not relative_path
