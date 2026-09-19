@@ -31,6 +31,7 @@ from worktrace.errors import (
     PermissionDenied,
     RecoveryError,
     RetryExhausted,
+    SourceObjectUnavailable,
     VaultIntegrityError,
 )
 from worktrace.vault.format import VaultDescriptor, canonical_json, write_vault_object
@@ -594,6 +595,16 @@ class JiraCollector:
             latest[logical] = str(attachment["original_state"])
         return bool(latest) and all(state == "complete" for state in latest.values())
 
+    def _logical_resource_complete(self, revision_id: str, logical_id: str) -> bool:
+        lineage = self._lineage_revisions(revision_id)
+        placeholders = ",".join("?" for _ in lineage)
+        row = self.connection.execute(
+            f"SELECT state FROM jira_resource_states WHERE logical_resource_id=? "
+            f"AND revision_id IN ({placeholders}) ORDER BY revision_id DESC LIMIT 1",
+            (logical_id, *lineage),
+        ).fetchone()
+        return row is not None and str(row[0]) == "complete"
+
     def _collect_issue(
         self,
         collection_id: str,
@@ -620,11 +631,11 @@ class JiraCollector:
             "comments",
             "changelog",
             "worklogs",
-            "issue_properties",
             "remote_links",
             "watchers_votes",
         ):
             self._collect_paged_resource(collection_id, revision_id, run_id, issue, kind)
+        self._collect_issue_properties(collection_id, revision_id, run_id, issue)
         attachments = self._attachments(full)
         self._store_json_resource(
             collection_id,
@@ -753,6 +764,81 @@ class JiraCollector:
             if not values:
                 raise PermanentSourceError(f"Jira {kind} pagination made no progress")
             start_at += len(values)
+
+    def _collect_issue_properties(
+        self, collection_id: str, revision_id: str, run_id: str, issue: dict[str, object]
+    ) -> None:
+        issue_id = str(issue["issue_id"])
+        start_at = 0
+        seen_starts: set[int] = set()
+        keys_seen: set[str] = set()
+        while True:
+            if start_at in seen_starts:
+                raise PermanentSourceError("Jira property pagination repeated startAt")
+            seen_starts.add(start_at)
+            page = self.provider.resource_page(issue_id, "issue_properties", start_at=start_at)
+            keys = page.get("keys")
+            start_value = page.get("startAt")
+            max_value = page.get("maxResults")
+            total = page.get("total")
+            if (
+                not isinstance(keys, list)
+                or not isinstance(start_value, int)
+                or start_value != start_at
+                or not isinstance(max_value, int)
+                or max_value < 1
+                or not isinstance(total, int)
+                or total < 0
+            ):
+                raise PermanentSourceError("Jira property pagination metadata is invalid")
+            for raw_key in keys:
+                if (
+                    not isinstance(raw_key, str)
+                    or not 1 <= len(raw_key) <= 256
+                    or any(ord(char) < 32 for char in raw_key)
+                    or "/" in raw_key
+                    or ".." in raw_key
+                    or raw_key in keys_seen
+                ):
+                    raise PermanentSourceError("Jira property key listing is invalid")
+                keys_seen.add(raw_key)
+                locator = {"issue_id": issue_id, "property_key": raw_key}
+                if self._logical_resource_complete(
+                    revision_id,
+                    self._logical_resource_id(collection_id, issue_id, "issue_property", locator),
+                ):
+                    continue
+                try:
+                    document = self.provider.issue_property(issue_id, raw_key)
+                except (PermissionDenied, SourceObjectUnavailable) as exc:
+                    self._store_resource_state(
+                        collection_id,
+                        revision_id,
+                        run_id,
+                        issue,
+                        "issue_property",
+                        locator,
+                        "unavailable",
+                        "unavailable",
+                        "unavailable",
+                        0,
+                        {"reason": type(exc).__name__},
+                    )
+                    continue
+                self._store_json_resource(
+                    collection_id,
+                    revision_id,
+                    run_id,
+                    issue,
+                    "issue_property",
+                    locator,
+                    document,
+                )
+            if start_at + len(keys) >= total:
+                return
+            if not keys:
+                raise PermanentSourceError("Jira property pagination made no progress")
+            start_at += len(keys)
 
     def _collect_attachment(
         self,
@@ -885,7 +971,7 @@ class JiraCollector:
         run_id: str,
         issue: dict[str, object],
         kind: str,
-        locator: dict[str, object],
+        locator: Mapping[str, object],
         payload: dict[str, object],
     ) -> None:
         resource_id = self._resource_id(
@@ -943,7 +1029,7 @@ class JiraCollector:
         run_id: str,
         issue: dict[str, object],
         kind: str,
-        locator: dict[str, object],
+        locator: Mapping[str, object],
         state: str,
         completeness: str,
         availability: str,

@@ -168,6 +168,7 @@ class JiraArchiveProvider:
             "GET",
             f"/rest/api/3/issue/{quote(issue_id, safe='')}/properties/{quote(key, safe='')}",
             resource="issue property",
+            exact_object=True,
         )
 
     @contextlib.contextmanager
@@ -214,6 +215,7 @@ class JiraArchiveProvider:
         params: Mapping[str, str | int] | None = None,
         json_body: object | None = None,
         resource: str,
+        exact_object: bool = False,
     ) -> dict[str, object]:
         response = request_with_retry(
             self.client,
@@ -222,6 +224,7 @@ class JiraArchiveProvider:
             params=params,
             json_body=json_body,
             policy=self.retry_policy,
+            exact_object=exact_object,
         )
         try:
             document = response.json()

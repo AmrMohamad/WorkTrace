@@ -426,3 +426,64 @@ def test_unstable_recheck_uses_successor_lineage_without_refetching_stable_ab(
         == 0
     )
     connection.close()
+
+
+def test_issue_property_keys_are_independent_and_resume_retries_only_denied_key(
+    tmp_path: Path,
+) -> None:
+    class PropertiesJira(FakeJira):
+        def __init__(self) -> None:
+            super().__init__()
+            self.allow_beta = False
+            self.property_calls: list[str] = []
+
+        def resource_page(
+            self, issue_id: str, kind: str, *, start_at: int = 0
+        ) -> dict[str, object]:
+            if kind == "issue_properties":
+                return {"startAt": 0, "maxResults": 100, "total": 2, "keys": ["alpha", "beta"]}
+            return super().resource_page(issue_id, kind, start_at=start_at)
+
+        def issue_property(self, issue_id: str, key: str) -> dict[str, object]:
+            self.property_calls.append(key)
+            if key == "beta" and not self.allow_beta:
+                raise PermissionDenied("property denied")
+            return {"key": key, "value": {"fixture": key}}
+
+    provider = PropertiesJira()
+    collector, connection = _collector(tmp_path, provider)
+    preview = collector.preview()
+    first = collector.collect(str(preview["approval_token"]))
+    assert first["status"] == "complete_with_unavailable_resources"
+    assert provider.property_calls.count("alpha") == 2
+    assert provider.property_calls.count("beta") == 2
+    connection.execute(
+        "UPDATE jira_collection_runs SET status='paused' WHERE id=?", (first["run_id"],)
+    )
+    connection.commit()
+    provider.allow_beta = True
+    resumed = collector.resume(str(first["collection_id"]))
+    assert resumed["status"] == "complete_with_unavailable_resources"
+    assert provider.property_calls.count("alpha") == 2
+    assert provider.property_calls.count("beta") == 4
+    connection.close()
+
+
+def test_malformed_or_duplicate_property_keys_are_partial(tmp_path: Path) -> None:
+    class BadPropertiesJira(FakeJira):
+        def issue_property(self, issue_id: str, key: str) -> dict[str, object]:
+            return {"key": key, "value": {"fixture": key}}
+
+        def resource_page(
+            self, issue_id: str, kind: str, *, start_at: int = 0
+        ) -> dict[str, object]:
+            if kind == "issue_properties":
+                return {"startAt": 0, "maxResults": 100, "total": 2, "keys": ["alpha", "alpha"]}
+            return super().resource_page(issue_id, kind, start_at=start_at)
+
+    provider = BadPropertiesJira()
+    collector, connection = _collector(tmp_path, provider)
+    preview = collector.preview()
+    result = collector.collect(str(preview["approval_token"]))
+    assert result["status"] == "partial"
+    connection.close()
