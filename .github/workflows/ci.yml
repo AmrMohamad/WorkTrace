@@ -84,7 +84,7 @@ jobs:
 
       - name: Test with branch coverage
         run: |
-          uv run coverage run -m pytest
+          uv run --extra jira-vault coverage run -m pytest
           uv run coverage report
 
       - name: Smoke test installed wheel
