@@ -114,7 +114,14 @@ class JiraArchiveRepository:
             )
         return run_id
 
-    def create_revision(self, collection_id: str, run_id: str, manifest_hash: str) -> str:
+    def create_revision(
+        self,
+        collection_id: str,
+        run_id: str,
+        manifest_hash: str,
+        *,
+        base_revision_id: str | None = None,
+    ) -> str:
         row = self.connection.execute(
             "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM jira_archive_revisions "
             "WHERE collection_id=?",
@@ -125,9 +132,9 @@ class JiraArchiveRepository:
         with self.connection:
             self.connection.execute(
                 "INSERT INTO jira_archive_revisions "
-                "(id, collection_id, run_id, revision_number, status, manifest_hash) "
-                "VALUES (?, ?, ?, ?, 'pending', ?)",
-                (revision_id, collection_id, run_id, number, manifest_hash),
+                "(id, collection_id, run_id, revision_number, status, manifest_hash, "
+                "base_revision_id) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                (revision_id, collection_id, run_id, number, manifest_hash, base_revision_id),
             )
         return revision_id
 
@@ -144,6 +151,7 @@ class JiraArchiveRepository:
         fetched_at: str | None = None,
         error: Mapping[str, object] | None = None,
         raw_vault_object_id: str | None = None,
+        logical_resource_id: str | None = None,
         raw_vault_object_path: str | None = None,
         raw_vault_ciphertext_sha256: str | None = None,
         raw_vault_key_version: int | None = None,
@@ -155,7 +163,7 @@ class JiraArchiveRepository:
             updated = self.connection.execute(
                 "UPDATE jira_resource_states SET state=?, completeness=?, availability=?, "
                 "seen_count=?, page_cursor=?, attempt=?, fetched_at=?, error_json=?, "
-                "raw_vault_object_id=?, raw_vault_object_path=?, "
+                "logical_resource_id=?, raw_vault_object_id=?, raw_vault_object_path=?, "
                 "raw_vault_ciphertext_sha256=?, raw_vault_key_version=? WHERE id=?",
                 (
                     state,
@@ -166,6 +174,7 @@ class JiraArchiveRepository:
                     attempt,
                     fetched_at,
                     _json(error) if error is not None else None,
+                    logical_resource_id,
                     raw_vault_object_id,
                     raw_vault_object_path,
                     raw_vault_ciphertext_sha256,
@@ -189,6 +198,7 @@ class JiraArchiveRepository:
         role: str,
         redaction_version: str,
         raw_vault_object_id: str | None = None,
+        logical_resource_id: str | None = None,
         raw_vault_object_path: str | None = None,
         raw_vault_ciphertext_sha256: str | None = None,
         raw_vault_key_version: int | None = None,
@@ -199,9 +209,10 @@ class JiraArchiveRepository:
                 "INSERT INTO jira_resource_states "
                 "(id, collection_id, revision_id, run_id, archive_evidence_id, issue_id, kind, "
                 "locator_json, role, state, completeness, availability, redaction_version, "
-                "raw_vault_object_id, raw_vault_object_path, raw_vault_ciphertext_sha256, "
+                "raw_vault_object_id, logical_resource_id, raw_vault_object_path, "
+                "raw_vault_ciphertext_sha256, "
                 "raw_vault_key_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', "
-                "'unknown', ?, ?, ?, ?, ?)",
+                "'unknown', ?, ?, ?, ?, ?, ?)",
                 (
                     resource_id,
                     collection_id,
@@ -215,6 +226,7 @@ class JiraArchiveRepository:
                     state,
                     redaction_version,
                     raw_vault_object_id,
+                    logical_resource_id,
                     raw_vault_object_path,
                     raw_vault_ciphertext_sha256,
                     raw_vault_key_version,
@@ -223,7 +235,8 @@ class JiraArchiveRepository:
 
     def get_checkpoint(self, resource_id: str) -> ResourceCheckpoint:
         row = self.connection.execute(
-            "SELECT id, collection_id, revision_id, run_id, issue_id, kind, locator_json, state, "
+            "SELECT id, collection_id, revision_id, logical_resource_id, run_id, issue_id, kind, "
+            "locator_json, state, "
             "completeness, availability, expected_count, seen_count, page_cursor, attempt, "
             "raw_vault_object_id, raw_vault_object_path, raw_vault_ciphertext_sha256, "
             "raw_vault_key_version, redaction_version, "

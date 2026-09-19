@@ -79,8 +79,8 @@ def test_populated_schema_six_migrates_additively_to_seven(tmp_path: Path) -> No
             "VALUES ('decision:1', 'confirm', 'candidate:1', '{}', '2026-01-01T00:00:00+00:00')"
         )
         connection.commit()
-        assert migrate(connection, database) == [7]
-        assert user_version(connection) == 7
+        assert migrate(connection, database) == [7, 8]
+        assert user_version(connection) == 8
         assert (
             connection.execute("SELECT name FROM apps WHERE id='sample'").fetchone()[0] == "Sample"
         )
@@ -517,7 +517,7 @@ def test_epoch_backup_restore_and_tamper_refusal(tmp_path: Path) -> None:
     restored = tmp_path / "restored"
     result = restore_epoch(epoch=epoch, destination=restored, passphrase="passphrase-12")
     assert result["verified"] is True
-    assert user_version(connect(restored / "worktrace.sqlite3")) == 7
+    assert user_version(connect(restored / "worktrace.sqlite3")) == 8
     assert read_vault_object(restored / "vault/object.wtva", b"k" * 32) == data
     assert backup.manifest["complete"] is True
     restored_connection = connect(restored / "worktrace.sqlite3")

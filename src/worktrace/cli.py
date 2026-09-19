@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -17,6 +18,8 @@ from worktrace import __version__
 from worktrace.adapters.git_local import LocalGitAdapter, LocalGitConfig
 from worktrace.adapters.gitlab import GitLabAdapter, GitLabConfig
 from worktrace.adapters.jira import JiraAdapter, JiraConfig
+from worktrace.archive.jira.orchestrator import JiraCollector, outcome_exit_code
+from worktrace.archive.jira.provider import JiraArchiveProvider
 from worktrace.candidates.builder import rebuild_candidates
 from worktrace.candidates.decisions import append_decision, undo_decision
 from worktrace.candidates.projector import list_candidates, project_candidate
@@ -65,10 +68,12 @@ candidates_app = typer.Typer(
 )
 evidence_app = typer.Typer(no_args_is_help=True, help="Add or inspect explicit evidence.")
 rebuild_app = typer.Typer(no_args_is_help=True, help="Deterministically rebuild derived data.")
+jira_app = typer.Typer(no_args_is_help=True, help="Collect an encrypted Jira archive.")
 app.add_typer(import_app, name="import")
 app.add_typer(candidates_app, name="candidates")
 app.add_typer(evidence_app, name="evidence")
 app.add_typer(rebuild_app, name="rebuild")
+app.add_typer(jira_app, name="jira")
 
 ConfigOption = Annotated[Path | None, typer.Option("--config", exists=True, dir_okay=False)]
 DateArgument = Annotated[str | None, typer.Argument()]
@@ -278,6 +283,135 @@ def main() -> None:
 def version() -> None:
     """Print the WorkTrace version."""
     typer.echo(__version__)
+
+
+def _open_jira_collector(
+    config: Path | None,
+    *,
+    require_vault: bool = False,
+) -> tuple[WorkTraceConfig, sqlite3.Connection, JiraArchiveProvider, JiraCollector]:
+    configuration, connection, _ = _open(config)
+    credentials = jira_credentials()
+    if credentials is None:
+        connection.close()
+        raise ConfigurationError("WORKTRACE_JIRA_* credentials are required")
+    provider = JiraArchiveProvider.from_credentials(
+        base_url=credentials.base_url,
+        email=credentials.email,
+        token=credentials.token,
+    )
+    vault_key: bytes | None = None
+    if require_vault:
+        from worktrace.vault.keychain import MacOSKeychain
+
+        installation_id = (
+            "install:"
+            + hashlib.sha256(str(configuration.config_path).encode("utf-8")).hexdigest()[:32]
+        )
+        vault_key = MacOSKeychain.open(installation_id).ensure(1)
+    return (
+        configuration,
+        connection,
+        provider,
+        JiraCollector(
+            connection,
+            configuration,
+            provider,
+            vault_key=vault_key,
+        ),
+    )
+
+
+@jira_app.command("collect-preview")
+def jira_collect_preview(
+    scope: Annotated[str, typer.Option("--scope")],
+    context_depth: Annotated[int, typer.Option("--context-depth")],
+    config: ConfigOption = None,
+) -> None:
+    if scope != "assigned-during-employment" or context_depth != 1:
+        raise typer.BadParameter(
+            "Jira archive scope/context-depth must be assigned-during-employment/1"
+        )
+    configuration, connection, provider, collector = _open_jira_collector(config)
+    del configuration
+    try:
+        _emit(collector.preview())
+    except WorkTraceError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        provider.close()
+        connection.close()
+
+
+@jira_app.command("collect")
+def jira_collect(
+    scope: Annotated[str, typer.Option("--scope")],
+    context_depth: Annotated[int, typer.Option("--context-depth")],
+    attachments: Annotated[str, typer.Option("--attachments")],
+    config: ConfigOption = None,
+    approve_scope: Annotated[str, typer.Option("--approve-scope")] = "",
+) -> None:
+    if scope != "assigned-during-employment" or context_depth != 1 or attachments != "all":
+        raise typer.BadParameter(
+            "Jira archive scope/context-depth/attachments are assigned-during-employment/1/all"
+        )
+    if not approve_scope:
+        raise typer.BadParameter("--approve-scope is required")
+    configuration, connection, provider, collector = _open_jira_collector(
+        config, require_vault=True
+    )
+    del configuration
+    try:
+        result = collector.collect(approve_scope)
+        _emit(result)
+        code = outcome_exit_code(str(result.get("status")))
+        if code:
+            raise typer.Exit(code)
+    except typer.Exit:
+        raise
+    except WorkTraceError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        provider.close()
+        connection.close()
+
+
+@jira_app.command("resume")
+def jira_resume(
+    collection_id: Annotated[str | None, typer.Argument()] = None,
+    config: ConfigOption = None,
+) -> None:
+    configuration, connection, provider, collector = _open_jira_collector(
+        config, require_vault=True
+    )
+    del configuration
+    try:
+        result = collector.resume(collection_id)
+        _emit(result)
+        code = outcome_exit_code(str(result.get("status")))
+        if code:
+            raise typer.Exit(code)
+    finally:
+        provider.close()
+        connection.close()
+
+
+@jira_app.command("status")
+def jira_status(
+    collection_id: Annotated[str | None, typer.Argument()] = None,
+    config: ConfigOption = None,
+) -> None:
+    configuration, connection, provider, collector = _open_jira_collector(config)
+    del configuration
+    try:
+        result = collector.status(collection_id)
+        _emit(result)
+        code = outcome_exit_code(str(result.get("status")))
+        if code:
+            raise typer.Exit(code)
+    finally:
+        provider.close()
+        connection.close()
 
 
 def _sanitize_tui_environment() -> None:

@@ -10,6 +10,7 @@ class ResourceCheckpoint:
     id: str
     collection_id: str
     revision_id: str
+    logical_resource_id: str | None
     run_id: str
     issue_id: str
     kind: str
