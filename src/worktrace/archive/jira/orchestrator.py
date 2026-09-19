@@ -37,6 +37,8 @@ from worktrace.vault.format import VaultDescriptor, canonical_json, write_vault_
 
 APP_MAPPING_STATUS = "not_configured"
 NOT_IMPLEMENTED_STATUS = "not_implemented"
+COMPLETE_OUTCOMES = frozenset({"complete", "complete_with_unavailable_resources"})
+ACTION_OUTCOMES = frozenset({"paused", "partial", "unstable_partial"})
 RESOURCE_TERMINAL = frozenset({"complete", "unavailable", "unsupported", "failed", "paused"})
 TRANSFER_BUDGET_BYTES = 20 * 1024 * 1024 * 1024
 FREE_SPACE_FLOOR_BYTES = 2 * 1024 * 1024 * 1024
@@ -113,6 +115,18 @@ DEFAULT_LIMITS = CollectorLimits()
 
 class CollectionPaused(Exception):
     """Durable pause requested by a collection budget or free-space guard."""
+
+
+def outcome_exit_code(outcome: str) -> int:
+    if outcome in COMPLETE_OUTCOMES:
+        return 0
+    if outcome in ACTION_OUTCOMES:
+        return 2
+    if outcome in {"failed", "preflight_failed"}:
+        return 1
+    if outcome in {"invalid", "incompatible"}:
+        return 3
+    return 1
 
 
 class AttachmentIntegrityError(Exception):
@@ -210,28 +224,34 @@ class JiraCollector:
         row = self._latest_collection(collection_id)
         if row is None:
             raise ConfigurationError("Jira collection was not found")
+        lineage = self._lineage_revisions(str(row["revision_id"]))
+        placeholders = ",".join("?" for _ in lineage)
         resources = self.connection.execute(
-            "SELECT state, availability, completeness FROM jira_resource_states "
-            "WHERE revision_id=?",
-            (row["revision_id"],),
+            f"SELECT id, logical_resource_id, state, completeness FROM jira_resource_states "
+            f"WHERE revision_id IN ({placeholders}) ORDER BY revision_id",
+            tuple(lineage),
         ).fetchall()
-        unavailable_attachments = int(
-            self.connection.execute(
-                "SELECT COUNT(*) FROM jira_attachment_objects "
-                "WHERE revision_id=? AND original_state='unavailable'",
-                (row["revision_id"],),
-            ).fetchone()[0]
-        )
+        attachments = self.connection.execute(
+            f"SELECT id, logical_resource_id, original_state AS state, "
+            f"original_state AS completeness FROM jira_attachment_objects "
+            f"WHERE revision_id IN ({placeholders}) ORDER BY revision_id",
+            tuple(lineage),
+        ).fetchall()
+        latest_resources: dict[str, tuple[str, str]] = {}
+        for resource in [*resources, *attachments]:
+            logical = str(resource["logical_resource_id"] or resource["id"])
+            latest_resources[logical] = (
+                str(resource["state"]),
+                str(resource["completeness"]),
+            )
         counts: dict[str, int] = {
             key: 0 for key in ("complete", "partial", "unavailable", "unstable")
         }
-        for resource in resources:
-            state = str(resource["state"])
+        for state, completeness in latest_resources.values():
             if state in counts:
                 counts[state] += 1
-            elif str(resource["completeness"]) == "partial":
+            elif completeness == "partial":
                 counts["partial"] += 1
-        counts["unavailable"] += unavailable_attachments
         outcome = str(row["run_status"])
         if outcome == "complete" and counts["unavailable"]:
             outcome = "complete_with_unavailable_resources"
@@ -466,14 +486,14 @@ class JiraCollector:
         unavailable = False
         partial = False
         for issue in issues:
+            if self._issue_is_complete_in_lineage(revision_id, str(issue["issue_id"])):
+                continue
             try:
                 first_signature = self._collect_issue(collection_id, revision_id, run_id, issue)
                 current_signature = self._issue_signature(str(issue["issue_id"]))
                 if current_signature != first_signature:
-                    self._collect_issue(collection_id, revision_id, run_id, issue, force=True)
-                    if self._issue_signature(str(issue["issue_id"])) != current_signature:
-                        unstable = True
-                        self._mark_issue_unstable(revision_id, str(issue["issue_id"]))
+                    unstable = True
+                    self._mark_issue_unstable(revision_id, str(issue["issue_id"]))
             except CollectionPaused:
                 self._finish_run(run_id, "paused")
                 return self.status(collection_id)
@@ -539,6 +559,41 @@ class JiraCollector:
                     ),
                 )
 
+    def _lineage_revisions(self, revision_id: str) -> list[str]:
+        result: list[str] = []
+        current: str | None = revision_id
+        while current is not None and current not in result:
+            result.append(current)
+            row = self.connection.execute(
+                "SELECT base_revision_id FROM jira_archive_revisions WHERE id=?", (current,)
+            ).fetchone()
+            current = str(row[0]) if row is not None and row[0] else None
+        return list(reversed(result))
+
+    def _issue_is_complete_in_lineage(self, revision_id: str, issue_id: str) -> bool:
+        lineage = self._lineage_revisions(revision_id)
+        placeholders = ",".join("?" for _ in lineage)
+        rows = self.connection.execute(
+            f"SELECT id, logical_resource_id, state FROM jira_resource_states "
+            f"WHERE revision_id IN ({placeholders}) AND issue_id=? ORDER BY revision_id",
+            (*lineage, issue_id),
+        ).fetchall()
+        if not rows:
+            return False
+        latest: dict[str, str] = {}
+        for resource in rows:
+            logical = str(resource["logical_resource_id"] or resource["id"])
+            latest[logical] = str(resource["state"])
+        attachment_rows = self.connection.execute(
+            f"SELECT logical_resource_id, original_state, id FROM jira_attachment_objects "
+            f"WHERE revision_id IN ({placeholders}) AND issue_id=? ORDER BY revision_id",
+            (*lineage, issue_id),
+        ).fetchall()
+        for attachment in attachment_rows:
+            logical = str(attachment["logical_resource_id"] or attachment["id"])
+            latest[logical] = str(attachment["original_state"])
+        return bool(latest) and all(state == "complete" for state in latest.values())
+
     def _collect_issue(
         self,
         collection_id: str,
@@ -579,6 +634,15 @@ class JiraCollector:
             "attachments_manifest",
             {"issue_id": issue_id, "manifest": True},
             {"issue_id": issue_id, "attachments": attachments},
+        )
+        self._store_json_resource(
+            collection_id,
+            revision_id,
+            run_id,
+            issue,
+            "embedded_media",
+            {"issue_id": issue_id, "media": True},
+            {"issue_id": issue_id, "media": self._embedded_media_payload(full, attachments)},
         )
         for attachment in attachments:
             self._collect_attachment(collection_id, revision_id, issue, attachment, force=force)
@@ -700,6 +764,7 @@ class JiraCollector:
         force: bool = False,
     ) -> None:
         attachment_id = str(attachment["attachment_id"])
+        logical_object_id = f"jatt-family:{collection_id}:{attachment_id}"
         object_id = f"jatt:{collection_id}:{revision_id}:{attachment_id}"
         existing = self.connection.execute(
             "SELECT original_state FROM jira_attachment_objects WHERE id=?",
@@ -712,8 +777,9 @@ class JiraCollector:
                 "INSERT OR IGNORE INTO jira_attachment_objects "
                 "(id, collection_id, revision_id, issue_id, attachment_id, archive_evidence_id, "
                 "filename, mime_type, declared_size, manifest_sha256, original_state, "
-                "extracted_state, source_locator) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "'planned', 'not_requested', ?)",
+                "extracted_state, logical_resource_id, source_locator) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "'planned', 'not_requested', ?, ?)",
                 (
                     object_id,
                     collection_id,
@@ -725,6 +791,7 @@ class JiraCollector:
                     str(attachment.get("mime_type") or ""),
                     attachment.get("declared_size"),
                     _hash(attachment),
+                    logical_object_id,
                     _json({"attachment_id": attachment_id}),
                 ),
             )
@@ -837,7 +904,7 @@ class JiraCollector:
             1,
             None,
         )
-        object_id = f"jres:{resource_id}"
+        object_id = f"jres:{resource_id}:attempt:{uuid.uuid4()}"
         raw = canonical_json(payload)
         destination = _object_path(
             self.vault_root, self._site_id, collection_id, revision_id, object_id
@@ -883,6 +950,9 @@ class JiraCollector:
         seen_count: int,
         error: Mapping[str, object] | None,
     ) -> None:
+        logical_resource_id = self._logical_resource_id(
+            collection_id, str(issue["issue_id"]), kind, locator
+        )
         resource_id = self._resource_id(
             collection_id, revision_id, str(issue["issue_id"]), kind, locator
         )
@@ -899,6 +969,7 @@ class JiraCollector:
                 locator=locator,
                 role=role,
                 redaction_version="1",
+                logical_resource_id=logical_resource_id,
                 state=state,
             )
         repository.checkpoint_resource(
@@ -909,6 +980,7 @@ class JiraCollector:
             seen_count=seen_count,
             page_cursor=None,
             attempt=1,
+            logical_resource_id=logical_resource_id,
             fetched_at=_iso(self.clock()),
             error=error,
         )
@@ -923,6 +995,13 @@ class JiraCollector:
     ) -> str:
         digest = hashlib.sha256(canonical_json(dict(locator))).hexdigest()[:24]
         return f"jres:{collection_id}:{revision_id}:{issue_id}:{kind}:{digest}"
+
+    @staticmethod
+    def _logical_resource_id(
+        collection_id: str, issue_id: str, kind: str, locator: Mapping[str, object]
+    ) -> str:
+        digest = hashlib.sha256(canonical_json(dict(locator))).hexdigest()[:24]
+        return f"jres-family:{collection_id}:{issue_id}:{kind}:{digest}"
 
     @staticmethod
     def _attachments(issue: Mapping[str, object]) -> list[dict[str, object]]:
@@ -946,6 +1025,51 @@ class JiraCollector:
                 }
             )
         return result
+
+    @staticmethod
+    def _embedded_media_payload(
+        issue: Mapping[str, object], attachments: list[dict[str, object]]
+    ) -> list[dict[str, object]]:
+        attachment_ids = {str(item["attachment_id"]) for item in attachments}
+        found: list[dict[str, object]] = []
+        stack: list[tuple[object, str, int]] = [(issue.get("fields", {}), "fields", 0)]
+        while stack and len(found) < 1000:
+            value, locator, depth = stack.pop()
+            if depth > 32:
+                continue
+            if isinstance(value, dict):
+                attrs: dict[str, object] = (
+                    cast(dict[str, object], value["attrs"])
+                    if isinstance(value.get("attrs"), dict)
+                    else {}
+                )
+                media_id = value.get("id") or attrs.get("id") or value.get("mediaId")
+                if value.get("type") == "media" or (media_id is not None and "media" in value):
+                    identifier = str(media_id) if media_id is not None else None
+                    found.append(
+                        {
+                            "media_id": identifier,
+                            "locator": locator,
+                            "disposition": (
+                                "resolved" if identifier in attachment_ids else "unavailable"
+                            ),
+                        }
+                    )
+                for key, child in value.items():
+                    if key in {"url", "contentUrl", "href"} and isinstance(child, str):
+                        found.append(
+                            {
+                                "media_id": None,
+                                "locator": f"{locator}.{key}",
+                                "disposition": "external_unavailable",
+                            }
+                        )
+                    elif key not in {"url", "contentUrl", "href"}:
+                        stack.append((child, f"{locator}.{key}", depth + 1))
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    stack.append((child, f"{locator}[{index}]", depth + 1))
+        return found[:1000]
 
     def _issue_signature(self, issue_id: str) -> str:
         return self._signature_from_issue(self.provider.issue_full(issue_id))
@@ -1030,8 +1154,18 @@ class JiraCollector:
         )
 
     def _new_revision(self, collection_id: str, selection: PreviewSelection) -> tuple[str, str]:
+        base_row = self.connection.execute(
+            "SELECT id FROM jira_archive_revisions WHERE collection_id=? "
+            "ORDER BY revision_number DESC LIMIT 1",
+            (collection_id,),
+        ).fetchone()
         with self.connection:
             repository = JiraArchiveRepository(self.connection)
             run_id = repository.start_run(collection_id)
-            revision_id = repository.create_revision(collection_id, run_id, "pending")
+            revision_id = repository.create_revision(
+                collection_id,
+                run_id,
+                "pending",
+                base_revision_id=str(base_row[0]) if base_row is not None else None,
+            )
         return run_id, revision_id

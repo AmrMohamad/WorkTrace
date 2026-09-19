@@ -330,3 +330,99 @@ def test_malformed_resource_pagination_never_completes(tmp_path: Path) -> None:
     assert result["status"] == "partial"
     assert result["next_action"] == "resume"
     connection.close()
+
+
+def test_unstable_recheck_uses_successor_lineage_without_refetching_stable_ab(
+    tmp_path: Path,
+) -> None:
+    class ABCJira(FakeJira):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issue_calls: dict[str, int] = {"1": 0, "2": 0, "3": 0}
+
+        def search_metadata(self, jql: str, *, next_token: str | None = None) -> MetadataPage:
+            issues = []
+            for issue_id in ("1", "2", "3"):
+                issues.append(
+                    {
+                        "id": issue_id,
+                        "key": f"DEMO-{issue_id}",
+                        "fields": {
+                            "project": {"id": "10", "key": "DEMO"},
+                            "parent": {},
+                            "subtasks": [],
+                            "issuelinks": [],
+                            "attachment": [],
+                        },
+                    }
+                )
+            return MetadataPage(tuple(issues), None, True)
+
+        def assignment_changelog(self, issue_id: str, *, start_at: int = 0) -> dict[str, object]:
+            return {
+                "startAt": 0,
+                "maxResults": 100,
+                "total": 1,
+                "values": [
+                    {
+                        "created": "2025-01-01T00:00:00Z",
+                        "items": [{"field": "assignee", "from": "other", "to": "self"}],
+                    }
+                ],
+            }
+
+        def issue_metadata(self, issue_id: str) -> dict[str, object]:
+            return {
+                "id": issue_id,
+                "key": f"DEMO-{issue_id}",
+                "fields": {"project": {"id": "10", "key": "DEMO"}},
+            }
+
+        def issue_full(self, issue_id: str) -> dict[str, object]:
+            self.issue_calls[issue_id] += 1
+            update = "stable" if issue_id != "3" else f"c-{self.issue_calls[issue_id]}"
+            return {
+                "id": issue_id,
+                "key": f"DEMO-{issue_id}",
+                "fields": {
+                    "project": {"id": "10", "key": "DEMO"},
+                    "updated": update,
+                    "parent": {},
+                    "subtasks": [],
+                    "issuelinks": [],
+                    "attachment": [],
+                },
+            }
+
+    provider = ABCJira()
+    collector, connection = _collector(tmp_path, provider)
+    preview = collector.preview()
+    first = collector.collect(str(preview["approval_token"]))
+    assert first["status"] == "unstable_partial"
+    first_revision = str(first["revision_id"])
+    resumed = collector.resume(str(first["collection_id"]))
+    assert resumed["status"] == "unstable_partial"
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM jira_archive_revisions WHERE collection_id=?",
+            (first["collection_id"],),
+        ).fetchone()[0]
+        == 2
+    )
+    assert (
+        connection.execute(
+            "SELECT base_revision_id FROM jira_archive_revisions WHERE id=?",
+            (resumed["revision_id"],),
+        ).fetchone()[0]
+        == first_revision
+    )
+    assert provider.issue_calls["1"] == 2
+    assert provider.issue_calls["2"] == 2
+    assert provider.issue_calls["3"] == 4
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM jira_archive_revisions WHERE status='active'"
+        ).fetchone()[0]
+        == 0
+    )
+    connection.close()

@@ -216,7 +216,7 @@ def _epoch_identity(
         "revision_ids": [revision_id],
         "vault_id": vault_id,
         "key_versions": sorted(key_versions),
-        "ledger_schema_version": 7,
+        "ledger_schema_version": 8,
         "vault_objects": objects,
     }
 
@@ -225,8 +225,8 @@ def _verify_sqlite_identity(database_path: Path, *, identity: Mapping[str, objec
     with sqlite3.connect(database_path) as connection:
         if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise RecoveryError("epoch SQLite integrity check failed")
-        if user_version(connection) != 7:
-            raise RecoveryError("epoch SQLite schema is not version 7")
+        if user_version(connection) != 8:
+            raise RecoveryError("epoch SQLite schema is not version 8")
         collection_ids = cast(list[object], identity["collection_ids"])
         revision_ids = cast(list[object], identity["revision_ids"])
         collection_id = str(collection_ids[0])

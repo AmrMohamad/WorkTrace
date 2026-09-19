@@ -18,7 +18,7 @@ from worktrace import __version__
 from worktrace.adapters.git_local import LocalGitAdapter, LocalGitConfig
 from worktrace.adapters.gitlab import GitLabAdapter, GitLabConfig
 from worktrace.adapters.jira import JiraAdapter, JiraConfig
-from worktrace.archive.jira.orchestrator import JiraCollector
+from worktrace.archive.jira.orchestrator import JiraCollector, outcome_exit_code
 from worktrace.archive.jira.provider import JiraArchiveProvider
 from worktrace.candidates.builder import rebuild_candidates
 from worktrace.candidates.decisions import append_decision, undo_decision
@@ -364,8 +364,9 @@ def jira_collect(
     try:
         result = collector.collect(approve_scope)
         _emit(result)
-        if result.get("status") in {"paused", "partial", "unstable_partial"}:
-            raise typer.Exit(2)
+        code = outcome_exit_code(str(result.get("status")))
+        if code:
+            raise typer.Exit(code)
     except typer.Exit:
         raise
     except WorkTraceError as exc:
@@ -385,7 +386,11 @@ def jira_resume(
     )
     del configuration
     try:
-        _emit(collector.resume(collection_id))
+        result = collector.resume(collection_id)
+        _emit(result)
+        code = outcome_exit_code(str(result.get("status")))
+        if code:
+            raise typer.Exit(code)
     finally:
         provider.close()
         connection.close()
@@ -399,7 +404,11 @@ def jira_status(
     configuration, connection, provider, collector = _open_jira_collector(config)
     del configuration
     try:
-        _emit(collector.status(collection_id))
+        result = collector.status(collection_id)
+        _emit(result)
+        code = outcome_exit_code(str(result.get("status")))
+        if code:
+            raise typer.Exit(code)
     finally:
         provider.close()
         connection.close()
