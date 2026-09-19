@@ -22,6 +22,7 @@ class ResourceCheckpoint:
     page_cursor: str | None
     attempt: int
     raw_vault_object_id: str | None
+    raw_vault_object_path: str | None
     redaction_version: str
     source_updated_at: str | None
     fetched_at: str | None

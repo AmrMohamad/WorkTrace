@@ -94,6 +94,7 @@ CREATE TABLE jira_resource_states (
     page_cursor TEXT NULL,
     attempt INTEGER NOT NULL DEFAULT 0,
     raw_vault_object_id TEXT NULL,
+    raw_vault_object_path TEXT NULL,
     redaction_version TEXT NOT NULL,
     source_updated_at TEXT NULL,
     fetched_at TEXT NULL,
@@ -114,6 +115,7 @@ CREATE TABLE jira_attachment_objects (
     manifest_sha256 TEXT NOT NULL,
     original_state TEXT NOT NULL,
     vault_object_id TEXT NULL,
+    vault_object_path TEXT NULL,
     ciphertext_sha256 TEXT NULL,
     extracted_state TEXT NOT NULL,
     source_locator TEXT NOT NULL,
@@ -143,7 +145,11 @@ CREATE INDEX jira_resource_states_revision_kind_idx
     ON jira_resource_states(revision_id, kind, state);
 CREATE INDEX jira_resource_states_run_cursor_idx
     ON jira_resource_states(run_id, state, page_cursor);
+CREATE INDEX jira_resource_states_vault_path_idx
+    ON jira_resource_states(revision_id, raw_vault_object_path);
 CREATE INDEX jira_attachment_objects_revision_state_idx
     ON jira_attachment_objects(revision_id, original_state, extracted_state);
+CREATE INDEX jira_attachment_objects_vault_path_idx
+    ON jira_attachment_objects(revision_id, vault_object_path);
 CREATE INDEX jira_search_chunks_revision_attachment_idx
     ON jira_search_chunks(revision_id, attachment_id, ordinal);

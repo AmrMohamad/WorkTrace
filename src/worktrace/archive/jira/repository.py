@@ -144,6 +144,7 @@ class JiraArchiveRepository:
         fetched_at: str | None = None,
         error: Mapping[str, object] | None = None,
         raw_vault_object_id: str | None = None,
+        raw_vault_object_path: str | None = None,
     ) -> None:
         """Atomically publish one resource checkpoint and its progress boundary."""
         if seen_count < 0 or attempt < 0:
@@ -152,7 +153,7 @@ class JiraArchiveRepository:
             updated = self.connection.execute(
                 "UPDATE jira_resource_states SET state=?, completeness=?, availability=?, "
                 "seen_count=?, page_cursor=?, attempt=?, fetched_at=?, error_json=?, "
-                "raw_vault_object_id=? WHERE id=?",
+                "raw_vault_object_id=?, raw_vault_object_path=? WHERE id=?",
                 (
                     state,
                     completeness,
@@ -163,6 +164,7 @@ class JiraArchiveRepository:
                     fetched_at,
                     _json(error) if error is not None else None,
                     raw_vault_object_id,
+                    raw_vault_object_path,
                     resource_id,
                 ),
             )
@@ -181,14 +183,16 @@ class JiraArchiveRepository:
         locator: Mapping[str, object],
         role: str,
         redaction_version: str,
+        raw_vault_object_path: str | None = None,
         state: str = "planned",
     ) -> None:
         with self.connection:
             self.connection.execute(
                 "INSERT INTO jira_resource_states "
                 "(id, collection_id, revision_id, run_id, archive_evidence_id, issue_id, kind, "
-                "locator_json, role, state, completeness, availability, redaction_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', 'unknown', ?)",
+                "locator_json, role, state, completeness, availability, redaction_version, "
+                "raw_vault_object_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', "
+                "'unknown', ?, ?)",
                 (
                     resource_id,
                     collection_id,
@@ -201,6 +205,7 @@ class JiraArchiveRepository:
                     role,
                     state,
                     redaction_version,
+                    raw_vault_object_path,
                 ),
             )
 
@@ -208,7 +213,8 @@ class JiraArchiveRepository:
         row = self.connection.execute(
             "SELECT id, collection_id, revision_id, run_id, issue_id, kind, locator_json, state, "
             "completeness, availability, expected_count, seen_count, page_cursor, attempt, "
-            "raw_vault_object_id, redaction_version, source_updated_at, fetched_at, error_json "
+            "raw_vault_object_id, raw_vault_object_path, redaction_version, "
+            "source_updated_at, fetched_at, error_json "
             "FROM jira_resource_states WHERE id=?",
             (resource_id,),
         ).fetchone()

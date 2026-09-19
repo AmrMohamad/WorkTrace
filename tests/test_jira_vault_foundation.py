@@ -234,11 +234,9 @@ def _recovery_descriptor() -> dict[str, object]:
         "installation_id": "install:test",
         "site_ids": ["jira-site:test"],
         "collection_ids": ["jcol:test"],
-        "revision_ids": ["jrev:jcol:test:1"],
         "vault_id": "vault:test",
         "epoch_id": "epoch:test",
         "key_versions": [1, 2],
-        "ledger_schema_version": 7,
         "schema_version": 1,
         "kdf": {"name": "argon2id", "opslimit": 1, "memlimit": 8 * 1024 * 1024, "dk_len": 32},
         "aead": {"name": "xchacha20-poly1305-ietf"},
@@ -255,7 +253,7 @@ def test_recovery_envelope_known_answer_and_rejects_tampering() -> None:
         nonce=b"n" * 24,
     )
     assert hashlib.sha256(envelope).hexdigest() == (
-        "c7b0a3cc7c977c536fce1c805d33c8f29863be6a3e305ef9042cfd7b017830fb"
+        "a1d0ea5631ab3dc121b8183210126f5d2f747859f9f219532d44a889148cfbaa"
     )
     opened = open_recovery_envelope(envelope, "passphrase-12")
     assert opened.keys == {1: b"a" * 32, 2: b"b" * 32}
@@ -336,6 +334,31 @@ def test_epoch_backup_restore_and_tamper_refusal(tmp_path: Path) -> None:
         _descriptor(data),
         b"k" * 32,
     )
+    connection = connect(database)
+    try:
+        connection.execute(
+            "INSERT INTO jira_attachment_objects "
+            "(id, collection_id, revision_id, issue_id, attachment_id, archive_evidence_id, "
+            "filename, manifest_sha256, original_state, extracted_state, source_locator, "
+            "vault_object_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "jatt:test",
+                collection_id,
+                revision_id,
+                "10001",
+                "1",
+                "jare:test",
+                "object.bin",
+                "manifest",
+                "complete",
+                "not_requested",
+                "object.wtva",
+                "object.wtva",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
     epoch = tmp_path / "epoch"
     backup = create_epoch_backup(
         database_path=database,
@@ -468,6 +491,31 @@ def test_epoch_backup_holds_single_writer_quiescence(
     vault.mkdir()
     data = b"quiesced"
     write_vault_object(BytesIO(data), vault / "object.wtva", _descriptor(data), b"k" * 32)
+    connection = connect(database)
+    try:
+        connection.execute(
+            "INSERT INTO jira_attachment_objects "
+            "(id, collection_id, revision_id, issue_id, attachment_id, archive_evidence_id, "
+            "filename, manifest_sha256, original_state, extracted_state, source_locator, "
+            "vault_object_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "jatt:test",
+                collection_id,
+                revision_id,
+                "10001",
+                "1",
+                "jare:test",
+                "object.bin",
+                "manifest",
+                "complete",
+                "not_requested",
+                "object.wtva",
+                "object.wtva",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
     import worktrace.vault.backup as backup_module
 
@@ -517,3 +565,85 @@ def test_epoch_backup_holds_single_writer_quiescence(
         release.set()
         worker.join(timeout=5)
     assert not errors
+
+
+def test_epoch_backup_isolates_referenced_objects_by_collection_and_revision(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "ledger.sqlite3"
+    connection = connect(database)
+    try:
+        migrate(connection, database)
+        repository = JiraArchiveRepository(connection)
+        site_id = repository.ensure_site("https://jira.example.test")
+        collections: list[tuple[str, str]] = []
+        for index in (1, 2):
+            collection = repository.create_collection(
+                site_id=site_id,
+                scope={"roots": [str(index)]},
+                scope_hash=f"scope-{index}",
+                approval_token_hash=f"token-{index}",
+                policy_version=1,
+                config_fingerprint=f"config-{index}",
+                vault_id=f"vault:{index}",
+            )
+            run = repository.start_run(collection)
+            connection.execute(
+                "UPDATE jira_collection_runs SET status='complete', "
+                "completed_at='2026-01-01T00:00:00+00:00' WHERE id=?",
+                (run,),
+            )
+            revision = repository.create_revision(collection, run, f"manifest-{index}")
+            collections.append((collection, revision))
+            connection.execute(
+                "INSERT INTO jira_attachment_objects "
+                "(id, collection_id, revision_id, issue_id, attachment_id, archive_evidence_id, "
+                "filename, manifest_sha256, original_state, extracted_state, source_locator, "
+                "vault_object_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"jatt:{index}",
+                    collection,
+                    revision,
+                    str(index),
+                    str(index),
+                    f"jare:{index}",
+                    "object.bin",
+                    "manifest",
+                    "complete",
+                    "not_requested",
+                    f"{collection}/object.wtva",
+                    f"{collection}/object.wtva",
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    config = tmp_path / "config.toml"
+    config.write_text("schema_version = 1\n", encoding="utf-8")
+    hmac_key = tmp_path / "email-hmac.key"
+    hmac_key.write_bytes(b"h" * 64)
+    vault = tmp_path / "vault"
+    for index, (collection, _) in enumerate(collections, start=1):
+        data = f"object-{index}".encode()
+        write_vault_object(
+            BytesIO(data),
+            vault / collection / "object.wtva",
+            _descriptor(data, object_id=f"jatt:{index}"),
+            b"k" * 32,
+        )
+    epoch = tmp_path / "epoch"
+    create_epoch_backup(
+        database_path=database,
+        config_path=config,
+        hmac_key_path=hmac_key,
+        vault_root=vault,
+        output=epoch,
+        collection_id=collections[0][0],
+        revision_id=collections[0][1],
+        installation_id="install:test",
+        vault_id="vault:1",
+        key_versions={1: b"k" * 32},
+        passphrase="passphrase-12",
+    )
+    manifest = json.loads((epoch / "epoch.json").read_text(encoding="utf-8"))
+    assert set(manifest["vault_inventory"]) == {f"{collections[0][0]}/object.wtva"}
