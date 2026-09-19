@@ -24,7 +24,7 @@ _U32 = struct.Struct(">I")
 
 def _bindings() -> Any:
     try:
-        from nacl import bindings
+        from nacl import bindings  # type: ignore[import-not-found, unused-ignore]
     except ImportError as exc:  # pragma: no cover - optional dependency is absent
         raise RecoveryError("install the jira-vault extra for recovery envelopes") from exc
     return bindings
@@ -32,7 +32,7 @@ def _bindings() -> Any:
 
 def _pwhash() -> Any:
     try:
-        from nacl import pwhash
+        from nacl import pwhash  # type: ignore[import-not-found, unused-ignore]
     except ImportError as exc:  # pragma: no cover - optional dependency is absent
         raise RecoveryError("install the jira-vault extra for recovery envelopes") from exc
     return pwhash

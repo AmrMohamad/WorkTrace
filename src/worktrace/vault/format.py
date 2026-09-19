@@ -26,7 +26,7 @@ _RECORD_HEADER = struct.Struct(">I")
 
 def _bindings() -> Any:
     try:
-        from nacl import bindings
+        from nacl import bindings  # type: ignore[import-not-found, unused-ignore]
     except ImportError as exc:  # pragma: no cover - exercised without the optional extra
         raise VaultFormatError("install the jira-vault extra for encrypted objects") from exc
     return bindings

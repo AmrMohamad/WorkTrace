@@ -57,7 +57,7 @@ class MacOSKeychain:
             raise KeychainError("installation_id is required for the vault Keychain")
         if backend is None:
             try:
-                import keyring
+                import keyring  # type: ignore[import-not-found, unused-ignore]
             except ImportError as exc:  # pragma: no cover - optional dependency is absent
                 raise KeychainError("install the jira-vault extra for Keychain access") from exc
             backend = keyring.get_keyring()
