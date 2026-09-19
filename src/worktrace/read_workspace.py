@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -301,3 +302,45 @@ class ReadOnlyWorkspace:
             if excerpt.get("app_id") != app_id:
                 raise ScopeViolation("evidence belongs to another application")
             return excerpt
+
+    def jira_collection_summary(self, collection_id: str) -> dict[str, object]:
+        with self._connection() as connection:
+            collection = connection.execute(
+                "SELECT id, site_id, scope_json FROM jira_collections WHERE id=?",
+                (collection_id,),
+            ).fetchone()
+            if collection is None:
+                raise NotFound("Jira collection was not found")
+            revision = connection.execute(
+                "SELECT id, status, revision_number FROM jira_archive_revisions "
+                "WHERE collection_id=? ORDER BY revision_number DESC LIMIT 1",
+                (collection_id,),
+            ).fetchone()
+            if revision is None:
+                raise NotFound("Jira collection has no revision")
+            issues = [
+                {"issue_id": str(row[0]), "issue_key": str(row[1]), "role": str(row[2])}
+                for row in connection.execute(
+                    "SELECT issue_id, issue_key, role FROM jira_collection_issues "
+                    "WHERE revision_id=? ORDER BY issue_id",
+                    (revision["id"],),
+                )
+            ]
+            resources = [
+                {"kind": str(row[0]), "state": str(row[1]), "completeness": str(row[2])}
+                for row in connection.execute(
+                    "SELECT kind, state, completeness FROM jira_resource_states "
+                    "WHERE revision_id=? ORDER BY kind, id",
+                    (revision["id"],),
+                )
+            ]
+            return {
+                "schema_version": 1,
+                "collection_id": str(collection["id"]),
+                "site_id": str(collection["site_id"]),
+                "revision_id": str(revision["id"]),
+                "revision_status": str(revision["status"]),
+                "issues": issues,
+                "resources": resources,
+                "scope": json.loads(str(collection["scope_json"])),
+            }

@@ -60,6 +60,10 @@ from worktrace.normalize.redaction import Redactor
 from worktrace.packets.builder import PacketBuilder
 from worktrace.paths import ensure_private_directory
 from worktrace.services import add_manual_evidence, export_app
+from worktrace.vault.backup import create_epoch_backup, restore_epoch
+from worktrace.vault.export import export_attachment
+from worktrace.vault.keychain import MacOSKeychain
+from worktrace.vault.search import search_collection, show_issue
 
 app = typer.Typer(no_args_is_help=True, help="Local evidence-oriented contribution reconstruction.")
 import_app = typer.Typer(no_args_is_help=True, help="Import full source snapshots.")
@@ -414,6 +418,169 @@ def jira_status(
         connection.close()
 
 
+@jira_app.command("search")
+def jira_search(
+    collection_id: str,
+    query: str,
+    limit: Annotated[int, typer.Option("--limit")] = 20,
+    cursor: Annotated[str | None, typer.Option("--cursor")] = None,
+    expected_view_token: Annotated[str | None, typer.Option("--expected-view-token")] = None,
+    config: ConfigOption = None,
+) -> None:
+    _configuration, connection, _ = _open(config)
+    try:
+        _emit(
+            search_collection(
+                connection,
+                collection_id,
+                query,
+                limit=limit,
+                cursor=cursor,
+                expected_view_token=expected_view_token,
+            )
+        )
+    finally:
+        connection.close()
+
+
+@jira_app.command("show")
+def jira_show(collection_id: str, issue_id: str, config: ConfigOption = None) -> None:
+    configuration, connection, _ = _open(config)
+    del configuration
+    try:
+        _emit(show_issue(connection, collection_id, issue_id))
+    finally:
+        connection.close()
+
+
+def _vault_key_for_config(configuration: WorkTraceConfig) -> bytes:
+    installation_id = (
+        "install:" + hashlib.sha256(str(configuration.config_path).encode("utf-8")).hexdigest()[:32]
+    )
+    return MacOSKeychain.open(installation_id).get(1) or MacOSKeychain.open(installation_id).ensure(
+        1
+    )
+
+
+@jira_app.command("attachment-export")
+def jira_attachment_export(
+    collection_id: str,
+    attachment_id: str,
+    output: Annotated[Path, typer.Option("--output", dir_okay=False)],
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+    config: ConfigOption = None,
+) -> None:
+    if not yes:
+        raise typer.Exit(3)
+    configuration, connection, _ = _open(config)
+    try:
+        row = connection.execute(
+            "SELECT a.*, c.vault_id FROM jira_attachment_objects a "
+            "JOIN jira_collections c ON c.id=a.collection_id "
+            "WHERE a.collection_id=? AND a.attachment_id=? ORDER BY a.revision_id DESC LIMIT 1",
+            (collection_id, attachment_id),
+        ).fetchone()
+        if row is None or row["vault_object_path"] is None:
+            raise WorkTraceError("attachment original is unavailable")
+        destination = export_attachment(
+            source=configuration.data_directory / "jira-vault" / str(row["vault_object_path"]),
+            destination=output,
+            vault_root=configuration.data_directory / "jira-vault",
+            key=_vault_key_for_config(configuration),
+            expected_ciphertext_sha256=row["ciphertext_sha256"],
+            collection_id=collection_id,
+            revision_id=str(row["revision_id"]),
+            object_id=str(row["vault_object_id"]),
+        )
+        _emit(
+            {
+                "schema_version": 1,
+                "collection_id": collection_id,
+                "attachment_id": attachment_id,
+                "destination": destination.name,
+                "verified": True,
+            }
+        )
+    finally:
+        connection.close()
+
+
+@jira_app.command("backup")
+def jira_backup(
+    collection_id: str,
+    output: Annotated[Path, typer.Option("--output", file_okay=False)],
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+    passphrase: Annotated[str, typer.Option("--passphrase", hidden=True)] = "",
+    config: ConfigOption = None,
+) -> None:
+    if not yes or not passphrase:
+        raise typer.Exit(3)
+    configuration, connection, _ = _open(config)
+    try:
+        row = connection.execute(
+            "SELECT c.*, r.id AS revision_id FROM jira_collections c "
+            "JOIN jira_archive_revisions r ON r.collection_id=c.id "
+            "WHERE c.id=? ORDER BY r.revision_number DESC LIMIT 1",
+            (collection_id,),
+        ).fetchone()
+        if row is None:
+            raise WorkTraceError("Jira collection was not found")
+        key = _vault_key_for_config(configuration)
+        backup = create_epoch_backup(
+            database_path=configuration.database_path,
+            config_path=configuration.config_path,
+            hmac_key_path=configuration.data_directory / "email-hmac.key",
+            vault_root=configuration.data_directory / "jira-vault",
+            output=output,
+            collection_id=collection_id,
+            revision_id=str(row["revision_id"]),
+            installation_id="install:"
+            + hashlib.sha256(str(configuration.config_path).encode()).hexdigest()[:32],
+            vault_id=str(row["vault_id"]),
+            key_versions={1: key},
+            passphrase=passphrase,
+        )
+        _emit(
+            {
+                key: backup.manifest[key]
+                for key in (
+                    "schema_version",
+                    "epoch_id",
+                    "collection_id",
+                    "revision_id",
+                    "sqlite_sha256",
+                    "config_binding_sha256",
+                    "hmac_binding_sha256",
+                    "vault_manifest_sha256",
+                    "ciphertext_count",
+                    "key_versions",
+                    "recovery_envelope_sha256",
+                    "complete",
+                )
+                if key in backup.manifest
+            }
+            | {
+                "schema_version": 1,
+                "collection_id": collection_id,
+                "revision_id": str(row["revision_id"]),
+            }
+        )
+    finally:
+        connection.close()
+
+
+@jira_app.command("restore")
+def jira_restore(
+    input: Annotated[Path, typer.Option("--input", file_okay=False)],
+    destination: Annotated[Path, typer.Option("--destination", file_okay=False)],
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+    passphrase: Annotated[str, typer.Option("--passphrase", hidden=True)] = "",
+) -> None:
+    if not yes or not passphrase:
+        raise typer.Exit(3)
+    _emit(restore_epoch(epoch=input, destination=destination, passphrase=passphrase))
+
+
 def _sanitize_tui_environment() -> None:
     for name in _TUI_ENVIRONMENT_VARIABLES:
         os.environ.pop(name, None)
@@ -423,6 +590,7 @@ def _sanitize_tui_environment() -> None:
 def launch_ui(
     app_id: Annotated[str | None, typer.Option("--app")] = None,
     candidate_id: Annotated[str | None, typer.Option("--candidate")] = None,
+    jira_collection: Annotated[str | None, typer.Option("--jira-collection")] = None,
     config: ConfigOption = None,
 ) -> None:
     """Review contribution evidence in an interactive, read-only terminal UI."""
@@ -430,6 +598,11 @@ def launch_ui(
     if candidate_id is not None and app_id is None:
         typer.echo("error: --candidate requires --app", err=True)
         raise typer.Exit(2)
+    if jira_collection is not None and (app_id is not None or candidate_id is not None):
+        typer.echo(
+            "error: --jira-collection is mutually exclusive with --app/--candidate", err=True
+        )
+        raise typer.Exit(3)
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         typer.echo("error: worktrace ui requires an interactive terminal", err=True)
         typer.echo("Use `worktrace --help` for non-interactive commands.", err=True)
@@ -443,6 +616,8 @@ def launch_ui(
             from worktrace.mcp_server.schemas import stable_id
 
             stable_id(candidate_id, "candidate_id")
+        if jira_collection is not None:
+            stable_id(jira_collection, "collection_id")
     except WorkTraceError as exc:
         typer.echo(f"error: {exc}", err=True)
         typer.echo("Run `worktrace doctor` from the CLI, then retry.", err=True)
@@ -462,6 +637,7 @@ def launch_ui(
         ReadOnlyWorkspace(configuration),
         initial_app_id=app_id,
         initial_candidate_id=candidate_id,
+        initial_jira_collection=jira_collection,
     )
 
 
