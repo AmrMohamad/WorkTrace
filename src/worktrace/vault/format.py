@@ -7,6 +7,7 @@ import shutil
 import struct
 import tempfile
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -189,6 +190,20 @@ def _key(key: bytes) -> bytes:
     return key
 
 
+def _absolute(path: Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _assert_no_symlink_chain(path: Path) -> None:
+    path = _absolute(path)
+    for item in [*list(reversed(path.parents)), path]:
+        try:
+            if item.is_symlink():
+                raise VaultFormatError(f"vault path contains a symlink: {item}")
+        except OSError as exc:
+            raise VaultFormatError("vault path cannot be inspected safely") from exc
+
+
 def _write_record(
     output: BinaryIO,
     ciphertext: bytes,
@@ -209,6 +224,7 @@ def write_vault_object(
     descriptor: VaultDescriptor,
     key: bytes,
     *,
+    vault_root: Path,
     checkpoint: CheckpointCallback | None = None,
 ) -> VaultObjectResult:
     """Encrypt one stream and publish it atomically without replacing a destination."""
@@ -218,8 +234,20 @@ def write_vault_object(
     header = bindings.crypto_secretstream_xchacha20poly1305_init_push(state, _key(key))
     if len(header) != HEADER_BYTES:
         raise VaultFormatError("secretstream returned an invalid header")
-    destination = destination.expanduser().resolve()
+    vault_root = _absolute(vault_root)
+    destination = _absolute(destination)
+    _assert_no_symlink_chain(vault_root)
+    if vault_root.is_symlink() or not vault_root.is_dir():
+        raise VaultFormatError("vault root must be a real directory")
+    _assert_no_symlink_chain(destination)
+    try:
+        destination.relative_to(vault_root)
+    except ValueError as exc:
+        raise VaultFormatError("vault object destination escapes the vault root") from exc
+    if destination == vault_root:
+        raise VaultFormatError("vault object destination must be below the vault root")
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _assert_no_symlink_chain(destination.parent)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(destination)
     temporary: Path | None = None
@@ -309,6 +337,39 @@ def decrypt_vault_object(
     *,
     expected_ciphertext_sha256: str | None = None,
 ) -> VaultObjectResult:
+    return _process_vault_object(
+        source,
+        key,
+        sink,
+        expected_ciphertext_sha256=expected_ciphertext_sha256,
+        stage_plaintext=True,
+    )
+
+
+def verify_vault_object(
+    source: BinaryIO,
+    key: bytes,
+    *,
+    expected_ciphertext_sha256: str | None = None,
+) -> VaultObjectResult:
+    """Authenticate and hash an object without materializing plaintext."""
+    return _process_vault_object(
+        source,
+        key,
+        None,
+        expected_ciphertext_sha256=expected_ciphertext_sha256,
+        stage_plaintext=False,
+    )
+
+
+def _process_vault_object(
+    source: BinaryIO,
+    key: bytes,
+    sink: BinaryIO | None,
+    *,
+    expected_ciphertext_sha256: str | None,
+    stage_plaintext: bool,
+) -> VaultObjectResult:
     bindings = _bindings()
     file_hash = hashlib.sha256()
     prefix = _read_exact(source, 9, "header")
@@ -332,7 +393,9 @@ def decrypt_vault_object(
     plain_hash = hashlib.sha256()
     plain_length = 0
     saw_final = False
-    with tempfile.TemporaryFile(mode="w+b") as verified_plaintext:
+    with (
+        tempfile.TemporaryFile(mode="w+b") if stage_plaintext else nullcontext()
+    ) as verified_plaintext:
         while True:
             length_bytes = source.read(_RECORD_HEADER.size)
             if length_bytes == b"":
@@ -359,7 +422,8 @@ def decrypt_vault_object(
                 saw_final = True
             elif tag != bindings.crypto_secretstream_xchacha20poly1305_TAG_MESSAGE:
                 raise VaultIntegrityError("vault record has an invalid tag")
-            verified_plaintext.write(plaintext)
+            if verified_plaintext is not None:
+                verified_plaintext.write(plaintext)
             plain_hash.update(plaintext)
             plain_length += len(plaintext)
         if source.read(1) != b"":
@@ -374,8 +438,11 @@ def decrypt_vault_object(
         ciphertext_hash = file_hash.hexdigest()
         if expected_ciphertext_sha256 is not None and ciphertext_hash != expected_ciphertext_sha256:
             raise VaultIntegrityError("vault ciphertext hash does not match its manifest")
-        verified_plaintext.seek(0)
-        shutil.copyfileobj(verified_plaintext, sink)
+        if verified_plaintext is not None:
+            if sink is None:
+                raise VaultFormatError("verified plaintext sink is missing")
+            verified_plaintext.seek(0)
+            shutil.copyfileobj(verified_plaintext, sink)
         return VaultObjectResult(descriptor, ciphertext_hash, plain_length)
 
 

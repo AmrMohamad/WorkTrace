@@ -23,6 +23,8 @@ class ResourceCheckpoint:
     attempt: int
     raw_vault_object_id: str | None
     raw_vault_object_path: str | None
+    raw_vault_ciphertext_sha256: str | None
+    raw_vault_key_version: int | None
     redaction_version: str
     source_updated_at: str | None
     fetched_at: str | None

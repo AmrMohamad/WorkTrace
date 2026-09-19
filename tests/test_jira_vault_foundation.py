@@ -13,24 +13,39 @@ import pytest
 from worktrace.archive.jira.repository import JiraArchiveRepository
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate, migrations, user_version
-from worktrace.errors import DatabaseError, KeychainError, RecoveryError, VaultIntegrityError
+from worktrace.errors import (
+    DatabaseError,
+    KeychainError,
+    RecoveryError,
+    VaultFormatError,
+    VaultIntegrityError,
+)
 from worktrace.vault.backup import create_epoch_backup, restore_epoch
 from worktrace.vault.format import (
     DEFAULT_CHUNK_SIZE,
     VaultDescriptor,
+    VaultObjectResult,
     decrypt_vault_object,
     read_vault_object,
+    verify_vault_object,
     write_vault_object,
 )
 from worktrace.vault.keychain import KEYCHAIN_SERVICE, MacOSKeychain
 from worktrace.vault.recovery import create_recovery_envelope, open_recovery_envelope
 
 
-def _descriptor(data: bytes, *, object_id: str = "jatt:test") -> VaultDescriptor:
+def _descriptor(
+    data: bytes,
+    *,
+    object_id: str = "jatt:test",
+    site_id: str = "jira-site:test",
+    collection_id: str = "jcol:test",
+    revision_id: str = "jrev:jcol:test:1",
+) -> VaultDescriptor:
     return VaultDescriptor(
-        site_id="jira-site:test",
-        collection_id="jcol:test",
-        revision_id="jrev:jcol:test:1",
+        site_id=site_id,
+        collection_id=collection_id,
+        revision_id=revision_id,
         object_id=object_id,
         kind="attachment_original",
         content_length=len(data),
@@ -137,7 +152,12 @@ def test_vault_stream_roundtrip_checkpoint_and_empty_object(tmp_path: Path) -> N
     path = tmp_path / "object.wtva"
     checkpoints = []
     result = write_vault_object(
-        BytesIO(data), path, _descriptor(data), key, checkpoint=checkpoints.append
+        BytesIO(data),
+        path,
+        _descriptor(data),
+        key,
+        vault_root=tmp_path,
+        checkpoint=checkpoints.append,
     )
     assert result.plaintext_length == len(data)
     assert checkpoints
@@ -145,7 +165,13 @@ def test_vault_stream_roundtrip_checkpoint_and_empty_object(tmp_path: Path) -> N
 
     empty = b""
     empty_path = tmp_path / "empty.wtva"
-    write_vault_object(BytesIO(empty), empty_path, _descriptor(empty, object_id="jatt:empty"), key)
+    write_vault_object(
+        BytesIO(empty),
+        empty_path,
+        _descriptor(empty, object_id="jatt:empty"),
+        key,
+        vault_root=tmp_path,
+    )
     assert read_vault_object(empty_path, key) == b""
 
 
@@ -155,7 +181,7 @@ def test_vault_rejects_wrong_key_corruption_truncation_reorder_and_trailing_byte
     key = b"k" * 32
     data = b"a" * (DEFAULT_CHUNK_SIZE * 2 + 17)
     path = tmp_path / "object.wtva"
-    write_vault_object(BytesIO(data), path, _descriptor(data), key)
+    write_vault_object(BytesIO(data), path, _descriptor(data), key, vault_root=tmp_path)
     raw = path.read_bytes()
 
     with pytest.raises(VaultIntegrityError):
@@ -200,19 +226,107 @@ def test_vault_interrupted_writer_does_not_publish_partial_object(tmp_path: Path
     data = b"x" * (DEFAULT_CHUNK_SIZE + 1)
     destination = tmp_path / "object.wtva"
     with pytest.raises(OSError):
-        write_vault_object(FailingSource(data), destination, _descriptor(data), b"k" * 32)
+        write_vault_object(
+            FailingSource(data), destination, _descriptor(data), b"k" * 32, vault_root=tmp_path
+        )
     assert not destination.exists()
     assert not list(tmp_path.glob(".wtva-*"))
 
-    write_vault_object(BytesIO(b"x"), destination, _descriptor(b"x"), b"k" * 32)
+    write_vault_object(
+        BytesIO(b"x"), destination, _descriptor(b"x"), b"k" * 32, vault_root=tmp_path
+    )
     with pytest.raises(FileExistsError):
-        write_vault_object(BytesIO(b"x"), destination, _descriptor(b"x"), b"k" * 32)
+        write_vault_object(
+            BytesIO(b"x"), destination, _descriptor(b"x"), b"k" * 32, vault_root=tmp_path
+        )
+
+
+def test_vault_publication_requires_a_real_root_and_parent_chain(tmp_path: Path) -> None:
+    data = b"boundary"
+    real_root = tmp_path / "real-vault"
+    real_root.mkdir()
+    root_link = tmp_path / "root-link"
+    root_link.symlink_to(real_root, target_is_directory=True)
+    with pytest.raises(VaultFormatError):
+        write_vault_object(
+            BytesIO(data),
+            root_link / "object.wtva",
+            _descriptor(data),
+            b"k" * 32,
+            vault_root=root_link,
+        )
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    parent_link = real_root / "nested"
+    parent_link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(VaultFormatError):
+        write_vault_object(
+            BytesIO(data),
+            parent_link / "object.wtva",
+            _descriptor(data),
+            b"k" * 32,
+            vault_root=real_root,
+        )
+    with pytest.raises(VaultFormatError):
+        write_vault_object(
+            BytesIO(data),
+            outside / "escape.wtva",
+            _descriptor(data),
+            b"k" * 32,
+            vault_root=real_root,
+        )
+
+
+def test_backup_copy_streams_without_path_read_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import worktrace.vault.backup as backup_module
+
+    source = tmp_path / "large-source.bin"
+    destination = tmp_path / "copy" / "large-destination.bin"
+    payload = b"streamed" * (1024 * 1024 // 8 + 1)
+    source.write_bytes(payload)
+
+    def fail_read_bytes(self: Path) -> bytes:
+        raise AssertionError("ciphertext copy must not use Path.read_bytes")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    backup_module._copy_private(source, destination)
+    assert destination.stat().st_mode & 0o777 == 0o600
+    assert destination.stat().st_size == len(payload)
+    monkeypatch.undo()
+    assert destination.read_bytes() == payload
+
+
+def test_backup_verification_does_not_allocate_plaintext_tempfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import worktrace.vault.format as format_module
+
+    data = b"verification-only" * 100
+    path = tmp_path / "object.wtva"
+    result = write_vault_object(
+        BytesIO(data), path, _descriptor(data), b"k" * 32, vault_root=tmp_path
+    )
+
+    def fail_temporary_file(*args: object, **kwargs: object) -> object:
+        raise AssertionError("verification must not allocate a plaintext TemporaryFile")
+
+    monkeypatch.setattr(format_module.tempfile, "TemporaryFile", fail_temporary_file)
+    with path.open("rb") as source:
+        verified = verify_vault_object(
+            source, b"k" * 32, expected_ciphertext_sha256=result.ciphertext_sha256
+        )
+    assert verified.ciphertext_sha256 == result.ciphertext_sha256
 
 
 def test_corrupt_vault_never_publishes_partial_plaintext(tmp_path: Path) -> None:
     data = b"verified only after final tag"
     path = tmp_path / "object.wtva"
-    result = write_vault_object(BytesIO(data), path, _descriptor(data), b"k" * 32)
+    result = write_vault_object(
+        BytesIO(data), path, _descriptor(data), b"k" * 32, vault_root=tmp_path
+    )
     corrupt = bytearray(path.read_bytes())
     corrupt[-1] ^= 1
     path.write_bytes(corrupt)
@@ -328,19 +442,21 @@ def test_epoch_backup_restore_and_tamper_refusal(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     vault.mkdir()
     data = b"original"
-    write_vault_object(
+    object_result = write_vault_object(
         BytesIO(data),
         vault / "object.wtva",
-        _descriptor(data),
+        _descriptor(data, site_id=site_id, collection_id=collection_id, revision_id=revision_id),
         b"k" * 32,
+        vault_root=vault,
     )
     connection = connect(database)
     try:
         connection.execute(
             "INSERT INTO jira_attachment_objects "
             "(id, collection_id, revision_id, issue_id, attachment_id, archive_evidence_id, "
-            "filename, manifest_sha256, original_state, extracted_state, source_locator, "
-            "vault_object_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "filename, manifest_sha256, original_state, vault_object_id, vault_object_path, "
+            "vault_key_version, ciphertext_sha256, extracted_state, source_locator) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "jatt:test",
                 collection_id,
@@ -351,8 +467,11 @@ def test_epoch_backup_restore_and_tamper_refusal(tmp_path: Path) -> None:
                 "object.bin",
                 "manifest",
                 "complete",
-                "not_requested",
+                "jatt:test",
                 "object.wtva",
+                1,
+                object_result.ciphertext_sha256,
+                "not_requested",
                 "object.wtva",
             ),
         )
@@ -490,14 +609,21 @@ def test_epoch_backup_holds_single_writer_quiescence(
     vault = tmp_path / "vault"
     vault.mkdir()
     data = b"quiesced"
-    write_vault_object(BytesIO(data), vault / "object.wtva", _descriptor(data), b"k" * 32)
+    object_result = write_vault_object(
+        BytesIO(data),
+        vault / "object.wtva",
+        _descriptor(data, site_id=site_id, collection_id=collection_id, revision_id=revision_id),
+        b"k" * 32,
+        vault_root=vault,
+    )
     connection = connect(database)
     try:
         connection.execute(
             "INSERT INTO jira_attachment_objects "
             "(id, collection_id, revision_id, issue_id, attachment_id, archive_evidence_id, "
-            "filename, manifest_sha256, original_state, extracted_state, source_locator, "
-            "vault_object_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "filename, manifest_sha256, original_state, vault_object_id, vault_object_path, "
+            "vault_key_version, ciphertext_sha256, extracted_state, source_locator) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "jatt:test",
                 collection_id,
@@ -508,8 +634,11 @@ def test_epoch_backup_holds_single_writer_quiescence(
                 "object.bin",
                 "manifest",
                 "complete",
-                "not_requested",
+                "jatt:test",
                 "object.wtva",
+                1,
+                object_result.ciphertext_sha256,
+                "not_requested",
                 "object.wtva",
             ),
         )
@@ -524,13 +653,13 @@ def test_epoch_backup_holds_single_writer_quiescence(
     release = threading.Event()
     calls = 0
 
-    def blocking_verify(root: Path, inventory: dict[str, str], keys: dict[int, bytes]) -> None:
+    def blocking_verify(root: Path, identity: dict[str, object], keys: dict[int, bytes]) -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
             reached.set()
             assert release.wait(3)
-        original_verify(root, inventory, keys)
+        original_verify(root, identity, keys)
 
     monkeypatch.setattr(backup_module, "_verify_vault_inventory", blocking_verify)
     errors: list[BaseException] = []
@@ -598,8 +727,8 @@ def test_epoch_backup_isolates_referenced_objects_by_collection_and_revision(
             connection.execute(
                 "INSERT INTO jira_attachment_objects "
                 "(id, collection_id, revision_id, issue_id, attachment_id, archive_evidence_id, "
-                "filename, manifest_sha256, original_state, extracted_state, source_locator, "
-                "vault_object_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "filename, manifest_sha256, original_state, vault_object_id, extracted_state, "
+                "source_locator, vault_object_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     f"jatt:{index}",
                     collection,
@@ -610,6 +739,7 @@ def test_epoch_backup_isolates_referenced_objects_by_collection_and_revision(
                     "object.bin",
                     "manifest",
                     "complete",
+                    f"jatt:{index}",
                     "not_requested",
                     f"{collection}/object.wtva",
                     f"{collection}/object.wtva",
@@ -623,14 +753,35 @@ def test_epoch_backup_isolates_referenced_objects_by_collection_and_revision(
     hmac_key = tmp_path / "email-hmac.key"
     hmac_key.write_bytes(b"h" * 64)
     vault = tmp_path / "vault"
+    vault.mkdir()
+    object_results: dict[str, VaultObjectResult] = {}
     for index, (collection, _) in enumerate(collections, start=1):
         data = f"object-{index}".encode()
-        write_vault_object(
+        object_results[collection] = write_vault_object(
             BytesIO(data),
             vault / collection / "object.wtva",
-            _descriptor(data, object_id=f"jatt:{index}"),
+            _descriptor(
+                data,
+                object_id=f"jatt:{index}",
+                site_id=site_id,
+                collection_id=collection,
+                revision_id=collections[index - 1][1],
+            ),
             b"k" * 32,
+            vault_root=vault,
         )
+    connection = connect(database)
+    try:
+        for _index, (collection, _) in enumerate(collections, start=1):
+            result = object_results[collection]
+            connection.execute(
+                "UPDATE jira_attachment_objects SET ciphertext_sha256=?, vault_key_version=? "
+                "WHERE collection_id=?",
+                (result.ciphertext_sha256, 1, collection),
+            )
+        connection.commit()
+    finally:
+        connection.close()
     epoch = tmp_path / "epoch"
     create_epoch_backup(
         database_path=database,
@@ -647,3 +798,39 @@ def test_epoch_backup_isolates_referenced_objects_by_collection_and_revision(
     )
     manifest = json.loads((epoch / "epoch.json").read_text(encoding="utf-8"))
     assert set(manifest["vault_inventory"]) == {f"{collections[0][0]}/object.wtva"}
+
+    first_path = vault / collections[0][0] / "object.wtva"
+    second_path = vault / collections[1][0] / "object.wtva"
+    first_bytes = first_path.read_bytes()
+    second_bytes = second_path.read_bytes()
+    first_path.write_bytes(second_bytes)
+    second_path.write_bytes(first_bytes)
+    connection = connect(database)
+    try:
+        first_hash = object_results[collections[0][0]].ciphertext_sha256
+        second_hash = object_results[collections[1][0]].ciphertext_sha256
+        connection.execute(
+            "UPDATE jira_attachment_objects SET ciphertext_sha256=? WHERE collection_id=?",
+            (second_hash, collections[0][0]),
+        )
+        connection.execute(
+            "UPDATE jira_attachment_objects SET ciphertext_sha256=? WHERE collection_id=?",
+            (first_hash, collections[1][0]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(VaultIntegrityError, match="descriptor identity mismatch"):
+        create_epoch_backup(
+            database_path=database,
+            config_path=config,
+            hmac_key_path=hmac_key,
+            vault_root=vault,
+            output=tmp_path / "swapped-epoch",
+            collection_id=collections[0][0],
+            revision_id=collections[0][1],
+            installation_id="install:test",
+            vault_id="vault:1",
+            key_versions={1: b"k" * 32},
+            passphrase="passphrase-12",
+        )

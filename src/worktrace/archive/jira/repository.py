@@ -145,6 +145,8 @@ class JiraArchiveRepository:
         error: Mapping[str, object] | None = None,
         raw_vault_object_id: str | None = None,
         raw_vault_object_path: str | None = None,
+        raw_vault_ciphertext_sha256: str | None = None,
+        raw_vault_key_version: int | None = None,
     ) -> None:
         """Atomically publish one resource checkpoint and its progress boundary."""
         if seen_count < 0 or attempt < 0:
@@ -153,7 +155,8 @@ class JiraArchiveRepository:
             updated = self.connection.execute(
                 "UPDATE jira_resource_states SET state=?, completeness=?, availability=?, "
                 "seen_count=?, page_cursor=?, attempt=?, fetched_at=?, error_json=?, "
-                "raw_vault_object_id=?, raw_vault_object_path=? WHERE id=?",
+                "raw_vault_object_id=?, raw_vault_object_path=?, "
+                "raw_vault_ciphertext_sha256=?, raw_vault_key_version=? WHERE id=?",
                 (
                     state,
                     completeness,
@@ -165,6 +168,8 @@ class JiraArchiveRepository:
                     _json(error) if error is not None else None,
                     raw_vault_object_id,
                     raw_vault_object_path,
+                    raw_vault_ciphertext_sha256,
+                    raw_vault_key_version,
                     resource_id,
                 ),
             )
@@ -183,7 +188,10 @@ class JiraArchiveRepository:
         locator: Mapping[str, object],
         role: str,
         redaction_version: str,
+        raw_vault_object_id: str | None = None,
         raw_vault_object_path: str | None = None,
+        raw_vault_ciphertext_sha256: str | None = None,
+        raw_vault_key_version: int | None = None,
         state: str = "planned",
     ) -> None:
         with self.connection:
@@ -191,8 +199,9 @@ class JiraArchiveRepository:
                 "INSERT INTO jira_resource_states "
                 "(id, collection_id, revision_id, run_id, archive_evidence_id, issue_id, kind, "
                 "locator_json, role, state, completeness, availability, redaction_version, "
-                "raw_vault_object_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', "
-                "'unknown', ?, ?)",
+                "raw_vault_object_id, raw_vault_object_path, raw_vault_ciphertext_sha256, "
+                "raw_vault_key_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', "
+                "'unknown', ?, ?, ?, ?, ?)",
                 (
                     resource_id,
                     collection_id,
@@ -205,7 +214,10 @@ class JiraArchiveRepository:
                     role,
                     state,
                     redaction_version,
+                    raw_vault_object_id,
                     raw_vault_object_path,
+                    raw_vault_ciphertext_sha256,
+                    raw_vault_key_version,
                 ),
             )
 
@@ -213,7 +225,8 @@ class JiraArchiveRepository:
         row = self.connection.execute(
             "SELECT id, collection_id, revision_id, run_id, issue_id, kind, locator_json, state, "
             "completeness, availability, expected_count, seen_count, page_cursor, attempt, "
-            "raw_vault_object_id, raw_vault_object_path, redaction_version, "
+            "raw_vault_object_id, raw_vault_object_path, raw_vault_ciphertext_sha256, "
+            "raw_vault_key_version, redaction_version, "
             "source_updated_at, fetched_at, error_json "
             "FROM jira_resource_states WHERE id=?",
             (resource_id,),

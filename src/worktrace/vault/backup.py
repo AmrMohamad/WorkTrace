@@ -5,15 +5,17 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
 from worktrace.db.migrations import backup_database, user_version
 from worktrace.errors import RecoveryError, VaultIntegrityError
-from worktrace.vault.format import decrypt_vault_object, read_vault_descriptor
+from worktrace.vault.format import read_vault_descriptor, verify_vault_object
 from worktrace.vault.recovery import create_recovery_envelope, open_recovery_envelope
 
 
@@ -45,9 +47,15 @@ def _canonical(value: Mapping[str, object]) -> bytes:
 
 def _write_private(path: Path, data: bytes) -> None:
     _assert_no_symlink_chain(path)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
     try:
-        os.write(descriptor, data)
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("private file write made no progress")
+            view = view[written:]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -59,7 +67,36 @@ def _copy_private(source: Path, destination: Path) -> None:
     if source.is_symlink() or not source.is_file():
         raise VaultIntegrityError(f"backup source is not a regular file: {source.name}")
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _write_private(destination, source.read_bytes())
+    _assert_no_symlink_chain(destination.parent)
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    source_fd = os.open(source, source_flags)
+    destination_fd: int | None = None
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise VaultIntegrityError(f"backup source is not a regular file: {source.name}")
+        destination_fd = os.open(destination, destination_flags, 0o600)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise OSError("private file copy made no progress")
+                view = view[written:]
+        os.fsync(destination_fd)
+    except BaseException:
+        if destination_fd is not None:
+            with suppress(FileNotFoundError):
+                os.unlink(destination)
+        raise
+    finally:
+        os.close(source_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
 
 
 def _inventory(root: Path) -> dict[str, str]:
@@ -103,13 +140,17 @@ def _epoch_identity(
     vault_id: str,
     key_versions: Mapping[int, bytes],
 ) -> dict[str, object]:
-    row = connection.execute(
+    archive_row = connection.execute(
         "SELECT c.site_id, c.id, c.vault_id, r.id, r.collection_id "
         "FROM jira_collections c JOIN jira_archive_revisions r "
         "ON r.collection_id=c.id WHERE c.id=? AND r.id=?",
         (collection_id, revision_id),
     ).fetchone()
-    if row is None or str(row[2]) != vault_id or str(row[4]) != collection_id:
+    if (
+        archive_row is None
+        or str(archive_row[2]) != vault_id
+        or str(archive_row[4]) != collection_id
+    ):
         raise RecoveryError("SQLite archive identity does not match the requested epoch")
     if connection.execute(
         "SELECT COUNT(*) FROM jira_collection_runs WHERE collection_id=? AND status='running'",
@@ -123,26 +164,55 @@ def _epoch_identity(
         raise RecoveryError("cannot back up while an archive resource is fetching")
     if not key_versions or any(len(key) != 32 for key in key_versions.values()):
         raise RecoveryError("epoch key versions are missing or malformed")
-    paths = {
-        str(row[0])
-        for row in connection.execute(
-            "SELECT raw_vault_object_path FROM jira_resource_states "
-            "WHERE collection_id=? AND revision_id=? AND raw_vault_object_path IS NOT NULL "
-            "UNION SELECT vault_object_path FROM jira_attachment_objects "
-            "WHERE collection_id=? AND revision_id=? AND vault_object_path IS NOT NULL",
-            (collection_id, revision_id, collection_id, revision_id),
+    objects: list[dict[str, object]] = []
+    rows = connection.execute(
+        "SELECT raw_vault_object_path, raw_vault_object_id, raw_vault_ciphertext_sha256, "
+        "raw_vault_key_version, kind FROM jira_resource_states WHERE collection_id=? "
+        "AND revision_id=? "
+        "UNION ALL SELECT vault_object_path, vault_object_id, ciphertext_sha256, "
+        "vault_key_version, 'attachment_original' FROM jira_attachment_objects "
+        "WHERE collection_id=? AND revision_id=?",
+        (collection_id, revision_id, collection_id, revision_id),
+    )
+    for object_row in rows:
+        relative_path, object_id, ciphertext_hash, key_version, kind = object_row
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or Path(relative_path).is_absolute()
+            or ".." in Path(relative_path).parts
+            or str(Path(relative_path)) != relative_path
+            or not isinstance(object_id, str)
+            or not object_id
+            or not isinstance(ciphertext_hash, str)
+            or len(ciphertext_hash) != 64
+            or ciphertext_hash != ciphertext_hash.lower()
+            or not isinstance(key_version, int)
+            or key_version < 1
+            or not isinstance(kind, str)
+            or not kind
+        ):
+            raise RecoveryError("archive vault object manifest is incomplete or unsafe")
+        objects.append(
+            {
+                "relative_path": relative_path,
+                "object_id": object_id,
+                "ciphertext_sha256": ciphertext_hash,
+                "key_version": key_version,
+                "kind": kind,
+            }
         )
-    }
-    if any(not path or Path(path).is_absolute() or ".." in Path(path).parts for path in paths):
-        raise RecoveryError("archive vault object paths are not safe relative paths")
+    if len({str(item["relative_path"]) for item in objects}) != len(objects):
+        raise RecoveryError("archive vault object manifest has duplicate paths")
+    objects.sort(key=lambda item: str(item["relative_path"]))
     return {
-        "site_ids": [str(row[0])],
+        "site_ids": [str(archive_row[0])],
         "collection_ids": [collection_id],
         "revision_ids": [revision_id],
         "vault_id": vault_id,
         "key_versions": sorted(key_versions),
         "ledger_schema_version": 7,
-        "vault_object_paths": sorted(paths),
+        "vault_objects": objects,
     }
 
 
@@ -168,24 +238,28 @@ def _verify_sqlite_identity(database_path: Path, *, identity: Mapping[str, objec
             or str(row[1]) != identity["vault_id"]
         ):
             raise RecoveryError("epoch SQLite identity does not match its manifest")
-        paths = {
-            str(item[0])
-            for item in connection.execute(
-                "SELECT raw_vault_object_path FROM jira_resource_states "
-                "WHERE collection_id=? AND revision_id=? AND raw_vault_object_path IS NOT NULL "
-                "UNION SELECT vault_object_path FROM jira_attachment_objects "
-                "WHERE collection_id=? AND revision_id=? AND vault_object_path IS NOT NULL",
-                (collection_id, revision_id, collection_id, revision_id),
-            )
-        }
-        if sorted(paths) != identity["vault_object_paths"]:
-            raise RecoveryError("epoch SQLite vault object paths do not match its manifest")
+        expected_objects = cast(list[dict[str, object]], identity["vault_objects"])
+        actual_objects = _epoch_identity(
+            connection,
+            collection_id=collection_id,
+            revision_id=revision_id,
+            vault_id=str(identity["vault_id"]),
+            key_versions={
+                int(cast(int, version)): b"k" * 32
+                for version in cast(list[object], identity["key_versions"])
+            },
+        )["vault_objects"]
+        if actual_objects != expected_objects:
+            raise RecoveryError("epoch SQLite vault object manifest does not match its identity")
 
 
 def _verify_vault_inventory(
-    root: Path, inventory: Mapping[str, str], keys: Mapping[int, bytes]
+    root: Path, identity: Mapping[str, object], keys: Mapping[int, bytes]
 ) -> None:
-    for relative, expected_hash in sorted(inventory.items()):
+    expected_objects = cast(list[dict[str, object]], identity["vault_objects"])
+    for expected in expected_objects:
+        relative = str(expected["relative_path"])
+        expected_hash = str(expected["ciphertext_sha256"])
         path = root / relative
         _assert_no_symlink_chain(path)
         if _hash(path) != expected_hash:
@@ -195,13 +269,23 @@ def _verify_vault_inventory(
         key = keys.get(descriptor.key_version)
         if key is None:
             raise VaultIntegrityError(f"missing vault key version: {descriptor.key_version}")
-        with path.open("rb") as source, open(os.devnull, "wb") as sink:
-            decrypt_vault_object(source, sink, key, expected_ciphertext_sha256=expected_hash)
+        if (
+            descriptor.site_id != str(cast(list[object], identity["site_ids"])[0])
+            or descriptor.collection_id != str(cast(list[object], identity["collection_ids"])[0])
+            or descriptor.revision_id != str(cast(list[object], identity["revision_ids"])[0])
+            or descriptor.object_id != str(expected["object_id"])
+            or descriptor.kind != str(expected["kind"])
+            or descriptor.key_version != int(cast(int, expected["key_version"]))
+        ):
+            raise VaultIntegrityError(f"vault descriptor identity mismatch: {relative}")
+        with path.open("rb") as source:
+            verify_vault_object(source, key, expected_ciphertext_sha256=expected_hash)
 
 
 def _scoped_inventory(root: Path, identity: Mapping[str, object]) -> dict[str, str]:
     all_inventory = _inventory(root)
-    expected = set(cast(list[str], identity["vault_object_paths"]))
+    expected_objects = cast(list[dict[str, object]], identity["vault_objects"])
+    expected = {str(item["relative_path"]) for item in expected_objects}
     missing = expected - set(all_inventory)
     if missing:
         raise VaultIntegrityError(f"referenced vault objects are missing: {sorted(missing)}")
@@ -256,7 +340,7 @@ def create_epoch_backup(
             key_versions=key_versions,
         )
         source_inventory = _scoped_inventory(vault_root, identity)
-        _verify_vault_inventory(vault_root, source_inventory, key_versions)
+        _verify_vault_inventory(vault_root, identity, key_versions)
         output.mkdir(mode=0o700, parents=True)
         sqlite_destination = output / "worktrace.sqlite3"
         backup_database(database_path, sqlite_destination)
@@ -271,7 +355,7 @@ def create_epoch_backup(
                 raise VaultIntegrityError("vault object changed during backup")
         if _scoped_inventory(vault_root, identity) != source_inventory:
             raise VaultIntegrityError("vault manifest changed during the epoch backup")
-        _verify_vault_inventory(copied_vault, source_inventory, key_versions)
+        _verify_vault_inventory(copied_vault, identity, key_versions)
         if (
             _epoch_identity(
                 guard,
@@ -350,6 +434,13 @@ def restore_epoch(*, epoch: Path, destination: Path, passphrase: str) -> dict[st
         raise RecoveryError("epoch identity hash does not match the manifest")
     recovery_path = epoch / "recovery.wtrk"
     recovery = open_recovery_envelope(recovery_path.read_bytes(), passphrase)
+    if recovery.descriptor["epoch_id"] != manifest.get("epoch_id"):
+        raise RecoveryError("recovery epoch identity does not match the manifest")
+    if (
+        manifest.get("collection_id") != identity["collection_ids"][0]
+        or manifest.get("revision_id") != identity["revision_ids"][0]
+    ):
+        raise RecoveryError("epoch top-level identity does not match its manifest identity")
     recovery_identity = {
         key: recovery.descriptor[key]
         for key in ("site_ids", "collection_ids", "vault_id", "key_versions")
@@ -379,7 +470,7 @@ def restore_epoch(*, epoch: Path, destination: Path, passphrase: str) -> dict[st
         raise RecoveryError("vault inventory does not match the epoch")
     if hashlib.sha256(_canonical(inventory)).hexdigest() != manifest.get("vault_manifest_sha256"):
         raise RecoveryError("vault manifest hash does not match the epoch")
-    _verify_vault_inventory(vault, inventory, recovery.keys)
+    _verify_vault_inventory(vault, identity, recovery.keys)
     staging = destination.parent / f".{destination.name}.restore-{uuid.uuid4().hex}"
     _assert_no_symlink_chain(staging)
     staging.mkdir(mode=0o700, parents=False)
@@ -397,7 +488,7 @@ def restore_epoch(*, epoch: Path, destination: Path, passphrase: str) -> dict[st
         for relative in sorted(inventory):
             _copy_private(vault / relative, restored_vault / relative)
         _verify_sqlite_identity(staging / "worktrace.sqlite3", identity=identity)
-        _verify_vault_inventory(restored_vault, inventory, recovery.keys)
+        _verify_vault_inventory(restored_vault, identity, recovery.keys)
         os.rename(staging, destination)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
