@@ -15,6 +15,7 @@ _SYNTHETIC_OVERRIDES = {
     "WORKTRACE_JIRA_API_TOKEN": "synthetic-jira-token",
     "WORKTRACE_JIRA_NEW_CREDENTIAL": "synthetic-future-jira",
     "WORKTRACE_GITLAB_TOKEN": "synthetic-gitlab-token",
+    "WORKTRACE_GITLAB_OAUTH_TOKEN": "synthetic-gitlab-oauth-token",
     "WORKTRACE_GITLAB_NEW_CREDENTIAL": "synthetic-future-gitlab",
     "WORKTRACE_EMAIL_HMAC_KEY": "synthetic-hmac-key",
     "WORKTRACE_EMAIL_HMAC_FUTURE": "synthetic-future-hmac",

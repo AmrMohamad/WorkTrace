@@ -240,8 +240,23 @@ def test_repair_cli_dry_run_stale_proposal_and_apply_preserve_evidence(tmp_path:
     assert identity["requires_rereview"]
 
 
+@pytest.mark.parametrize(
+    ("gitlab_variable", "expected_header", "expected_value"),
+    (
+        ("WORKTRACE_GITLAB_TOKEN", "PRIVATE-TOKEN", "synthetic-gitlab-token"),
+        (
+            "WORKTRACE_GITLAB_OAUTH_TOKEN",
+            "Authorization",
+            "Bearer synthetic-gitlab-token",
+        ),
+    ),
+)
 def test_repair_verifies_providers_only_when_explicitly_requested(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gitlab_variable: str,
+    expected_header: str,
+    expected_value: str,
 ) -> None:
     config, repository, _ = _workspace(tmp_path, providers=True)
     _invoke(config, "import", "git", "sample_store", str(repository))
@@ -250,7 +265,7 @@ def test_repair_verifies_providers_only_when_explicitly_requested(
         "WORKTRACE_JIRA_EMAIL": "fixture@example.test",
         "WORKTRACE_JIRA_API_TOKEN": "synthetic-jira-token",
         "WORKTRACE_GITLAB_BASE_URL": "https://gitlab.example",
-        "WORKTRACE_GITLAB_TOKEN": "synthetic-gitlab-token",
+        gitlab_variable: "synthetic-gitlab-token",
     }.items():
         monkeypatch.setenv(key, value)
     with respx.mock(assert_all_called=False) as mocked:
@@ -270,3 +285,11 @@ def test_repair_verifies_providers_only_when_explicitly_requested(
         assert verified["verified_sources"] == ["gitlab", "jira"]
         assert jira.call_count == gitlab.call_count == 1
         assert len(mocked.calls) == 2
+        gitlab_request = next(
+            call.request for call in mocked.calls if call.request.url.host == "gitlab.example"
+        )
+        assert gitlab_request.headers[expected_header] == expected_value
+        forbidden_header = (
+            "Authorization" if expected_header == "PRIVATE-TOKEN" else "PRIVATE-TOKEN"
+        )
+        assert forbidden_header not in gitlab_request.headers

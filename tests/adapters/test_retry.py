@@ -14,6 +14,7 @@ from worktrace.adapters.retry import RetryPolicy, request_with_retry
 from worktrace.errors import (
     InvalidCredentials,
     PermanentSourceError,
+    PermissionDenied,
     RetryExhausted,
     SourceObjectUnavailable,
 )
@@ -61,20 +62,26 @@ def test_retry_is_bounded_for_429_and_honors_capped_retry_after() -> None:
     assert sleeps == [2, 2]
 
 
-def test_credentials_failure_is_immediate_and_sanitized() -> None:
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    ((401, InvalidCredentials), (403, PermissionDenied)),
+)
+def test_credentials_failure_is_immediate_and_sanitized(
+    status: int, error_type: type[Exception]
+) -> None:
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        return httpx.Response(401, text="token=do-not-leak", request=request)
+        return httpx.Response(status, text="token=do-not-leak", request=request)
 
     with (
         httpx.Client(
             base_url="https://provider.example",
             transport=httpx.MockTransport(handler),
         ) as client,
-        pytest.raises(InvalidCredentials) as error,
+        pytest.raises(error_type) as error,
     ):
         request_with_retry(client, "GET", "/fixed", sleep=lambda _delay: None)
 

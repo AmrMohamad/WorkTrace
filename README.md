@@ -35,6 +35,9 @@ uv run worktrace doctor
 Edit the copied configuration first. Every repository path, Jira project key, and GitLab project
 ID must be explicitly assigned to exactly one app. Do not put tokens in the file. Optional live
 imports read `WORKTRACE_JIRA_*` and `WORKTRACE_GITLAB_*` environment variables.
+Set `WORKTRACE_GITLAB_TOKEN` for a personal access token or
+`WORKTRACE_GITLAB_OAUTH_TOKEN` for an OAuth bearer token, never both; either requires
+`WORKTRACE_GITLAB_BASE_URL`.
 The default `doctor` command is offline. Use `worktrace doctor --live` only when an explicitly
 authorized provider check is intended; it validates identities and configured project visibility
 without persisting provider responses.

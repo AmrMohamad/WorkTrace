@@ -6,7 +6,7 @@ import tomllib
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from worktrace.errors import ConfigurationError, ScopeViolation
@@ -337,10 +337,23 @@ class JiraCredentials:
     token: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class GitLabCredentials:
     base_url: str
     token: str
+    auth_scheme: Literal["pat", "oauth"]
+
+    def request_headers(self) -> dict[str, str]:
+        """Return the only supported GitLab authentication header for this credential."""
+        authentication = (
+            {"PRIVATE-TOKEN": self.token}
+            if self.auth_scheme == "pat"
+            else {"Authorization": f"Bearer {self.token}"}
+        )
+        return {"Accept": "application/json", **authentication}
+
+    def __repr__(self) -> str:
+        return f"GitLabCredentials(base_url={self.base_url!r}, auth_scheme={self.auth_scheme!r})"
 
 
 def jira_credentials() -> JiraCredentials | None:
@@ -363,11 +376,18 @@ def jira_credentials() -> JiraCredentials | None:
 
 def gitlab_credentials() -> GitLabCredentials | None:
     base_url = os.environ.get("WORKTRACE_GITLAB_BASE_URL")
-    token = os.environ.get("WORKTRACE_GITLAB_TOKEN")
-    if not base_url and not token:
+    pat = os.environ.get("WORKTRACE_GITLAB_TOKEN")
+    oauth = os.environ.get("WORKTRACE_GITLAB_OAUTH_TOKEN")
+    if not base_url and not pat and not oauth:
         return None
-    if not base_url or not token:
+    if pat and oauth:
         raise ConfigurationError(
-            "WORKTRACE_GITLAB_BASE_URL and WORKTRACE_GITLAB_TOKEN are both required"
+            "WORKTRACE_GITLAB_TOKEN and WORKTRACE_GITLAB_OAUTH_TOKEN are mutually exclusive"
         )
-    return GitLabCredentials(base_url.rstrip("/"), token)
+    if not base_url:
+        raise ConfigurationError("WORKTRACE_GITLAB_BASE_URL is required with GitLab credentials")
+    if pat:
+        return GitLabCredentials(base_url.rstrip("/"), pat, "pat")
+    if oauth:
+        return GitLabCredentials(base_url.rstrip("/"), oauth, "oauth")
+    raise ConfigurationError("WORKTRACE_GITLAB_TOKEN or WORKTRACE_GITLAB_OAUTH_TOKEN is required")

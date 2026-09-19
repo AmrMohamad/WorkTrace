@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
-from typing import ClassVar, Protocol, cast
+from typing import ClassVar, Literal, Protocol, cast
 
 import httpx
 import pytest
@@ -24,7 +24,7 @@ from worktrace.adapters.base import (
 )
 from worktrace.candidates.decisions import append_decision
 from worktrace.cli import app
-from worktrace.config import AppConfig, IdentityConfig, WorkTraceConfig
+from worktrace.config import AppConfig, GitLabCredentials, IdentityConfig, WorkTraceConfig
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
 from worktrace.db.repository import EvidenceRepository
@@ -569,9 +569,11 @@ def test_cli_git_only_journey_reaches_packet_gaps_and_mcp_entrypoint(
     assert observed == [config]
 
 
+@pytest.mark.parametrize("auth_scheme", ["pat", "oauth"])
 def test_import_all_uses_git_then_gitlab_then_jira_discovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    auth_scheme: str,
 ) -> None:
     repository = tmp_path / "repository"
     _run("git", "init", "-q", str(repository), cwd=tmp_path)
@@ -613,9 +615,12 @@ def test_import_all_uses_git_then_gitlab_then_jira_discovery(
                 records=(),
             )
 
+    client_headers: dict[str, dict[str, str]] = {}
+
     class ContextClient:
-        def __init__(self, **_: object) -> None:
-            pass
+        def __init__(self, **kwargs: object) -> None:
+            base_url = str(kwargs["base_url"])
+            client_headers[base_url] = dict(cast(dict[str, str], kwargs["headers"]))
 
         def __enter__(self) -> ContextClient:
             return self
@@ -629,7 +634,11 @@ def test_import_all_uses_git_then_gitlab_then_jira_discovery(
     monkeypatch.setattr("worktrace.cli.httpx.Client", ContextClient)
     monkeypatch.setattr(
         "worktrace.cli.gitlab_credentials",
-        lambda: SimpleNamespace(base_url="https://gitlab.example.test", token="fixture"),
+        lambda: GitLabCredentials(
+            "https://gitlab.example.test",
+            "fixture",
+            cast(Literal["pat", "oauth"], auth_scheme),
+        ),
     )
     monkeypatch.setattr(
         "worktrace.cli.jira_credentials",
@@ -654,6 +663,11 @@ def test_import_all_uses_git_then_gitlab_then_jira_discovery(
     assert result.exit_code == 0, result.stdout
     assert constructed == ["git", "gitlab", "jira"]
     assert len(json.loads(result.stdout)["sources"]) == 3
+    assert client_headers["https://gitlab.example.test"] == (
+        {"Accept": "application/json", "PRIVATE-TOKEN": "fixture"}
+        if auth_scheme == "pat"
+        else {"Accept": "application/json", "Authorization": "Bearer fixture"}
+    )
 
 
 @pytest.mark.asyncio
