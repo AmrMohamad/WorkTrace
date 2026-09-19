@@ -87,6 +87,38 @@ Candidate rebuilds may delete and recreate derived references and suggestions. C
 
 `human_decisions` contains the complete in-app append-only closure for exported candidates, contributions, source objects, and their undo chains. Historical undo scope follows cycle-safe stable decision-ID ancestry rather than decision timestamps. Legacy nested undo rows remain inactive but may be inspected when their target lineage resolves to exactly one app; missing, mismatched, cyclic, cross-app, or ambiguous ancestry remains unscoped and is excluded from excerpts and export. Creation snapshots (`confirm_candidate`, `merge_contributions`, and `split_contribution`) remain exportable after deterministic candidate rebuilds delete their derived row. `unsupported_contribution_history` carries only human-supplied title/state, stable unsupported member IDs, and decision IDs; it never hydrates quarantined provider metadata or evidence. A creation payload is in scope only when its surviving candidate or resolvable snapshot members establish exactly the requested app; its declared `app_id` cannot override that ownership.
 
+## Jira vault observations
+
+The optional Jira vault adds encrypted archive observations without changing the existing app
+evidence model. Site identity, collection instance, run, and immutable activated revision are
+distinct; historical revisions remain queryable. Stable ticket identity is
+`(site_canonical, numeric_issue_id)`, not `app_id`; provider attachment identity is distinct from a
+revision attachment object. An app association is a projection convenience and cannot split or
+merge archive identity. Assignment roots are selected
+only after expanded-day discovery and full assignment-changelog overlap verification in the
+configured timezone/date interval. Unknown assignment boundaries remain `boundary_unknown`.
+
+Current hydration is outside the historical interval and is bounded to one direct hop through a
+parent, true subtask, or typed Jira issue link. The target may be in another accessible project.
+Remote links are metadata-only and never crawled. A context target is not a participation, candidate
+root, ownership signal, or authorship signal.
+
+The following Jira resources each have an independent resource state and locator: all returned
+fields/custom fields; every comment page; every changelog field/history; worklogs/properties;
+typed links; remote-link metadata; accessible watcher/vote data; attachment manifests and original
+bytes; and embedded Jira media mappings. Empty successful responses are complete with zero items;
+permission, deletion, boundary, parser, or transport failures are explicit unavailable/partial
+states. A collection never claims a global snapshot.
+
+Archive evidence IDs are site-scoped and remain on a rail separate from app `source_objects`,
+`observations`, and `references`. A derived app association never automatically changes app
+authority or candidates. Original attachment bytes and raw structured provider payloads are encrypted in a dedicated vault
+outside SQLite. SQLite contains only redacted metadata, hashes, status/error summaries, stable
+locators, and extracted redacted chunks. Every attachment type is eligible for preservation;
+unsupported extraction retains the original and reports search unavailability. MCP and the TUI do
+not decrypt or expose vault objects. A material output may cite an attachment's stable metadata or
+extracted observation, but the existence of an attachment never upgrades claim authority.
+
 ## Evidence dimensions
 
 WorkTrace does not collapse evidence quality into a numeric confidence score.

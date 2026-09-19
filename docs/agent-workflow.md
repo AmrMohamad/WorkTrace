@@ -70,6 +70,45 @@ uv run worktrace rebuild all APP_ID --config /path/to/config.toml
 
 ## 3. Investigate with bounded MCP reads
 
+### Optional Jira ticket-vault investigation
+
+For a separately authorized complete Jira collection, use the dedicated CLI workflow:
+
+```console
+uv run worktrace jira collect-preview --scope assigned-during-employment --context-depth 1 --config CONFIG
+uv run worktrace jira collect --scope assigned-during-employment --context-depth 1 --attachments all --config CONFIG --approve-scope TOKEN
+uv run worktrace jira status COLLECTION_ID
+uv run worktrace jira resume COLLECTION_ID
+uv run worktrace jira search COLLECTION_ID "checkout"
+uv run worktrace jira show COLLECTION_ID ISSUE_ID
+uv run worktrace jira attachment-export COLLECTION_ID ATTACHMENT_ID --output /private/path/file
+uv run worktrace jira backup COLLECTION_ID --output /private/path/epoch --yes
+uv run worktrace jira restore --input /private/path/epoch --destination /private/path/fresh --yes
+uv run worktrace ui --jira-collection COLLECTION_ID
+```
+
+The selector uses freshly verified `WORKTRACE_JIRA_*` credentials for site/account identity and
+verifies assignment overlap after expanded-day discovery across visible same-site projects; no app
+or configured project allowlist is required. `collect-preview` is metadata/JQL/relationship-only:
+it performs no raw hydration or attachment download and returns the immutable scope hash/token.
+`collect` requires `--approve-scope TOKEN`; the token is provider/config/view bound and expires on
+scope changes. Collection status separates selection, enumeration,
+original availability, download integrity, extraction, search readiness, and app mapping. The
+current full ticket is hydrated
+outside the interval, with exactly one hop of parent/subtask/typed-link context; context is not
+participation. The TUI and MCP show only redacted metadata/extracted chunks. Attachment export is
+explicit, private, no-overwrite, and never launches the file. A collection is not a global Jira
+snapshot, and static or fixture proof is not live-provider proof. The `--jira-collection` TUI
+option is mutually exclusive with the existing `--app`/`--candidate` options. `jira backup` and
+`jira restore` are the only vault portability commands; existing `worktrace backup` remains
+DB-only and warns when vault state exists. Restore requires a fresh destination and fail-closed
+verification. `unstable_partial` is a public terminal state after a second-changing recheck; affected
+resources use state `unstable`. It retains completed resources plus the pending unstable resource,
+exits 2, and resumes only by creating a new run/revision attempt that refetches affected resources;
+it is not complete or successful. The shipped `worktrace purge --yes` fails before deleting DB/HMAC/backups when any
+Jira collection/vault/key references exist. Use `worktrace jira purge COLLECTION_ID --include-vault
+--yes` for one collection; whole-installation vault purge is a separate explicit command/flag.
+
 Configure the seven read-only stdio tools with
 [`codex-mcp.example.toml`](codex-mcp.example.toml). The MCP process receives no Jira or GitLab
 credentials and never accepts a path, command, URL to follow, or SQL query.

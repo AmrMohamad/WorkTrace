@@ -4,9 +4,9 @@
 
 WorkTrace processes proprietary engineering history, employee identities, source assertions, and potentially sensitive incident text. It is a private local single-user tool, but “local” is not a complete security control. The design assumes source text is untrusted and source credentials are high-value secrets.
 
-This model covers the CLI, adapters, local Git subprocess boundary, SQLite ledger, backups/exports,
-the read-only MCP process, and the approved structurally read-only human TUI. It does not authorize
-organization-wide collection or evaluation.
+This model covers the CLI, adapters, local Git subprocess boundary, SQLite ledger, encrypted Jira
+vault, backups/exports, the read-only MCP process, and the approved structurally read-only human TUI.
+It does not authorize organization-wide collection or evaluation.
 
 ## Trust boundaries
 
@@ -24,6 +24,8 @@ SQLite ledger <---- read-only SQLite URI ---- MCP server ----> Codex
       ^
       |
       +--------- worker-local read-only SQLite URI -------- Textual TUI
+      |
+      +--------- encrypted Jira vault (Keychain key; CLI only)
 ```
 
 - The CLI is the only mutation boundary.
@@ -34,6 +36,12 @@ SQLite ledger <---- read-only SQLite URI ---- MCP server ----> Codex
 - The TUI receives only a read-only workspace. It does not receive providers, credentials, network,
   writes, imports, decisions, migrations, maintenance, export, backup, purge, or configuration
   editing.
+- The Jira vault stores raw structured payloads and every accessible attachment type outside SQLite.
+  A dedicated random key is held by an explicit macOS Keychain backend (`WorkTrace Jira Vault`,
+  account `<installation-id>:<key-version>`). The TUI and MCP cannot read the vault or key.
+- Site identity is a non-secret SHA-256 of the canonical HTTPS origin. Collection instance, run,
+  immutable revision, ticket ID, and provider attachment ID are distinct. Archive evidence IDs are
+  site-scoped and do not become app-scoped source objects automatically.
 
 ## Assets and controls
 
@@ -60,7 +68,11 @@ Controls:
 - repository paths resolved and validated by the CLI;
 - no remote auto-discovery outside configured identifiers;
 - path and module metadata instead of complete patches;
-- no attachment import;
+- encrypted originals are stored only in the dedicated vault, outside SQLite and MCP;
+- raw Jira resource payloads are encrypted outside SQLite; only redacted metadata and extracted
+  chunks are ledger-visible;
+- archive resources are not app participations; cross-project one-hop context cannot affect app
+  authority or candidates without an explicit, redacted association projection;
 - no arbitrary-path MCP inputs; and
 - record, excerpt, and total-response limits enforced after serialization.
 
@@ -184,6 +196,15 @@ CLI configuration resolves repository roots once and rejects duplicates, nonexis
 
 A configured issue may mention another private project or URL. WorkTrace may retain a redacted textual reference, but it must not fetch the target unless the target project/source instance is explicitly configured. Candidate generation cannot cross app scope merely because identifiers or names resemble one another.
 
+Jira archive collection uses a mandatory preview/approval gate rather than treating credential
+visibility or a static app map as authorization. `collect-preview` performs bounded metadata/JQL
+root and one-hop relationship enumeration only; it returns the canonical site/account, approved
+root/context issue+project set, visible attachment estimates, policy, interval/timezone,
+limitations, scope hash, and expiring approval token without content or attachment downloads.
+`collect` requires the token bound to provider-scope view and config; forged/stale tokens, injected
+projects, changed context, or provider scope changes are rejected. A newly discovered target pauses
+with `scope_expansion_required` for a new preview and never hydrates automatically.
+
 ### Role and ownership escalation
 
 Adversarial inputs include another engineer as author with the local user as committer, a review-only participant, reassignment after implementation, an MR author using another engineer's branch, release merges, backports, and reverts. These remain distinct participations and relationships. No path converts them into implementation or ownership without claim-appropriate evidence or attestation.
@@ -196,9 +217,55 @@ Jira `Done`, GitLab `merged`, tags, fix versions, deployments, mobile availabili
 
 Each source page persists transactionally in its run. A killed, failed, partial, or stale-running run cannot become current. Previous complete evidence remains readable with visible staleness; retry uses stable identities and must not duplicate logical objects.
 
+For Jira collections, resource streams are the restart unit: an incomplete stream starts over from
+its first page, while verified resources remain idempotently complete. At most two attachment
+downloads run concurrently and one SQLite writer commits short transactions. Default network
+timeouts are 30 seconds with three attempts for timeouts/429/5xx only; each invocation has a 20 GiB
+transfer budget, an adjustable explicit override, and a 2 GiB free-space reserve. Pause is durable.
+Before revision activation, the CLI rechecks issue `updated` and the attachment manifest; one retry
+is allowed. A second-changing recheck marks affected resources `unstable` and the collection outcome
+`unstable_partial`; resume creates a new run/revision attempt and refetches affected resources.
+
+### Encrypted-vault threats and controls
+
+Threats include plaintext leakage, ciphertext truncation, descriptor substitution, key loss,
+redirect credential exfiltration, parser bombs, and incoherent database/vault backup. Controls:
+
+- each object uses versioned libsodium secretstream XChaCha20-Poly1305 with immutable descriptor/AAD,
+  authenticated chunks, and a required final tag;
+- temporary ciphertext is atomically published only after final-tag and hash verification;
+- keyring must be the explicit macOS Keychain backend, service `WorkTrace Jira Vault`, account
+  `<installation-id>:<key-version>`; access is limited by the logged-in user session/Keychain ACL,
+  but same-user malware is out of scope. There is no plaintext fallback and the email HMAC/vault
+  keys are never reused;
+- recovery is a passphrase-wrapped, versioned Argon2id authenticated envelope and import requires a
+  fresh destination; portable epochs hash that envelope while same-host restore may use Keychain
+  only after verifying the same binding;
+- attachment HTTP uses `trust_env=False` and `follow_redirects=False`, exact origin/path
+  construction, rejects all 3xx before body, and never sends credentials to redirects or proxies;
+- extraction requires generated profile version `1` for macOS `sandbox-exec`, with SHA-256 integrity
+  over the exact profile bytes. The install/runtime allowlist resolves and hashes only the exact venv/interpreter, dyld/system
+  libraries, Python stdlib, WorkTrace worker, and approved parser packages; all other file access,
+  network, subprocess, and process creation is denied. Input/output use inherited pipes only.
+  Invalid capability/profile/allowlist hashes or symlinks save `extraction_unavailable`, never an
+  unsandboxed attempt. The worker uses an empty allowlist environment, fixed cwd,
+  close-on-exec descriptors, limits of 25 MiB/60 seconds/512 MiB/1,000 pages/1M chars,
+  TERM/KILL/reap, and OOXML 10,000 entries/100 MiB inflated content;
+- a coherent backup epoch quiesces the writer at a resource boundary and binds SQLite/config/HMAC,
+  vault manifest/ciphertexts, and key versions separately; restore fails closed and never deletes,
+  merges, overwrites, or runs automatically. Purge quiesces jobs, checks manifest/backup references,
+  retires only unreferenced keys, and requires `worktrace jira purge COLLECTION_ID --include-vault
+  --yes`; it reports logical deletion, not secure erasure. Legacy `worktrace purge --yes` fails
+  before deleting DB/HMAC/backups whenever Jira collection/vault/key references exist; whole-
+  installation vault purge requires a separate explicit command/flag.
+
 ### Database, backup, and export exposure
 
-The ledger, its SQLite side files, backups, and exports inherit the same sensitivity. Store them only in the configured local data directory with restrictive permissions. Do not print their content in logs. Export is an explicit CLI action, remains redacted, and must not imply that the output is safe to publish. Purge is explicit and should report what retention boundary it applied.
+The ledger, its SQLite side files, backups, vault manifests/ciphertexts, and exports inherit the
+same sensitivity. Store them only in configured private directories with restrictive permissions.
+Do not print their content in logs. Export uses no-follow, exclusive 0600 temp creation and an
+atomic no-overwrite finalization under a trusted parent chain; it remains explicit/private and
+never launches the file. Purge reports its logical deletion and explicit backup-retention boundary.
 
 ## Redaction before persistence
 
@@ -237,6 +304,27 @@ markup-derived spans or links, and registers or triggers no actions, commands, o
 Behavioral tests also attempt mouse selection over evidence and dispatch both `ctrl+c` and
 `super+c`; the clipboard remains unchanged and `copy_to_clipboard` is not called. The explicit
 validated-ID action remains covered and copies the exact stable ID once.
+
+## Source references
+
+- [Jira REST v3 introduction](https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro)
+  documents expansion, pagination, ADF, and the current REST version.
+- [Issue attachments](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-attachments/),
+  [comments](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/),
+  [worklogs](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-worklogs/),
+  and [properties](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-properties/)
+  establish the resource, pagination, and permission surfaces being treated as independently
+  complete or unavailable.
+- [Jira issue linking model](https://developer.atlassian.com/cloud/jira/platform/issue-linking-model/)
+  describes link endpoints, labels, and bidirectional interpretation.
+- [libsodium secretstream](https://libsodium.gitbook.io/doc/secret-key_cryptography/secretstream)
+  and [PyNaCl's binding](https://github.com/pyca/pynacl/blob/main/src/nacl/bindings/crypto_secretstream.py)
+  support the authenticated chunk/final-tag contract.
+- [keyring](https://keyring.readthedocs.io/en/stable/) documents macOS Keychain support and its
+  backend access-control considerations.
+- [pypdf extraction guidance](https://github.com/py-pdf/pypdf/blob/main/docs/user/extract-text.md)
+  and [defusedxml security notes](https://github.com/tiran/defusedxml/blob/main/README.md) support
+  the bounded parser and XML-bomb controls.
 
 ## Residual risk
 
