@@ -18,6 +18,14 @@ dependencies = [
   "typer>=0.16,<1",
 ]
 
+[project.optional-dependencies]
+jira-vault = [
+  "PyNaCl>=1.5,<2",
+  "defusedxml>=0.7,<1",
+  "keyring>=25,<26",
+  "pypdf>=6,<7",
+]
+
 [project.scripts]
 worktrace = "worktrace.cli:entrypoint"
 

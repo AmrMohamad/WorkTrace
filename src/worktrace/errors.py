@@ -40,3 +40,23 @@ class ScopeViolation(WorkTraceError):
 
 class NotFound(WorkTraceError):
     pass
+
+
+class VaultError(WorkTraceError):
+    """Base error for encrypted Jira vault and recovery operations."""
+
+
+class VaultFormatError(VaultError):
+    pass
+
+
+class VaultIntegrityError(VaultError):
+    pass
+
+
+class KeychainError(VaultError):
+    pass
+
+
+class RecoveryError(VaultError):
+    pass
