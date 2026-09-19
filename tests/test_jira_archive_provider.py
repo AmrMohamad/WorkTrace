@@ -73,3 +73,18 @@ def test_attachment_content_retries_transient_then_streams_without_redirects() -
         assert response.read() == b"bytes"
     assert calls == 2
     provider.close()
+
+
+@pytest.mark.parametrize("payload", [[], [{"id": "10", "object": {"url": "https://jira.test"}}]])
+def test_remote_links_accepts_bounded_metadata_list(payload: list[object]) -> None:
+    provider = _provider(lambda request: httpx.Response(200, json=payload, request=request))
+    assert provider.remote_links("1") == payload
+    provider.close()
+
+
+@pytest.mark.parametrize("payload", [{"id": "10"}, ["malformed"]])
+def test_remote_links_rejects_malformed_top_level_or_item(payload: object) -> None:
+    provider = _provider(lambda request: httpx.Response(200, json=payload, request=request))
+    with pytest.raises(PermanentSourceError):
+        provider.remote_links("1")
+    provider.close()

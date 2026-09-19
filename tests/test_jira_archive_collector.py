@@ -94,6 +94,9 @@ class FakeJira:
             "values": [] if kind != "issue_properties" else None,
         }
 
+    def remote_links(self, issue_id: str) -> list[dict[str, object]]:
+        return []
+
     class _Attachment:
         def __enter__(self):
             raise PermissionDenied("fixture attachment unavailable")
@@ -486,4 +489,42 @@ def test_malformed_or_duplicate_property_keys_are_partial(tmp_path: Path) -> Non
     preview = collector.preview()
     result = collector.collect(str(preview["approval_token"]))
     assert result["status"] == "partial"
+    connection.close()
+
+
+def test_remote_links_are_one_stable_resource_and_resume_permission_failure(
+    tmp_path: Path,
+) -> None:
+    class LinksJira(FakeJira):
+        def __init__(self) -> None:
+            super().__init__()
+            self.allow = False
+            self.calls = 0
+
+        def remote_links(self, issue_id: str) -> list[dict[str, object]]:
+            self.calls += 1
+            if not self.allow:
+                raise PermissionDenied("remote links denied")
+            return [{"id": "r1", "object": {"title": "fixture"}}]
+
+    provider = LinksJira()
+    collector, connection = _collector(tmp_path, provider)
+    preview = collector.preview()
+    first = collector.collect(str(preview["approval_token"]))
+    assert first["status"] == "complete_with_unavailable_resources"
+    connection.execute(
+        "UPDATE jira_collection_runs SET status='paused' WHERE id=?", (first["run_id"],)
+    )
+    connection.commit()
+    provider.allow = True
+    resumed = collector.resume(str(first["collection_id"]))
+    assert resumed["status"] == "complete_with_unavailable_resources"
+    assert provider.calls >= 4  # root/context on both attempts
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM jira_resource_states "
+            "WHERE kind='remote_links' AND state='complete'"
+        ).fetchone()[0]
+        == 2
+    )
     connection.close()

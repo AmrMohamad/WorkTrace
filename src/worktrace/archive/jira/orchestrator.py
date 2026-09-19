@@ -631,11 +631,11 @@ class JiraCollector:
             "comments",
             "changelog",
             "worklogs",
-            "remote_links",
             "watchers_votes",
         ):
             self._collect_paged_resource(collection_id, revision_id, run_id, issue, kind)
         self._collect_issue_properties(collection_id, revision_id, run_id, issue)
+        self._collect_remote_links(collection_id, revision_id, run_id, issue)
         attachments = self._attachments(full)
         self._store_json_resource(
             collection_id,
@@ -839,6 +839,38 @@ class JiraCollector:
             if not keys:
                 raise PermanentSourceError("Jira property pagination made no progress")
             start_at += len(keys)
+
+    def _collect_remote_links(
+        self, collection_id: str, revision_id: str, run_id: str, issue: dict[str, object]
+    ) -> None:
+        issue_id = str(issue["issue_id"])
+        locator = {"issue_id": issue_id, "remote_links": True}
+        try:
+            links = self.provider.remote_links(issue_id)
+        except (PermissionDenied, SourceObjectUnavailable) as exc:
+            self._store_resource_state(
+                collection_id,
+                revision_id,
+                run_id,
+                issue,
+                "remote_links",
+                locator,
+                "unavailable",
+                "unavailable",
+                "unavailable",
+                0,
+                {"reason": type(exc).__name__},
+            )
+            return
+        self._store_json_resource(
+            collection_id,
+            revision_id,
+            run_id,
+            issue,
+            "remote_links",
+            locator,
+            {"issue_id": issue_id, "links": links},
+        )
 
     def _collect_attachment(
         self,

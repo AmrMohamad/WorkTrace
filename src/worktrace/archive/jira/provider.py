@@ -149,7 +149,6 @@ class JiraArchiveProvider:
             "changelog": "changelog",
             "worklogs": "worklog",
             "issue_properties": "properties",
-            "remote_links": "remotelink",
             "watchers_votes": "watchers",
         }
         endpoint = endpoints.get(kind)
@@ -162,6 +161,19 @@ class JiraArchiveProvider:
             params=params,
             resource=kind,
         )
+
+    def remote_links(self, issue_id: str) -> list[dict[str, object]]:
+        value = self._json_value(
+            "GET",
+            f"/rest/api/3/issue/{quote(issue_id, safe='')}/remotelink",
+            resource="remote links",
+            exact_object=True,
+        )
+        if not isinstance(value, list) or len(value) > 1000:
+            raise PermanentSourceError("Jira remote links response must be a bounded list")
+        if not all(isinstance(item, dict) for item in value):
+            raise PermanentSourceError("Jira remote links response contained malformed metadata")
+        return [dict(item) for item in value]
 
     def issue_property(self, issue_id: str, key: str) -> dict[str, object]:
         return self._json(
@@ -217,6 +229,28 @@ class JiraArchiveProvider:
         resource: str,
         exact_object: bool = False,
     ) -> dict[str, object]:
+        value = self._json_value(
+            method,
+            endpoint,
+            params=params,
+            json_body=json_body,
+            resource=resource,
+            exact_object=exact_object,
+        )
+        if not isinstance(value, dict):
+            raise PermanentSourceError(f"Jira returned an invalid {resource} document")
+        return value
+
+    def _json_value(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        params: Mapping[str, str | int] | None = None,
+        json_body: object | None = None,
+        resource: str,
+        exact_object: bool = False,
+    ) -> object:
         response = request_with_retry(
             self.client,
             method,
@@ -230,6 +264,4 @@ class JiraArchiveProvider:
             document = response.json()
         except (ValueError, json.JSONDecodeError):
             raise PermanentSourceError(f"Jira returned invalid {resource} JSON") from None
-        if not isinstance(document, dict):
-            raise PermanentSourceError(f"Jira returned an invalid {resource} document")
         return document
