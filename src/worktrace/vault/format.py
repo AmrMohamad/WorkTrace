@@ -336,13 +336,14 @@ def decrypt_vault_object(
     key: bytes,
     *,
     expected_ciphertext_sha256: str | None = None,
+    stage_plaintext: bool = True,
 ) -> VaultObjectResult:
     return _process_vault_object(
         source,
         key,
         sink,
         expected_ciphertext_sha256=expected_ciphertext_sha256,
-        stage_plaintext=True,
+        stage_plaintext=stage_plaintext,
     )
 
 
@@ -424,6 +425,12 @@ def _process_vault_object(
                 raise VaultIntegrityError("vault record has an invalid tag")
             if verified_plaintext is not None:
                 verified_plaintext.write(plaintext)
+            elif sink is not None:
+                # The extraction path performs a complete authentication pass
+                # before invoking this streaming pass.  Keep the streaming
+                # mode pipe-only: no plaintext temporary is created, and the
+                # caller discards the sink if a subsequent check fails.
+                sink.write(plaintext)
             plain_hash.update(plaintext)
             plain_length += len(plaintext)
         if source.read(1) != b"":

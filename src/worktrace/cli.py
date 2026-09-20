@@ -8,6 +8,7 @@ import sys
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import date
+from getpass import getpass
 from pathlib import Path
 from typing import Annotated, cast
 
@@ -36,7 +37,7 @@ from worktrace.db.authority import (
     parse_scope,
     run_is_authoritative,
 )
-from worktrace.db.connection import connect
+from worktrace.db.connection import connect, connect_read_only
 from worktrace.db.import_status import readiness_contract, source_readiness
 from worktrace.db.migrations import backup_database, migrate
 from worktrace.db.queries import search_evidence, source_status
@@ -63,7 +64,11 @@ from worktrace.services import add_manual_evidence, export_app
 from worktrace.vault.backup import create_epoch_backup, restore_epoch
 from worktrace.vault.export import export_attachment
 from worktrace.vault.keychain import MacOSKeychain
-from worktrace.vault.search import search_collection, show_issue
+from worktrace.vault.search import (
+    index_collection_attachments,
+    search_collection,
+    show_issue,
+)
 
 app = typer.Typer(no_args_is_help=True, help="Local evidence-oriented contribution reconstruction.")
 import_app = typer.Typer(no_args_is_help=True, help="Import full source snapshots.")
@@ -278,6 +283,20 @@ def _open(
         raise
 
 
+def _open_read_only(config_path: Path | None = None) -> tuple[WorkTraceConfig, sqlite3.Connection]:
+    configuration = load_config(config_path)
+    if not configuration.database_path.is_file():
+        raise WorkTraceError("database is missing; run worktrace init")
+    connection = connect_read_only(configuration.database_path)
+    try:
+        if database_readiness(connection).status is not DatabaseReadinessStatus.READY:
+            raise WorkTraceError("unsupported database schema; run the matching worktrace init")
+        return configuration, connection
+    except BaseException:
+        connection.close()
+        raise
+
+
 @app.callback()
 def main() -> None:
     """WorkTrace keeps source observations separate from human claims."""
@@ -326,6 +345,37 @@ def _open_jira_collector(
     )
 
 
+def _index_jira_collection(
+    configuration: WorkTraceConfig,
+    connection: sqlite3.Connection,
+    collector: JiraCollector,
+    result: dict[str, object],
+) -> dict[str, object]:
+    if str(result.get("status")) not in {"complete", "complete_with_unavailable_resources"}:
+        return result
+    if collector.vault_key is None:
+        raise WorkTraceError("Jira extraction requires the loaded vault key")
+    counts = index_collection_attachments(
+        connection,
+        collection_id=str(result["collection_id"]),
+        vault_root=str(configuration.data_directory / "jira-vault"),
+        key_for_version=lambda version: collector.vault_key or b"",
+        redactor=Redactor(email_hmac_key(configuration.data_directory, create=False)),
+    )
+    refreshed = collector.status(str(result["collection_id"]))
+    dimensions = cast(dict[str, object], refreshed["dimensions"])
+    if counts.get("extraction_unavailable"):
+        dimensions["extraction"] = "unavailable"
+        dimensions["search_readiness"] = "unavailable"
+    elif counts.get("failed") or counts.get("limit"):
+        dimensions["extraction"] = "complete_with_unavailable_resources"
+        dimensions["search_readiness"] = "complete_with_unavailable_resources"
+    else:
+        dimensions["extraction"] = "complete"
+        dimensions["search_readiness"] = "ready"
+    return refreshed
+
+
 @jira_app.command("collect-preview")
 def jira_collect_preview(
     scope: Annotated[str, typer.Option("--scope")],
@@ -336,8 +386,7 @@ def jira_collect_preview(
         raise typer.BadParameter(
             "Jira archive scope/context-depth must be assigned-during-employment/1"
         )
-    configuration, connection, provider, collector = _open_jira_collector(config)
-    del configuration
+    _configuration, connection, provider, collector = _open_jira_collector(config)
     try:
         _emit(collector.preview())
     except WorkTraceError as exc:
@@ -364,9 +413,9 @@ def jira_collect(
     configuration, connection, provider, collector = _open_jira_collector(
         config, require_vault=True
     )
-    del configuration
     try:
         result = collector.collect(approve_scope)
+        result = _index_jira_collection(configuration, connection, collector, result)
         _emit(result)
         code = outcome_exit_code(str(result.get("status")))
         if code:
@@ -388,9 +437,9 @@ def jira_resume(
     configuration, connection, provider, collector = _open_jira_collector(
         config, require_vault=True
     )
-    del configuration
     try:
         result = collector.resume(collection_id)
+        result = _index_jira_collection(configuration, connection, collector, result)
         _emit(result)
         code = outcome_exit_code(str(result.get("status")))
         if code:
@@ -427,7 +476,7 @@ def jira_search(
     expected_view_token: Annotated[str | None, typer.Option("--expected-view-token")] = None,
     config: ConfigOption = None,
 ) -> None:
-    _configuration, connection, _ = _open(config)
+    _configuration, connection = _open_read_only(config)
     try:
         _emit(
             search_collection(
@@ -444,22 +493,46 @@ def jira_search(
 
 
 @jira_app.command("show")
-def jira_show(collection_id: str, issue_id: str, config: ConfigOption = None) -> None:
-    configuration, connection, _ = _open(config)
-    del configuration
+def jira_show(
+    collection_id: str,
+    issue_id: str,
+    limit: Annotated[int, typer.Option("--limit")] = 20,
+    cursor: Annotated[str | None, typer.Option("--cursor")] = None,
+    expected_view_token: Annotated[str | None, typer.Option("--expected-view-token")] = None,
+    config: ConfigOption = None,
+) -> None:
+    _configuration, connection = _open_read_only(config)
     try:
-        _emit(show_issue(connection, collection_id, issue_id))
+        _emit(
+            show_issue(
+                connection,
+                collection_id,
+                issue_id,
+                limit=limit,
+                cursor=cursor,
+                expected_view_token=expected_view_token,
+            )
+        )
     finally:
         connection.close()
 
 
-def _vault_key_for_config(configuration: WorkTraceConfig) -> bytes:
+def _vault_key_for_config(configuration: WorkTraceConfig, version: int = 1) -> bytes:
     installation_id = (
         "install:" + hashlib.sha256(str(configuration.config_path).encode("utf-8")).hexdigest()[:32]
     )
-    return MacOSKeychain.open(installation_id).get(1) or MacOSKeychain.open(installation_id).ensure(
-        1
-    )
+    key = MacOSKeychain.open(installation_id).get(version)
+    if key is None:
+        raise WorkTraceError(f"required Jira vault key version is missing: {version}")
+    return key
+
+
+def _interactive_passphrase() -> str:
+    first = getpass("Recovery passphrase: ")
+    second = getpass("Repeat recovery passphrase: ")
+    if first != second:
+        raise WorkTraceError("recovery passphrases do not match")
+    return first
 
 
 @jira_app.command("attachment-export")
@@ -472,21 +545,30 @@ def jira_attachment_export(
 ) -> None:
     if not yes:
         raise typer.Exit(3)
-    configuration, connection, _ = _open(config)
+    configuration, connection = _open_read_only(config)
     try:
         row = connection.execute(
             "SELECT a.*, c.vault_id FROM jira_attachment_objects a "
             "JOIN jira_collections c ON c.id=a.collection_id "
-            "WHERE a.collection_id=? AND a.attachment_id=? ORDER BY a.revision_id DESC LIMIT 1",
+            "JOIN jira_archive_revisions r ON r.id=a.revision_id "
+            "WHERE a.collection_id=? AND a.attachment_id=? AND r.status='active' "
+            "AND a.original_state='complete' "
+            "ORDER BY r.revision_number DESC LIMIT 1",
             (collection_id, attachment_id),
         ).fetchone()
-        if row is None or row["vault_object_path"] is None:
+        if (
+            row is None
+            or row["vault_object_path"] is None
+            or row["vault_key_version"] is None
+            or row["ciphertext_sha256"] is None
+            or row["vault_object_id"] is None
+        ):
             raise WorkTraceError("attachment original is unavailable")
         destination = export_attachment(
             source=configuration.data_directory / "jira-vault" / str(row["vault_object_path"]),
             destination=output,
             vault_root=configuration.data_directory / "jira-vault",
-            key=_vault_key_for_config(configuration),
+            key=_vault_key_for_config(configuration, int(row["vault_key_version"])),
             expected_ciphertext_sha256=row["ciphertext_sha256"],
             collection_id=collection_id,
             revision_id=str(row["revision_id"]),
@@ -510,22 +592,41 @@ def jira_backup(
     collection_id: str,
     output: Annotated[Path, typer.Option("--output", file_okay=False)],
     yes: Annotated[bool, typer.Option("--yes")] = False,
-    passphrase: Annotated[str, typer.Option("--passphrase", hidden=True)] = "",
     config: ConfigOption = None,
 ) -> None:
-    if not yes or not passphrase:
+    if not yes:
         raise typer.Exit(3)
+    passphrase = _interactive_passphrase()
     configuration, connection, _ = _open(config)
     try:
         row = connection.execute(
             "SELECT c.*, r.id AS revision_id FROM jira_collections c "
             "JOIN jira_archive_revisions r ON r.collection_id=c.id "
-            "WHERE c.id=? ORDER BY r.revision_number DESC LIMIT 1",
+            "WHERE c.id=? AND r.status='active' ORDER BY r.revision_number DESC LIMIT 1",
             (collection_id,),
         ).fetchone()
         if row is None:
             raise WorkTraceError("Jira collection was not found")
-        key = _vault_key_for_config(configuration)
+        installation_id = (
+            "install:" + hashlib.sha256(str(configuration.config_path).encode()).hexdigest()[:32]
+        )
+        keychain = MacOSKeychain.open(installation_id)
+        versions = {
+            int(row[0])
+            for row in connection.execute(
+                "SELECT raw_vault_key_version FROM jira_resource_states "
+                "WHERE revision_id=? AND raw_vault_key_version IS NOT NULL "
+                "UNION SELECT vault_key_version FROM jira_attachment_objects "
+                "WHERE revision_id=? AND vault_key_version IS NOT NULL",
+                (row["revision_id"], row["revision_id"]),
+            )
+        }
+        keys = {}
+        for version in sorted(versions):
+            value = keychain.get(version)
+            if value is None:
+                raise WorkTraceError(f"required Jira vault key version is missing: {version}")
+            keys[version] = value
         backup = create_epoch_backup(
             database_path=configuration.database_path,
             config_path=configuration.config_path,
@@ -537,7 +638,7 @@ def jira_backup(
             installation_id="install:"
             + hashlib.sha256(str(configuration.config_path).encode()).hexdigest()[:32],
             vault_id=str(row["vault_id"]),
-            key_versions={1: key},
+            key_versions=keys,
             passphrase=passphrase,
         )
         _emit(
@@ -574,10 +675,10 @@ def jira_restore(
     input: Annotated[Path, typer.Option("--input", file_okay=False)],
     destination: Annotated[Path, typer.Option("--destination", file_okay=False)],
     yes: Annotated[bool, typer.Option("--yes")] = False,
-    passphrase: Annotated[str, typer.Option("--passphrase", hidden=True)] = "",
 ) -> None:
-    if not yes or not passphrase:
+    if not yes:
         raise typer.Exit(3)
+    passphrase = _interactive_passphrase()
     _emit(restore_epoch(epoch=input, destination=destination, passphrase=passphrase))
 
 
@@ -1743,6 +1844,17 @@ def export_command(app_id: str, destination: Path, config: ConfigOption = None) 
 @app.command()
 def backup(destination: Path | None = None, config: ConfigOption = None) -> None:
     configuration = load_config(config)
+    if configuration.database_path.is_file():
+        connection = connect(configuration.database_path)
+        try:
+            if connection.execute("SELECT COUNT(*) FROM jira_collections").fetchone()[0]:
+                typer.echo(
+                    "warning: this is the DB-only backup; use `worktrace jira backup` "
+                    "for vault-inclusive portability",
+                    err=True,
+                )
+        finally:
+            connection.close()
     result = backup_database(configuration.database_path, destination)
     _emit({"backup": str(result) if result else None})
 

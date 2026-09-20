@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import html.parser
 import io
 import json
 import os
 import platform
+import resource
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from contextlib import suppress
 from dataclasses import asdict, dataclass
@@ -48,6 +51,11 @@ class ExtractionResult:
 
 
 DEFAULT_LIMITS = ExtractionLimits()
+
+
+def _set_worker_limits() -> None:
+    maximum = 512 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (maximum, maximum))
 
 
 class _HTMLText(html.parser.HTMLParser):
@@ -93,7 +101,9 @@ def _ooxml_text(data: bytes, limits: ExtractionLimits) -> ExtractionResult:
                 total += entry.file_size
                 if total > MAX_ZIP_INFLATED_BYTES:
                     return ExtractionResult("limit", "", 0, 0, reason="zip_inflated_bytes")
-                if entry.filename.lower().endswith((".xml", ".rels")):
+                if entry.filename.lower().endswith(".xml") and not entry.filename.lower().endswith(
+                    ("/externallinks.xml", "customxml/item1.xml")
+                ):
                     parts.append(_xml_text(archive.read(entry), limits).text)
     except (OSError, zipfile.BadZipFile, RuntimeError, ValueError):
         return ExtractionResult("failed", "", 0, 0, reason="malformed_ooxml")
@@ -160,7 +170,19 @@ def extract_bytes(
 
 
 def sandbox_available() -> bool:
-    return platform.system() == "Darwin" and shutil.which("sandbox-exec") is not None
+    return platform.system() == "Darwin" and Path("/usr/bin/sandbox-exec").is_file()
+
+
+def _sandbox_profile() -> tuple[str, str]:
+    interpreter = Path(sys.executable).resolve()
+    module_root = Path(__file__).resolve().parents[2]
+    read_roots = {interpreter.parent, module_root, Path(sys.prefix).resolve()}
+    read_rules = "".join(f'(allow file-read* (subpath "{root}"))' for root in sorted(read_roots))
+    profile = (
+        "(version 1)(deny default)(deny network*)(deny process-fork)(deny process-exec)"
+        f'{read_rules}(allow file-read* (literal "/dev/null"))'
+    )
+    return profile, hashlib.sha256(profile.encode()).hexdigest()
 
 
 def run_worker(
@@ -177,17 +199,33 @@ def run_worker(
     interpreter = worker_python or sys.executable
     control_read, control_write = os.pipe()
     process: subprocess.Popen[bytes] | None = None
+    workdir: str | None = None
     try:
-        environment = {"PATH": os.environ.get("PATH", "")}
+        profile, profile_hash = _sandbox_profile()
+        environment = {
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+            "PYTHONUTF8": "1",
+            "WORKTRACE_CONTROL_FD": str(control_read),
+        }
+        command = [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            profile,
+            interpreter,
+            "-m",
+            "worktrace.vault.extract_worker",
+        ]
+        workdir = tempfile.mkdtemp(prefix="worktrace-extract-")
         process = subprocess.Popen(
-            [interpreter, "-m", "worktrace.vault.extract_worker"],
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
             pass_fds=(control_read,),
             env=environment,
-            cwd="/",
+            cwd=workdir,
+            preexec_fn=_set_worker_limits,
         )
         os.write(
             control_write,
@@ -195,8 +233,10 @@ def run_worker(
                 {
                     "schema_version": 1,
                     "mime_type": mime_type,
-                    "filename": filename,
+                    "attachment_id": "worker-input",
+                    "declared_length": None,
                     "limits": asdict(limits),
+                    "profile_sha256": profile_hash,
                 },
                 separators=(",", ":"),
             ).encode()
@@ -210,16 +250,24 @@ def run_worker(
         process.stdin.close()
         output = process.stdout.read()
         process.wait(timeout=limits.timeout_seconds)
-        if process.returncode != 0:
+        if process.returncode not in {0, 10, 11}:
             return ExtractionResult(
                 "failed", "", 0, 0, exit_code=process.returncode, reason="worker"
             )
         result = json.loads(output.decode("utf-8"))
-        return ExtractionResult(**result)
+        parsed = ExtractionResult(**result)
+        expected_exit = {"complete": 0, "unsupported": 10, "limit": 11}.get(parsed.status)
+        if expected_exit is None or process.returncode != expected_exit:
+            return ExtractionResult("failed", "", 0, 0, exit_code=12, reason="protocol")
+        return parsed
     except subprocess.TimeoutExpired:
         if process is not None:
-            process.kill()
-            process.wait()
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
         return ExtractionResult("failed", "", 0, 0, exit_code=14, reason="timeout")
     except (OSError, ValueError, json.JSONDecodeError):
         return ExtractionResult("extraction_unavailable", "", 0, 0, exit_code=13, reason="worker")
@@ -227,6 +275,8 @@ def run_worker(
         os.close(control_read)
         with suppress(OSError):
             os.close(control_write)
+        if workdir is not None:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 def run_vault_worker(
@@ -234,28 +284,44 @@ def run_vault_worker(
     key: bytes,
     *,
     expected_ciphertext_sha256: str | None,
+    attachment_id: str,
+    declared_length: int | None,
     mime_type: str | None,
-    filename: str,
     limits: ExtractionLimits = DEFAULT_LIMITS,
 ) -> ExtractionResult:
     """Verify one WTVA object, then feed verified plaintext directly to the worker pipe."""
     if not sandbox_available():
         return ExtractionResult("extraction_unavailable", "", 0, 0, exit_code=13, reason="sandbox")
-    from worktrace.vault.format import decrypt_vault_object
+    from worktrace.vault.format import decrypt_vault_object, verify_vault_object
 
     interpreter = sys.executable
     control_read, control_write = os.pipe()
     process: subprocess.Popen[bytes] | None = None
+    workdir: str | None = None
     try:
+        profile, profile_hash = _sandbox_profile()
+        workdir = tempfile.mkdtemp(prefix="worktrace-extract-")
         process = subprocess.Popen(
-            [interpreter, "-m", "worktrace.vault.extract_worker"],
+            [
+                "/usr/bin/sandbox-exec",
+                "-p",
+                profile,
+                interpreter,
+                "-m",
+                "worktrace.vault.extract_worker",
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
             pass_fds=(control_read,),
-            env={"PATH": os.environ.get("PATH", "")},
-            cwd="/",
+            env={
+                "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                "PYTHONUTF8": "1",
+                "WORKTRACE_CONTROL_FD": str(control_read),
+            },
+            cwd=workdir,
+            preexec_fn=_set_worker_limits,
         )
         os.write(
             control_write,
@@ -264,8 +330,10 @@ def run_vault_worker(
                     {
                         "schema_version": 1,
                         "mime_type": mime_type,
-                        "filename": filename,
+                        "attachment_id": attachment_id,
+                        "declared_length": declared_length,
                         "limits": asdict(limits),
+                        "profile_sha256": profile_hash,
                     },
                     separators=(",", ":"),
                 )
@@ -275,25 +343,45 @@ def run_vault_worker(
         os.close(control_write)
         if process.stdin is None or process.stdout is None:
             raise OSError("extraction worker pipes were not created")
-        with suppress(Exception):
+        try:
+            verify_vault_object(
+                source,
+                key,
+                expected_ciphertext_sha256=expected_ciphertext_sha256,
+            )
+            source.seek(0)
             decrypt_vault_object(
                 source,
                 cast(BinaryIO, process.stdin),
                 key,
                 expected_ciphertext_sha256=expected_ciphertext_sha256,
+                stage_plaintext=False,
             )
+        except Exception:
+            process.stdin.close()
+            process.terminate()
+            process.wait(timeout=1)
+            return ExtractionResult("failed", "", 0, 0, exit_code=12, reason="vault_verification")
         process.stdin.close()
         output = process.stdout.read()
         process.wait(timeout=limits.timeout_seconds)
-        if process.returncode != 0:
+        if process.returncode not in {0, 10, 11}:
             return ExtractionResult(
                 "failed", "", 0, 0, exit_code=process.returncode, reason="worker"
             )
-        return ExtractionResult(**json.loads(output.decode("utf-8")))
+        parsed = ExtractionResult(**json.loads(output.decode("utf-8")))
+        expected_exit = {"complete": 0, "unsupported": 10, "limit": 11}.get(parsed.status)
+        if expected_exit is None or process.returncode != expected_exit:
+            return ExtractionResult("failed", "", 0, 0, exit_code=12, reason="protocol")
+        return parsed
     except subprocess.TimeoutExpired:
         if process is not None:
-            process.kill()
-            process.wait()
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
         return ExtractionResult("failed", "", 0, 0, exit_code=14, reason="timeout")
     except (OSError, ValueError, json.JSONDecodeError):
         return ExtractionResult("extraction_unavailable", "", 0, 0, exit_code=13, reason="worker")
@@ -301,3 +389,5 @@ def run_vault_worker(
         os.close(control_read)
         with suppress(OSError):
             os.close(control_write)
+        if workdir is not None:
+            shutil.rmtree(workdir, ignore_errors=True)

@@ -38,7 +38,7 @@ def _decode(value: str) -> dict[str, object]:
 
 def collection_view_token(connection: sqlite3.Connection, collection_id: str) -> tuple[str, str]:
     row = connection.execute(
-        "SELECT id FROM jira_archive_revisions WHERE collection_id=? "
+        "SELECT id FROM jira_archive_revisions WHERE collection_id=? AND status='active' "
         "ORDER BY revision_number DESC LIMIT 1",
         (collection_id,),
     ).fetchone()
@@ -49,6 +49,18 @@ def collection_view_token(connection: sqlite3.Connection, collection_id: str) ->
     for item in connection.execute(
         "SELECT id, kind, state, completeness, locator_json FROM jira_resource_states "
         "WHERE revision_id=? ORDER BY id",
+        (revision_id,),
+    ):
+        digest.update(json.dumps(tuple(item), sort_keys=True).encode())
+    for item in connection.execute(
+        "SELECT attachment_id, original_state, extracted_state, ciphertext_sha256 "
+        "FROM jira_attachment_objects WHERE revision_id=? ORDER BY attachment_id",
+        (revision_id,),
+    ):
+        digest.update(json.dumps(tuple(item), sort_keys=True).encode())
+    for item in connection.execute(
+        "SELECT id, attachment_id, ordinal, chars, extraction_version "
+        "FROM jira_search_chunks WHERE revision_id=? ORDER BY id",
         (revision_id,),
     ):
         digest.update(json.dumps(tuple(item), sort_keys=True).encode())
@@ -69,9 +81,20 @@ def search_collection(
     revision_id, view_token = collection_view_token(connection, collection_id)
     if expected_view_token is not None and expected_view_token != view_token:
         raise ValueError("Jira search view changed")
-    offset = 0
+    last: tuple[str, str, int] | None = None
     if cursor:
         decoded = _decode(cursor)
+        if set(decoded) != {
+            "schema_version",
+            "collection_id",
+            "revision_id",
+            "view_token",
+            "query",
+            "last",
+        }:
+            raise ValueError("Jira search cursor fields are invalid")
+        if decoded.get("schema_version") != SEARCH_SCHEMA_VERSION:
+            raise ValueError("Jira search cursor schema is unsupported")
         if (
             decoded.get("collection_id") != collection_id
             or decoded.get("revision_id") != revision_id
@@ -79,17 +102,45 @@ def search_collection(
             raise ValueError("Jira search cursor scope mismatch")
         if decoded.get("view_token") != view_token or decoded.get("query") != query:
             raise ValueError("Jira search cursor is stale")
-        raw_offset = decoded.get("offset")
-        if not isinstance(raw_offset, int) or raw_offset < 0:
-            raise ValueError("Jira search cursor offset is invalid")
-        offset = raw_offset
-    rows = connection.execute(
-        "SELECT issue_id, attachment_id, ordinal, locator_json, text_redacted "
-        "FROM jira_search_chunks WHERE collection_id=? AND revision_id=? "
-        "AND instr(lower(text_redacted), lower(?)) > 0 ORDER BY issue_id, attachment_id, ordinal "
-        "LIMIT ? OFFSET ?",
-        (collection_id, revision_id, query, limit + 1, offset),
-    ).fetchall()
+        raw_last = decoded.get("last")
+        if (
+            not isinstance(raw_last, list)
+            or len(raw_last) != 3
+            or not isinstance(raw_last[0], str)
+            or not isinstance(raw_last[1], str)
+            or not isinstance(raw_last[2], int)
+        ):
+            raise ValueError("Jira search cursor key is invalid")
+        last = (raw_last[0], raw_last[1], raw_last[2])
+    if last is None:
+        rows = connection.execute(
+            "SELECT issue_id, attachment_id, ordinal, locator_json, text_redacted "
+            "FROM jira_search_chunks WHERE collection_id=? AND revision_id=? "
+            "AND instr(lower(text_redacted), lower(?)) > 0 "
+            "ORDER BY issue_id, attachment_id, ordinal LIMIT ?",
+            (collection_id, revision_id, query, limit + 1),
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            "SELECT issue_id, attachment_id, ordinal, locator_json, text_redacted "
+            "FROM jira_search_chunks WHERE collection_id=? AND revision_id=? "
+            "AND instr(lower(text_redacted), lower(?)) > 0 "
+            "AND (issue_id>? OR (issue_id=? AND attachment_id>?) OR "
+            "(issue_id=? AND attachment_id=? AND ordinal>?)) "
+            "ORDER BY issue_id, attachment_id, ordinal LIMIT ?",
+            (
+                collection_id,
+                revision_id,
+                query,
+                last[0],
+                last[0],
+                last[1],
+                last[0],
+                last[1],
+                last[2],
+                limit + 1,
+            ),
+        ).fetchall()
     delivered = rows[:limit]
     hits = [
         {
@@ -110,7 +161,7 @@ def search_collection(
                 "revision_id": revision_id,
                 "view_token": view_token,
                 "query": query,
-                "offset": offset + limit,
+                "last": [str(delivered[-1][0]), str(delivered[-1][1]), int(delivered[-1][2])],
             }
         )
     return {
@@ -129,8 +180,50 @@ def show_issue(
     connection: sqlite3.Connection,
     collection_id: str,
     issue_id: str,
+    *,
+    limit: int = MAX_SEARCH_LIMIT,
+    cursor: str | None = None,
+    expected_view_token: str | None = None,
 ) -> dict[str, object]:
+    if not 1 <= limit <= MAX_SEARCH_LIMIT:
+        raise ValueError("limit must be between 1 and 20")
     revision_id, view_token = collection_view_token(connection, collection_id)
+    if expected_view_token is not None and expected_view_token != view_token:
+        raise ValueError("Jira issue view changed")
+    last_ordinal: int | None = None
+    if cursor:
+        decoded = _decode(cursor)
+        if set(decoded) != {
+            "schema_version",
+            "collection_id",
+            "revision_id",
+            "view_token",
+            "issue_id",
+            "last",
+        }:
+            raise ValueError("Jira issue cursor fields are invalid")
+        if decoded.get("schema_version") != SEARCH_SCHEMA_VERSION:
+            raise ValueError("Jira issue cursor schema is unsupported")
+        if (
+            decoded.get("collection_id") != collection_id
+            or decoded.get("revision_id") != revision_id
+            or decoded.get("view_token") != view_token
+            or decoded.get("issue_id") != issue_id
+        ):
+            raise ValueError("Jira issue cursor is stale")
+        raw_last = decoded.get("last")
+        if (
+            not isinstance(raw_last, list)
+            or len(raw_last) != 2
+            or not isinstance(raw_last[0], int)
+            or raw_last[0] < 0
+            or not isinstance(raw_last[1], str)
+        ):
+            raise ValueError("Jira issue cursor key is invalid")
+        last_ordinal = raw_last[0]
+        last_attachment_id = raw_last[1]
+    else:
+        last_attachment_id = ""
     issue = connection.execute(
         "SELECT issue_id, issue_key, role, assignment_status, boundary_status "
         "FROM jira_collection_issues WHERE collection_id=? AND revision_id=? AND issue_id=?",
@@ -168,6 +261,40 @@ def show_issue(
             (collection_id, revision_id, issue_id),
         )
     ]
+    chunk_query = (
+        "SELECT attachment_id, ordinal, locator_json, text_redacted, chars, extraction_version "
+        "FROM jira_search_chunks WHERE collection_id=? AND revision_id=? AND issue_id=? "
+    )
+    chunk_args: tuple[object, ...] = (collection_id, revision_id, issue_id)
+    if last_ordinal is not None:
+        chunk_query += "AND (ordinal>? OR (ordinal=? AND attachment_id>?)) "
+        chunk_args += (last_ordinal, last_ordinal, last_attachment_id)
+    chunk_query += "ORDER BY ordinal, attachment_id LIMIT ?"
+    chunk_args += (limit + 1,)
+    chunk_rows = connection.execute(chunk_query, chunk_args).fetchall()
+    chunks = [
+        {
+            "attachment_id": str(row[0]),
+            "ordinal": int(row[1]),
+            "locator": json.loads(str(row[2])),
+            "text": str(row[3]),
+            "chars": int(row[4]),
+            "extraction_version": str(row[5]),
+        }
+        for row in chunk_rows[:limit]
+    ]
+    next_cursor = None
+    if len(chunk_rows) > limit:
+        next_cursor = _encode(
+            {
+                "schema_version": SEARCH_SCHEMA_VERSION,
+                "collection_id": collection_id,
+                "revision_id": revision_id,
+                "view_token": view_token,
+                "issue_id": issue_id,
+                "last": [int(chunks[-1]["ordinal"]), str(chunks[-1]["attachment_id"])],
+            }
+        )
     return {
         "schema_version": 1,
         "collection_id": collection_id,
@@ -182,7 +309,61 @@ def show_issue(
         },
         "resources": resources,
         "attachments": attachments,
+        "chunks": chunks,
+        "next_cursor": next_cursor,
         "limitations": ["raw Jira payloads and vault paths are never returned"],
+    }
+
+
+def show_attachment(
+    connection: sqlite3.Connection,
+    collection_id: str,
+    attachment_id: str,
+    *,
+    expected_view_token: str | None = None,
+) -> dict[str, object]:
+    """Return one active-revision attachment and its redacted indexed chunks."""
+    revision_id, view_token = collection_view_token(connection, collection_id)
+    if expected_view_token is not None and expected_view_token != view_token:
+        raise ValueError("Jira attachment view changed")
+    row = connection.execute(
+        "SELECT issue_id, mime_type, declared_size, original_state, extracted_state "
+        "FROM jira_attachment_objects WHERE collection_id=? AND revision_id=? "
+        "AND attachment_id=?",
+        (collection_id, revision_id, attachment_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError("Jira attachment is outside the collection")
+    chunks = [
+        {
+            "ordinal": int(chunk[0]),
+            "locator": json.loads(str(chunk[1])),
+            "text": str(chunk[2]),
+            "chars": int(chunk[3]),
+            "extraction_version": str(chunk[4]),
+        }
+        for chunk in connection.execute(
+            "SELECT ordinal, locator_json, text_redacted, chars, extraction_version "
+            "FROM jira_search_chunks WHERE collection_id=? AND revision_id=? "
+            "AND attachment_id=? ORDER BY ordinal LIMIT ?",
+            (collection_id, revision_id, attachment_id, MAX_SEARCH_LIMIT),
+        )
+    ]
+    return {
+        "schema_version": SEARCH_SCHEMA_VERSION,
+        "collection_id": collection_id,
+        "revision_id": revision_id,
+        "view_token": view_token,
+        "attachment": {
+            "attachment_id": attachment_id,
+            "issue_id": str(row[0]),
+            "mime_type": str(row[1]),
+            "declared_size": row[2],
+            "original_state": str(row[3]),
+            "extracted_state": str(row[4]),
+        },
+        "chunks": chunks,
+        "limitations": ["raw Jira payloads, vault paths, and original bytes are unavailable"],
     }
 
 
@@ -225,16 +406,21 @@ def index_collection_attachments(
         if row["vault_object_path"] is None or row["vault_key_version"] is None:
             continue
         source = Path(vault_root) / str(row["vault_object_path"])
-        with source.open("rb") as stream:
-            result = worker(
-                stream,
-                key_for_version(int(row["vault_key_version"])),
-                expected_ciphertext_sha256=row["ciphertext_sha256"],
-                mime_type=row["mime_type"],
-                filename=row["filename"],
-                limits=limits,
-            )
-        status = result.status
+        try:
+            with source.open("rb") as stream:
+                result = worker(
+                    stream,
+                    key_for_version(int(row["vault_key_version"])),
+                    expected_ciphertext_sha256=row["ciphertext_sha256"],
+                    attachment_id=str(row["attachment_id"]),
+                    declared_length=row["declared_size"],
+                    mime_type=row["mime_type"],
+                    limits=limits,
+                )
+            status = result.status
+        except OSError:
+            result = None
+            status = "failed"
         counts[status] = counts.get(status, 0) + 1
         with connection:
             connection.execute(
@@ -246,7 +432,7 @@ def index_collection_attachments(
                 "AND attachment_id=?",
                 (collection_id, revision_id, row["attachment_id"]),
             )
-            if status == "complete":
+            if status == "complete" and result is not None:
                 for ordinal, text, locator in redact_chunks(result.text, redactor):
                     connection.execute(
                         "INSERT INTO jira_search_chunks "

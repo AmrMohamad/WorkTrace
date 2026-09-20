@@ -234,7 +234,7 @@ class JiraCollector:
         ).fetchall()
         attachments = self.connection.execute(
             f"SELECT id, logical_resource_id, original_state AS state, "
-            f"original_state AS completeness FROM jira_attachment_objects "
+            f"original_state AS completeness, extracted_state FROM jira_attachment_objects "
             f"WHERE revision_id IN ({placeholders}) ORDER BY revision_id",
             tuple(lineage),
         ).fetchall()
@@ -253,6 +253,29 @@ class JiraCollector:
                 counts[state] += 1
             elif completeness == "partial":
                 counts["partial"] += 1
+        latest_extraction: dict[str, str] = {}
+        unavailable_originals = False
+        for attachment in attachments:
+            logical = str(attachment["logical_resource_id"] or attachment["id"])
+            latest_extraction[logical] = str(attachment["extracted_state"])
+            unavailable_originals = unavailable_originals or str(attachment["state"]) != "complete"
+        extraction_states = set(latest_extraction.values())
+        if not extraction_states or extraction_states == {"not_requested"}:
+            extraction_status = (
+                "complete_with_unavailable_resources"
+                if unavailable_originals
+                else ("complete" if not extraction_states else "partial")
+            )
+            search_status = "ready" if not extraction_states else "partial"
+        elif "extraction_unavailable" in extraction_states:
+            extraction_status = "unavailable"
+            search_status = "unavailable"
+        elif extraction_states <= {"complete"}:
+            extraction_status = "complete"
+            search_status = "ready"
+        else:
+            extraction_status = "complete_with_unavailable_resources"
+            search_status = "complete_with_unavailable_resources"
         outcome = str(row["run_status"])
         if outcome == "complete" and counts["unavailable"]:
             outcome = "complete_with_unavailable_resources"
@@ -284,8 +307,8 @@ class JiraCollector:
                 "download_integrity": "complete_with_unavailable_resources"
                 if counts["unavailable"]
                 else "complete",
-                "extraction": NOT_IMPLEMENTED_STATUS,
-                "search_readiness": NOT_IMPLEMENTED_STATUS,
+                "extraction": extraction_status,
+                "search_readiness": search_status,
                 "app_mapping": APP_MAPPING_STATUS,
             },
             "resource_counts": counts,

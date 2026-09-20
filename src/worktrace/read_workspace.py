@@ -313,7 +313,7 @@ class ReadOnlyWorkspace:
                 raise NotFound("Jira collection was not found")
             revision = connection.execute(
                 "SELECT id, status, revision_number FROM jira_archive_revisions "
-                "WHERE collection_id=? ORDER BY revision_number DESC LIMIT 1",
+                "WHERE collection_id=? AND status='active' ORDER BY revision_number DESC LIMIT 1",
                 (collection_id,),
             ).fetchone()
             if revision is None:
@@ -344,3 +344,65 @@ class ReadOnlyWorkspace:
                 "resources": resources,
                 "scope": json.loads(str(collection["scope_json"])),
             }
+
+    def jira_search(
+        self,
+        collection_id: str,
+        query: str,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+        expected_view_token: str | None = None,
+    ) -> dict[str, object]:
+        """Read one redacted, active-revision Jira search page on a fresh RO connection."""
+        from worktrace.vault.search import search_collection
+
+        with self._connection() as connection:
+            return search_collection(
+                connection,
+                collection_id,
+                query,
+                limit=limit,
+                cursor=cursor,
+                expected_view_token=expected_view_token,
+            )
+
+    def jira_issue(
+        self,
+        collection_id: str,
+        issue_id: str,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+        expected_view_token: str | None = None,
+    ) -> dict[str, object]:
+        """Read one issue detail page without exposing vault/provider capabilities."""
+        from worktrace.vault.search import show_issue
+
+        with self._connection() as connection:
+            return show_issue(
+                connection,
+                collection_id,
+                issue_id,
+                limit=limit,
+                cursor=cursor,
+                expected_view_token=expected_view_token,
+            )
+
+    def jira_attachment(
+        self,
+        collection_id: str,
+        attachment_id: str,
+        *,
+        expected_view_token: str | None = None,
+    ) -> dict[str, object]:
+        """Read an attachment's metadata and redacted chunks only."""
+        from worktrace.vault.search import show_attachment
+
+        with self._connection() as connection:
+            return show_attachment(
+                connection,
+                collection_id,
+                attachment_id,
+                expected_view_token=expected_view_token,
+            )
