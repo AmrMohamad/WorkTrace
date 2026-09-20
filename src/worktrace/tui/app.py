@@ -20,6 +20,7 @@ from worktrace.tui.screens.base import WorkTraceModal, WorkTraceScreen
 from worktrace.tui.screens.candidates import CandidateScreen
 from worktrace.tui.screens.contribution import ContributionScreen
 from worktrace.tui.screens.evidence_search import EvidenceSearchScreen
+from worktrace.tui.screens.jira_collection import JiraCollectionScreen
 
 # Below this width the candidate browser uses the four-column compact table; the
 # six-column full layout is reserved for the documented full terminal size.
@@ -172,11 +173,13 @@ class WorkTraceApp(App[None], inherit_bindings=False):
         *,
         initial_app_id: str | None = None,
         initial_candidate_id: str | None = None,
+        initial_jira_collection: str | None = None,
     ) -> None:
         super().__init__()
         self.workspace = workspace
         self.initial_app_id = initial_app_id
         self.initial_candidate_id = initial_candidate_id
+        self.initial_jira_collection = initial_jira_collection
         self._applications: tuple[ApplicationSummary, ...] = ()
         self._applications_request_id = 0
         self.current_app_id: str | None = None
@@ -246,6 +249,11 @@ class WorkTraceApp(App[None], inherit_bindings=False):
         """No selected-text clipboard path exists in WorkTrace."""
 
     def action_restart(self) -> None:
+        if self.initial_jira_collection is not None:
+            collection_id = self.initial_jira_collection
+            self.initial_jira_collection = None
+            self._show_screen(JiraCollectionScreen(self.workspace, collection_id))
+            return
         self._applications_request_id += 1
         request_id = self._applications_request_id
         self._show_screen(LoadingScreen())
@@ -415,9 +423,11 @@ def run_worktrace_ui(
     *,
     initial_app_id: str | None = None,
     initial_candidate_id: str | None = None,
+    initial_jira_collection: str | None = None,
 ) -> None:
     WorkTraceApp(
         workspace,
         initial_app_id=initial_app_id,
         initial_candidate_id=initial_candidate_id,
+        initial_jira_collection=initial_jira_collection,
     ).run()

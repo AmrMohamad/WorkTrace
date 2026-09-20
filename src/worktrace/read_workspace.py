@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -301,3 +302,107 @@ class ReadOnlyWorkspace:
             if excerpt.get("app_id") != app_id:
                 raise ScopeViolation("evidence belongs to another application")
             return excerpt
+
+    def jira_collection_summary(self, collection_id: str) -> dict[str, object]:
+        with self._connection() as connection:
+            collection = connection.execute(
+                "SELECT id, site_id, scope_json FROM jira_collections WHERE id=?",
+                (collection_id,),
+            ).fetchone()
+            if collection is None:
+                raise NotFound("Jira collection was not found")
+            revision = connection.execute(
+                "SELECT id, status, revision_number FROM jira_archive_revisions "
+                "WHERE collection_id=? AND status='active' ORDER BY revision_number DESC LIMIT 1",
+                (collection_id,),
+            ).fetchone()
+            if revision is None:
+                raise NotFound("Jira collection has no revision")
+            issues = [
+                {"issue_id": str(row[0]), "issue_key": str(row[1]), "role": str(row[2])}
+                for row in connection.execute(
+                    "SELECT issue_id, issue_key, role FROM jira_collection_issues "
+                    "WHERE revision_id=? ORDER BY issue_id",
+                    (revision["id"],),
+                )
+            ]
+            resources = [
+                {"kind": str(row[0]), "state": str(row[1]), "completeness": str(row[2])}
+                for row in connection.execute(
+                    "SELECT kind, state, completeness FROM jira_resource_states "
+                    "WHERE revision_id=? ORDER BY kind, id",
+                    (revision["id"],),
+                )
+            ]
+            return {
+                "schema_version": 1,
+                "collection_id": str(collection["id"]),
+                "site_id": str(collection["site_id"]),
+                "revision_id": str(revision["id"]),
+                "revision_status": str(revision["status"]),
+                "issues": issues,
+                "resources": resources,
+                "scope": json.loads(str(collection["scope_json"])),
+            }
+
+    def jira_search(
+        self,
+        collection_id: str,
+        query: str,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+        expected_view_token: str | None = None,
+    ) -> dict[str, object]:
+        """Read one redacted, active-revision Jira search page on a fresh RO connection."""
+        from worktrace.vault.search import search_collection
+
+        with self._connection() as connection:
+            return search_collection(
+                connection,
+                collection_id,
+                query,
+                limit=limit,
+                cursor=cursor,
+                expected_view_token=expected_view_token,
+            )
+
+    def jira_issue(
+        self,
+        collection_id: str,
+        issue_id: str,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+        expected_view_token: str | None = None,
+    ) -> dict[str, object]:
+        """Read one issue detail page without exposing vault/provider capabilities."""
+        from worktrace.vault.search import show_issue
+
+        with self._connection() as connection:
+            return show_issue(
+                connection,
+                collection_id,
+                issue_id,
+                limit=limit,
+                cursor=cursor,
+                expected_view_token=expected_view_token,
+            )
+
+    def jira_attachment(
+        self,
+        collection_id: str,
+        attachment_id: str,
+        *,
+        expected_view_token: str | None = None,
+    ) -> dict[str, object]:
+        """Read an attachment's metadata and redacted chunks only."""
+        from worktrace.vault.search import show_attachment
+
+        with self._connection() as connection:
+            return show_attachment(
+                connection,
+                collection_id,
+                attachment_id,
+                expected_view_token=expected_view_token,
+            )
