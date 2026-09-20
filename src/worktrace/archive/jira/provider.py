@@ -93,7 +93,7 @@ class JiraArchiveProvider:
             "maxResults": 100,
             "fields": PREVIEW_FIELDS.split(","),
             "fieldsByKeys": False,
-            "expand": [],
+            "expand": "",
         }
         if next_token is not None:
             body["nextPageToken"] = next_token

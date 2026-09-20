@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -72,6 +74,43 @@ def test_attachment_content_retries_transient_then_streams_without_redirects() -
     with provider.attachment_content("10") as response:
         assert response.read() == b"bytes"
     assert calls == 2
+    provider.close()
+
+
+def test_preview_search_uses_enhanced_search_json_contract() -> None:
+    observed: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/rest/api/3/search/jql"
+        body = json.loads(request.content)
+        assert isinstance(body, dict)
+        observed.append(body)
+        if not isinstance(body.get("expand"), str):
+            return httpx.Response(400, json={"errorMessages": ["expand must be a string"]})
+        return httpx.Response(
+            200,
+            json={"issues": [{"id": "10001"}], "nextPageToken": "next", "isLast": False},
+            request=request,
+        )
+
+    provider = _provider(handler)
+    page = provider.search_metadata("project = DEMO", next_token="prior")
+    assert page.next_token == "next"
+    assert page.is_last is False
+    assert len(observed) == 1
+    body = observed[0]
+    assert body["fields"] == [
+        "id",
+        "key",
+        "project",
+        "parent",
+        "subtasks",
+        "issuelinks",
+        "attachment",
+    ]
+    assert body["fieldsByKeys"] is False
+    assert body["expand"] == ""
+    assert body["nextPageToken"] == "prior"
     provider.close()
 
 
