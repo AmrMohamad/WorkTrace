@@ -1855,10 +1855,16 @@ def export_command(app_id: str, destination: Path, config: ConfigOption = None) 
 @app.command()
 def backup(destination: Path | None = None, config: ConfigOption = None) -> None:
     configuration = load_config(config)
-    if configuration.database_path.is_file():
-        connection = connect(configuration.database_path)
+    if configuration.database_path.is_file() and configuration.database_path.stat().st_size > 0:
+        connection = connect_read_only(configuration.database_path)
         try:
-            if connection.execute("SELECT COUNT(*) FROM jira_collections").fetchone()[0]:
+            has_jira_collections = connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='jira_collections'"
+            ).fetchone()
+            if (
+                has_jira_collections
+                and connection.execute("SELECT COUNT(*) FROM jira_collections").fetchone()[0]
+            ):
                 typer.echo(
                     "warning: this is the DB-only backup; use `worktrace jira backup` "
                     "for vault-inclusive portability",
