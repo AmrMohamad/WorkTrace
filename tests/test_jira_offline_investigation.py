@@ -7,10 +7,12 @@ import os
 import sqlite3
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from textual.widgets import DataTable, Input
 
+from worktrace import cli as cli_module
 from worktrace.archive.jira.repository import JiraArchiveRepository
 from worktrace.db.connection import connect
 from worktrace.db.migrations import migrate
@@ -235,6 +237,125 @@ def test_post_collection_index_is_redacted_and_idempotent(tmp_path: Path) -> Non
         assert connection.execute("SELECT COUNT(*) FROM jira_search_chunks").fetchone()[0] == 1
     finally:
         connection.close()
+
+
+def test_index_resolves_each_vault_key_version_without_fallback(tmp_path: Path) -> None:
+    connection, collection_id, revision_id, vault, key1 = _archive(tmp_path)
+    key2 = b"2" * 32
+    try:
+        site_id = str(
+            connection.execute(
+                "SELECT site_id FROM jira_collections WHERE id=?", (collection_id,)
+            ).fetchone()[0]
+        )
+        data = b"second version"
+        descriptor = VaultDescriptor(
+            site_id=site_id,
+            collection_id=collection_id,
+            revision_id=revision_id,
+            object_id="jatt:test2",
+            kind="attachment_original",
+            content_length=len(data),
+            content_sha256=hashlib.sha256(data).hexdigest(),
+            key_version=2,
+        )
+        result = write_vault_object(
+            BytesIO(data), vault / "object2.wtva", descriptor, key2, vault_root=vault
+        )
+        connection.execute(
+            "INSERT INTO jira_attachment_objects "
+            "(id,collection_id,revision_id,issue_id,attachment_id,archive_evidence_id,filename,"
+            "mime_type,declared_size,manifest_sha256,original_state,vault_object_id,vault_object_path,"
+            "vault_key_version,ciphertext_sha256,extracted_state,source_locator,"
+            "logical_resource_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "jatt:test2",
+                collection_id,
+                revision_id,
+                "10001",
+                "att-2",
+                "jare:test2",
+                "second.txt",
+                "text/plain",
+                len(data),
+                "manifest2",
+                "complete",
+                "jatt:test2",
+                "object2.wtva",
+                2,
+                result.ciphertext_sha256,
+                "not_requested",
+                "{}",
+                "jatt-family:test2",
+            ),
+        )
+        connection.commit()
+        observed: dict[str, bytes] = {}
+
+        def worker(source: object, received_key: bytes, **kwargs: object) -> ExtractionResult:
+            observed[str(kwargs["attachment_id"])] = received_key
+            return ExtractionResult("complete", "indexed", 0, 7)
+
+        counts = index_collection_attachments(
+            connection,
+            collection_id=collection_id,
+            vault_root=str(vault),
+            key_for_version={1: key1, 2: key2}.get,
+            redactor=Redactor(b"hmac-key"),
+            worker=worker,
+        )
+        assert counts["complete"] == 2
+        assert observed == {"att-1": key1, "att-2": key2}
+    finally:
+        connection.close()
+
+
+def test_missing_vault_key_marks_attachment_unavailable_without_chunks(tmp_path: Path) -> None:
+    connection, collection_id, _revision_id, vault, _key = _archive(tmp_path)
+    try:
+        called = False
+
+        def worker(*_args: object, **_kwargs: object) -> ExtractionResult:
+            nonlocal called
+            called = True
+            return ExtractionResult("complete", "must not run", 0, 12)
+
+        counts = index_collection_attachments(
+            connection,
+            collection_id=collection_id,
+            vault_root=str(vault),
+            key_for_version=lambda _version: None,
+            redactor=Redactor(b"hmac-key"),
+            worker=worker,
+        )
+        assert counts["extraction_unavailable"] == 1
+        assert called is False
+        assert (
+            connection.execute(
+                "SELECT extracted_state FROM jira_attachment_objects WHERE attachment_id='att-1'"
+            ).fetchone()[0]
+            == "extraction_unavailable"
+        )
+        assert connection.execute("SELECT COUNT(*) FROM jira_search_chunks").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_export_key_lookup_is_versioned_and_never_creates(monkeypatch: pytest.MonkeyPatch) -> None:
+    keychain = type(
+        "FakeKeychain",
+        (),
+        {
+            "get": lambda self, version: {1: b"1" * 32, 2: b"2" * 32}.get(version),
+            "ensure": lambda self, _version=1: pytest.fail("export must not ensure a key"),
+        },
+    )()
+    monkeypatch.setattr(cli_module.MacOSKeychain, "open", lambda _installation: keychain)
+    configuration = SimpleNamespace(config_path=Path("/private/config.toml"))
+    assert cli_module._vault_key_for_config(configuration, 2) == b"2" * 32
+    with pytest.raises(cli_module.WorkTraceError, match="version is missing"):
+        cli_module._vault_key_for_config(configuration, 3)
 
 
 def test_search_cursor_is_keyset_view_bound_and_tamper_evident(tmp_path: Path) -> None:

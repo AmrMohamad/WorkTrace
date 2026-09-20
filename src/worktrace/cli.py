@@ -45,7 +45,7 @@ from worktrace.db.readiness import DatabaseReadinessStatus, database_readiness
 from worktrace.db.repository import EvidenceRepository, source_instance_id, stable_id
 from worktrace.doctor import run_doctor
 from worktrace.domain.models import JsonValue
-from worktrace.errors import ConfigurationError, WorkTraceError
+from worktrace.errors import ConfigurationError, KeychainError, WorkTraceError
 from worktrace.identity import (
     finish_identity_rebuild,
     identity_policy_status,
@@ -353,13 +353,24 @@ def _index_jira_collection(
 ) -> dict[str, object]:
     if str(result.get("status")) not in {"complete", "complete_with_unavailable_resources"}:
         return result
-    if collector.vault_key is None:
-        raise WorkTraceError("Jira extraction requires the loaded vault key")
+    installation_id = (
+        "install:" + hashlib.sha256(str(configuration.config_path).encode("utf-8")).hexdigest()[:32]
+    )
+    try:
+        keychain = MacOSKeychain.open(installation_id)
+    except KeychainError:
+        keychain = None
+
+    def key_for_version(version: int) -> bytes | None:
+        if keychain is None:
+            return None
+        return keychain.get(version)
+
     counts = index_collection_attachments(
         connection,
         collection_id=str(result["collection_id"]),
         vault_root=str(configuration.data_directory / "jira-vault"),
-        key_for_version=lambda version: collector.vault_key or b"",
+        key_for_version=key_for_version,
         redactor=Redactor(email_hmac_key(configuration.data_directory, create=False)),
     )
     refreshed = collector.status(str(result["collection_id"]))

@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from worktrace.errors import KeychainError
 from worktrace.normalize.redaction import Redactor
 
 if TYPE_CHECKING:
@@ -381,7 +382,7 @@ def index_collection_attachments(
     *,
     collection_id: str,
     vault_root: str,
-    key_for_version: Callable[[int], bytes],
+    key_for_version: Callable[[int], bytes | None],
     redactor: Redactor,
     worker: Callable[..., Any] | None = None,
     limits: ExtractionLimits | None = None,
@@ -407,17 +408,25 @@ def index_collection_attachments(
             continue
         source = Path(vault_root) / str(row["vault_object_path"])
         try:
-            with source.open("rb") as stream:
-                result = worker(
-                    stream,
-                    key_for_version(int(row["vault_key_version"])),
-                    expected_ciphertext_sha256=row["ciphertext_sha256"],
-                    attachment_id=str(row["attachment_id"]),
-                    declared_length=row["declared_size"],
-                    mime_type=row["mime_type"],
-                    limits=limits,
-                )
-            status = result.status
+            key = key_for_version(int(row["vault_key_version"]))
+            if key is None:
+                result = None
+                status = "extraction_unavailable"
+            else:
+                with source.open("rb") as stream:
+                    result = worker(
+                        stream,
+                        key,
+                        expected_ciphertext_sha256=row["ciphertext_sha256"],
+                        attachment_id=str(row["attachment_id"]),
+                        declared_length=row["declared_size"],
+                        mime_type=row["mime_type"],
+                        limits=limits,
+                    )
+                status = result.status
+        except KeychainError:
+            result = None
+            status = "extraction_unavailable"
         except OSError:
             result = None
             status = "failed"
